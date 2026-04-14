@@ -120,13 +120,26 @@ pub fn model_family_description(id: &str) -> String {
 // Provider grouping helpers
 // ---------------------------------------------------------------------------
 
+/// Format context window tokens for display in the model picker.
+pub fn format_context_window(context_window: u32) -> String {
+    if context_window >= 1_000_000 {
+        if context_window % 1_000_000 == 0 {
+            format!("{}M context", context_window / 1_000_000)
+        } else {
+            format!("{:.1}M context", context_window as f64 / 1_000_000.0)
+        }
+    } else {
+        format!("{}K context", context_window / 1000)
+    }
+}
+
 /// Format a model display line with optional context window and cost info.
 ///
 /// Example: `"gpt-4o  128K ctx  $5.00/M"`
 pub fn format_model_line(model_str: &str, context_window: Option<u32>, cost_per_1m: Option<f64>) -> String {
     let mut parts = vec![model_str.to_string()];
     if let Some(ctx) = context_window {
-        parts.push(format!("{}K ctx", ctx / 1000));
+        parts.push(format_context_window(ctx).replace(" context", " ctx"));
     }
     if let Some(cost) = cost_per_1m {
         if cost == 0.0 {
@@ -245,10 +258,9 @@ pub fn models_for_provider_from_registry(
         entries
             .iter()
             .map(|e| {
-                let ctx_k = e.info.context_window / 1000;
                 let cost_str = match (e.cost_input, e.cost_output) {
-                    (Some(ci), Some(co)) => format!("{}K ctx | ${:.2}/${:.2} per M", ctx_k, ci, co),
-                    _ => format!("{}K ctx", ctx_k),
+                    (Some(ci), Some(co)) => format!("{} | ${:.2}/${:.2} per M", format_context_window(e.info.context_window), ci, co),
+                    _ => format_context_window(e.info.context_window),
                 };
                 ModelEntry {
                     id: e.info.id.to_string(),
@@ -377,6 +389,9 @@ pub fn models_for_provider(provider_id: &str) -> Vec<ModelEntry> {
         "azure" => vec![
             model_entry("gpt-4o", "GPT-4o (Azure)", "128K context"),
             model_entry("gpt-4o-mini", "GPT-4o mini (Azure)", "128K context"),
+        ],
+        "custom-openai" => vec![
+            model_entry("default", "Default model", "OpenAI-compatible endpoint"),
         ],
         "amazon-bedrock" => vec![
             model_entry("anthropic.claude-sonnet-4-6-v1", "Claude Sonnet 4.6 (Bedrock)", "200K context"),
@@ -579,6 +594,15 @@ impl ModelPickerState {
     /// in the correct provider-aware format.
     pub fn confirm(&mut self) -> Option<(String, Option<EffortLevel>)> {
         let filtered = self.filtered_models();
+        let custom = self.filter.trim();
+        if filtered.is_empty() {
+            if custom.is_empty() {
+                return None;
+            }
+            let id = custom.to_string();
+            self.close();
+            return Some((id, None));
+        }
         let entry = filtered.get(self.selected_idx)?;
         let id = entry.id.clone();
         let effort = if model_supports_effort(&id) { Some(self.effort_level) } else { None };
@@ -865,6 +889,12 @@ pub fn render_model_picker(state: &ModelPickerState, area: Rect, buf: &mut Buffe
 
     if filtered.is_empty() {
         lines.push(Line::from(vec![Span::styled(" No results found", Style::default().fg(dim))]));
+        if !state.filter.trim().is_empty() {
+            lines.push(Line::from(vec![Span::styled(
+                " Press Enter to use custom model",
+                Style::default().fg(Color::Rgb(200, 200, 200)),
+            )]));
+        }
     } else {
         for (i, model) in filtered.iter().enumerate() {
             let is_selected = i == state.selected_idx;
@@ -1069,14 +1099,14 @@ mod tests {
         assert!(!p.visible, "picker should be closed after confirm");
     }
 
-    // 9. confirm() on empty filter list returns None.
+    // 9. confirm() on empty filter list uses custom model when filter is set.
     #[test]
     fn confirm_empty_filter_returns_none() {
         let mut p = make_picker_with_current("claude-opus-4-6");
         p.filter = "zzznomatch999".to_string();
         p.selected_idx = 0;
         let result = p.confirm();
-        assert!(result.is_none());
+        assert_eq!(result.map(|(id, _)| id), Some("zzznomatch999".to_string()));
     }
 
     // 10. close() clears filter and hides overlay.

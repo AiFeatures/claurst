@@ -12,6 +12,9 @@ refs/
 
 # Git
 .gitignore
+.gitattributes
 
-Agents.md
-plan.md
+# VSCode / unsolicited devcontainers mounts
+.vscode/
+.claurst/
+

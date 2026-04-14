@@ -1166,6 +1166,7 @@ pub mod config {
                 Some("ollama") => "llama3.2",
                 Some("lmstudio") => "default",
                 Some("llamacpp") => "default",
+                Some("custom-openai") => "default",
                 Some("azure") => "gpt-4o",
                 Some("amazon-bedrock") => "anthropic.claude-sonnet-4-6-v1",
                 Some("venice") => "llama-3.3-70b",
@@ -1226,6 +1227,11 @@ pub mod config {
                     provider_cfg
                         .and_then(|provider| provider.api_key.clone())
                         .filter(|key| !key.is_empty())
+                })
+                .or_else(|| {
+                    api_key_env_vars_for_provider(provider_id)
+                        .iter()
+                        .find_map(|var| std::env::var(var).ok().filter(|v| !v.is_empty()))
                 })
                 .or_else(|| crate::AuthStore::load().api_key_for(provider_id))
         }
