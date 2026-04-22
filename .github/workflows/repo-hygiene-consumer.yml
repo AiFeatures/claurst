@@ -1,0 +1,15 @@
+name: Repo Hygiene (nightly)
+
+on:
+  schedule:
+    - cron: "0 5 * * *"  # Daily 05:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  hygiene:
+    uses: Ai-road-4-You/enterprise-ci-cd/.github/workflows/repo-hygiene.yml@v1
+    with:
+      fail-on-warnings: false
