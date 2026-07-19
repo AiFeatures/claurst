@@ -53,7 +53,7 @@ pub struct CodexProvider {
 impl CodexProvider {
     pub fn new(tokens: CodexTokens) -> Self {
         let http_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(600))
+            .timeout(crate::request_timeout())
             .build()
             .expect("failed to build reqwest client");
 
@@ -226,7 +226,7 @@ impl CodexProvider {
     ) -> reqwest::RequestBuilder {
         let builder = builder
             .bearer_auth(token)
-            .header("User-Agent", "claurst/0.0.9");
+            .header("User-Agent", concat!("claurst/", env!("CARGO_PKG_VERSION")));
 
         if let Some(id) = account_id {
             builder.header("ChatGPT-Account-Id", id)
@@ -282,6 +282,13 @@ impl CodexProvider {
             body["tools"] = json!(tools);
         }
 
+        // Apply reasoning effort / summary / verbosity exactly like the Copilot
+        // Responses path. The query layer already populates `reasoningEffort`
+        // (default "medium"), `reasoningSummary`, and `include` for gpt-5 Codex
+        // models — without this they were silently dropped and every request ran
+        // at the server default. Mirrors opencode's gpt-5 reasoning defaults.
+        CopilotProvider::apply_responses_provider_options_pub(&mut body, &request.provider_options);
+
         body
     }
 
@@ -301,54 +308,6 @@ impl CodexProvider {
             })
             .map(|value| value.to_string())
             .unwrap_or_else(|| json_val.to_string())
-    }
-
-    fn parse_stream_frame(
-        provider_id: &ProviderId,
-        event_name: &str,
-        data: &str,
-    ) -> Result<Option<ProviderResponse>, ProviderError> {
-        let trimmed = data.trim();
-        if trimmed.is_empty() || trimmed == "[DONE]" {
-            return Ok(None);
-        }
-
-        let json_val: Value =
-            serde_json::from_str(trimmed).map_err(|e| ProviderError::StreamError {
-                provider: provider_id.clone(),
-                message: format!("Failed to parse Codex stream JSON: {}", e),
-                partial_response: Some(trimmed.to_string()),
-            })?;
-
-        let effective_event = if event_name.is_empty() {
-            json_val
-                .get("type")
-                .and_then(|value| value.as_str())
-                .unwrap_or("")
-        } else {
-            event_name
-        };
-
-        match effective_event {
-            "response.completed" => {
-                let response_json = json_val.get("response").unwrap_or(&json_val);
-                let response =
-                    Self::parse_responses_response(provider_id, response_json).map_err(|e| {
-                        ProviderError::StreamError {
-                            provider: provider_id.clone(),
-                            message: format!("Failed to parse Codex completed event: {}", e),
-                            partial_response: Some(trimmed.to_string()),
-                        }
-                    })?;
-                Ok(Some(response))
-            }
-            "response.failed" | "response.error" | "error" => Err(ProviderError::StreamError {
-                provider: provider_id.clone(),
-                message: Self::extract_stream_error_message(&json_val),
-                partial_response: Some(trimmed.to_string()),
-            }),
-            _ => Ok(None),
-        }
     }
 
     // -----------------------------------------------------------------------
@@ -533,7 +492,12 @@ impl CodexProvider {
                         .and_then(|v| v.as_str())
                         .unwrap_or("{}");
                     let input = serde_json::from_str(args).unwrap_or_else(|_| json!({}));
-                    content.push(ContentBlock::ToolUse { id, name, input });
+                    content.push(ContentBlock::ToolUse {
+                        id,
+                        name,
+                        input,
+                        thought_signature: None,
+                    });
                 }
                 _ => {}
             }
@@ -579,79 +543,6 @@ impl CodexProvider {
         })
     }
 
-    // -----------------------------------------------------------------------
-    // Synthetic streaming  (same pattern as CopilotProvider)
-    // -----------------------------------------------------------------------
-
-    fn stream_synthetic_response(
-        response: ProviderResponse,
-    ) -> Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>> {
-        use claurst_core::types::ContentBlock;
-
-        let s = stream! {
-            yield Ok(StreamEvent::MessageStart {
-                id: response.id.clone(),
-                model: response.model.clone(),
-                usage: UsageInfo::default(),
-            });
-
-            for (index, block) in response.content.iter().enumerate() {
-                let start_block = match block {
-                    ContentBlock::Text { .. } => ContentBlock::Text { text: String::new() },
-                    ContentBlock::ToolUse { id, name, .. } => ContentBlock::ToolUse {
-                        id: id.clone(),
-                        name: name.clone(),
-                        input: json!({}),
-                    },
-                    ContentBlock::Thinking { .. } => ContentBlock::Thinking {
-                        thinking: String::new(),
-                        signature: String::new(),
-                    },
-                    other => other.clone(),
-                };
-                yield Ok(StreamEvent::ContentBlockStart {
-                    index,
-                    content_block: start_block,
-                });
-
-                match block {
-                    ContentBlock::Text { text } if !text.is_empty() => {
-                        yield Ok(StreamEvent::TextDelta {
-                            index,
-                            text: text.clone(),
-                        });
-                    }
-                    ContentBlock::ToolUse { input, .. } => {
-                        let json_str = serde_json::to_string(input)
-                            .unwrap_or_else(|_| "{}".to_string());
-                        if json_str != "{}" {
-                            yield Ok(StreamEvent::InputJsonDelta {
-                                index,
-                                partial_json: json_str,
-                            });
-                        }
-                    }
-                    ContentBlock::Thinking { thinking, .. } if !thinking.is_empty() => {
-                        yield Ok(StreamEvent::ThinkingDelta {
-                            index,
-                            thinking: thinking.clone(),
-                        });
-                    }
-                    _ => {}
-                }
-
-                yield Ok(StreamEvent::ContentBlockStop { index });
-            }
-
-            yield Ok(StreamEvent::MessageDelta {
-                stop_reason: Some(response.stop_reason.clone()),
-                usage: Some(response.usage.clone()),
-            });
-            yield Ok(StreamEvent::MessageStop);
-        };
-
-        Box::pin(s)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -694,7 +585,7 @@ impl LlmProvider for CodexProvider {
             let mut saw_tool_call = false;
             let mut open_blocks: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
-            'outer: while let Some(chunk_result) = byte_stream.next().await {
+            while let Some(chunk_result) = byte_stream.next().await {
                 let chunk = match chunk_result {
                     Ok(chunk) => chunk,
                     Err(e) => {
@@ -819,6 +710,7 @@ impl LlmProvider for CodexProvider {
                                                         id: call_id,
                                                         name,
                                                         input: json!({}),
+                                                        thought_signature: None,
                                                     },
                                                 });
                                             }
@@ -925,7 +817,9 @@ impl LlmProvider for CodexProvider {
                                             model: model_name.clone(),
                                             usage: UsageInfo::default(),
                                         });
-                                        message_started = true;
+                                        // No reassignment: this branch is the
+                                        // stream-completion handler — execution
+                                        // never re-enters the guard below.
                                     }
 
                                     let mut remaining: Vec<usize> = open_blocks.drain().collect();
@@ -1011,20 +905,22 @@ impl LlmProvider for CodexProvider {
         Ok(Box::pin(s))
     }
 
-    async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+    async fn discover_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+        use claurst_core::codex_oauth::codex_limit_override;
         let models = CODEX_MODELS
             .iter()
-            .map(|(id, name)| ModelInfo {
-                id: ModelId::new(*id),
-                provider_id: self.id.clone(),
-                name: name.to_string(),
-                context_window: match *id {
-                    "gpt-5.4" | "gpt-5-codex" | "gpt-5-mini" => 400_000,
-                    "gpt-4.1" => 128_000,
-                    "o4-mini" => 200_000,
-                    _ => 128_000,
-                },
-                max_output_tokens: 32_768,
+            .map(|(id, name)| {
+                let (context_window, max_output_tokens) = codex_limit_override(id)
+                    .map(|(ctx, _, out)| (ctx, out))
+                    .unwrap_or((400_000, 128_000));
+                ModelInfo {
+                    id: ModelId::new(*id),
+                    provider_id: self.id.clone(),
+                    name: name.to_string(),
+                    context_window,
+                    max_output_tokens,
+                    ..Default::default()
+                }
             })
             .collect();
         Ok(models)

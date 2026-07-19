@@ -279,17 +279,14 @@ impl RemoteSettingsManager {
     /// Fails open: returns the stale cached value (or `None`) on any error.
     pub async fn fetch_once_and_cache(&self) -> Option<Value> {
         // Load any previously cached settings to compute an ETag checksum.
-        let cached_raw = match tokio::fs::read_to_string(&self.cache_path).await {
-            Ok(text) => Some(text),
-            Err(_) => None,
-        };
+        let cached_raw = tokio::fs::read_to_string(&self.cache_path).await.ok();
         let cached_settings: Option<Value> = cached_raw
             .as_deref()
             .and_then(|t| serde_json::from_str(t).ok());
 
         let cached_checksum = cached_settings
             .as_ref()
-            .map(|s| compute_checksum_from_settings(s));
+            .map(compute_checksum_from_settings);
 
         match self
             .fetch_with_retry(cached_checksum.as_deref())
@@ -405,11 +402,9 @@ pub fn merge_remote_into_local(local: &Value, remote: &Value) -> Value {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Return the ~/.claurst directory, falling back to the current directory.
+/// Return the canonical claurst home directory.
 fn claude_config_dir() -> PathBuf {
-    dirs::home_dir()
-        .map(|h| h.join(".claurst"))
-        .unwrap_or_else(|| PathBuf::from(".claurst"))
+    crate::config::Settings::config_dir()
 }
 
 /// Exponential backoff delay for retry attempt `n` (1-indexed).

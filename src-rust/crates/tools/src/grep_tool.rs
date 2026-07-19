@@ -67,6 +67,9 @@ fn extensions_for_type(t: &str) -> Vec<&'static str> {
 
 #[async_trait]
 impl Tool for GrepTool {
+    // Gates itself: calls `ctx.check_permission_for_path` in `execute()` (#210).
+    fn self_gates(&self) -> bool { true }
+
     fn name(&self) -> &str {
         claurst_core::constants::TOOL_NAME_GREP
     }
@@ -144,6 +147,15 @@ impl Tool for GrepTool {
             .map(|p| ctx.resolve_path(p))
             .unwrap_or_else(|| ctx.working_dir.clone());
 
+        if let Err(e) = ctx.check_permission_for_path(
+            self.name(),
+            &format!("Grep {} in {}", params.pattern, search_path.display()),
+            search_path.clone(),
+            true,
+        ) {
+            return ToolResult::error(e.to_string());
+        }
+
         debug!(pattern = %params.pattern, path = %search_path.display(), "Running grep");
 
         // Compile regex
@@ -210,6 +222,17 @@ impl Tool for GrepTool {
 
             let path = entry.path();
 
+            if !ctx.path_is_within_workspace(path) {
+                if let Err(e) = ctx.check_permission_for_path(
+                    self.name(),
+                    &format!("Grep result {}", path.display()),
+                    path.to_path_buf(),
+                    true,
+                ) {
+                    return ToolResult::error(e.to_string());
+                }
+            }
+
             // Type filter
             if !type_exts.is_empty() {
                 let ext = path
@@ -264,13 +287,13 @@ impl Tool for GrepTool {
                         let start = line_idx.saturating_sub(context_lines);
                         let end = (*line_idx + context_lines + 1).min(lines.len());
 
-                        for ci in start..end {
+                        for (ci, line) in lines.iter().enumerate().take(end).skip(start) {
                             let prefix = if show_line_numbers {
                                 format!("{}:{}:", path.display(), ci + 1)
                             } else {
                                 format!("{}:", path.display())
                             };
-                            results.push(format!("{}{}", prefix, lines[ci]));
+                            results.push(format!("{}{}", prefix, line));
                         }
 
                         if context_lines > 0 {
@@ -346,11 +369,11 @@ impl GrepTool {
                 for line_idx in &matching_lines {
                     let start = line_idx.saturating_sub(context_lines);
                     let end = (*line_idx + context_lines + 1).min(lines.len());
-                    for ci in start..end {
+                    for (ci, line) in lines.iter().enumerate().take(end).skip(start) {
                         if show_line_numbers {
-                            results.push(format!("{}:{}", ci + 1, lines[ci]));
+                            results.push(format!("{}:{}", ci + 1, line));
                         } else {
-                            results.push(lines[ci].to_string());
+                            results.push(line.to_string());
                         }
                     }
                     if context_lines > 0 {

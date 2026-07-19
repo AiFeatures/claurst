@@ -2,7 +2,7 @@
 //! Verifies that core data structures are usable as the TS CLI would use them.
 
 use claurst_core::{
-    session_storage::{TranscriptEntry, transcript_dir},
+    session_storage::transcript_dir,
     prompt_history::HistoryEntry,
     file_history::FileHistory,
     claudemd::load_all_memory_files,
@@ -60,6 +60,7 @@ fn get_message_text_user() {
         content: MessageContent::Text("hello world".to_string()),
         uuid: None,
         cost: None,
+        snapshot_patch: None,
     };
     assert_eq!(get_message_text(&msg), "hello world");
 }
@@ -71,6 +72,7 @@ fn is_tool_use_message_false_for_user() {
         content: MessageContent::Text("not a tool".to_string()),
         uuid: None,
         cost: None,
+        snapshot_patch: None,
     };
     assert!(!is_tool_use_message(&msg));
 }

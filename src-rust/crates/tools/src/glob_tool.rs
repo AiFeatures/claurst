@@ -18,6 +18,9 @@ struct GlobInput {
 
 #[async_trait]
 impl Tool for GlobTool {
+    // Gates itself: calls `ctx.check_permission_for_path` in `execute()` (#210).
+    fn self_gates(&self) -> bool { true }
+
     fn name(&self) -> &str {
         claurst_core::constants::TOOL_NAME_GLOB
     }
@@ -62,6 +65,15 @@ impl Tool for GlobTool {
             .map(|p| ctx.resolve_path(p))
             .unwrap_or_else(|| ctx.working_dir.clone());
 
+        if let Err(e) = ctx.check_permission_for_path(
+            self.name(),
+            &format!("Glob {} in {}", params.pattern, base_dir.display()),
+            base_dir.clone(),
+            true,
+        ) {
+            return ToolResult::error(e.to_string());
+        }
+
         debug!(pattern = %params.pattern, dir = %base_dir.display(), "Running glob");
 
         if !base_dir.exists() || !base_dir.is_dir() {
@@ -79,7 +91,23 @@ impl Tool for GlobTool {
         let pattern_str = pattern_str.replace('\\', "/");
 
         let entries: Vec<PathBuf> = match glob::glob(&pattern_str) {
-            Ok(paths) => paths.filter_map(|p| p.ok()).collect(),
+            Ok(paths) => {
+                let mut out = Vec::new();
+                for path in paths.filter_map(|p| p.ok()) {
+                    if !ctx.path_is_within_workspace(&path) {
+                        if let Err(e) = ctx.check_permission_for_path(
+                            self.name(),
+                            &format!("Glob result {}", path.display()),
+                            path.clone(),
+                            true,
+                        ) {
+                            return ToolResult::error(e.to_string());
+                        }
+                    }
+                    out.push(path);
+                }
+                out
+            }
             Err(e) => {
                 return ToolResult::error(format!("Invalid glob pattern: {}", e));
             }
@@ -102,7 +130,7 @@ impl Tool for GlobTool {
             })
             .collect();
 
-        entries_with_time.sort_by(|a, b| b.1.cmp(&a.1));
+        entries_with_time.sort_by_key(|b| std::cmp::Reverse(b.1));
 
         let total = entries_with_time.len();
         let max_results = 250;

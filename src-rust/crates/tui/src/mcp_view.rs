@@ -89,7 +89,7 @@ pub enum McpViewPane {
 
 #[derive(Debug, Clone)]
 pub struct McpViewState {
-    pub open: bool,
+    pub visible: bool,
     pub servers: Vec<McpServerView>,
     pub active_pane: McpViewPane,
     pub selected_server: usize,
@@ -104,7 +104,7 @@ pub struct McpViewState {
 impl McpViewState {
     pub fn new() -> Self {
         Self {
-            open: false,
+            visible: false,
             servers: Vec::new(),
             active_pane: McpViewPane::ServerList,
             selected_server: 0,
@@ -123,7 +123,7 @@ impl McpViewState {
         self.tool_search.clear();
         self.active_pane = McpViewPane::ServerList;
         self.error_expanded = false;
-        self.open = true;
+        self.visible = true;
     }
 
     /// Toggle full error detail for the currently selected server.
@@ -131,7 +131,7 @@ impl McpViewState {
         self.error_expanded = !self.error_expanded;
     }
 
-    pub fn close(&mut self) { self.open = false; }
+    pub fn close(&mut self) { self.visible = false; }
 
     pub fn switch_pane(&mut self) {
         self.active_pane = match self.active_pane {
@@ -220,7 +220,7 @@ impl Default for McpViewState {
 // ---------------------------------------------------------------------------
 
 pub fn render_mcp_view(state: &McpViewState, area: Rect, buf: &mut Buffer) {
-    if !state.open { return; }
+    if !state.visible { return; }
 
     let w = (area.width * 9 / 10).max(50).min(area.width);
     let h = (area.height * 4 / 5).max(15).min(area.height);
@@ -283,6 +283,8 @@ pub fn render_mcp_view(state: &McpViewState, area: Rect, buf: &mut Buffer) {
         Span::raw("filter tools  "),
         Span::styled(" e ", Style::default().fg(CLAURST_ACCENT).add_modifier(Modifier::BOLD)),
         Span::raw("error detail  "),
+        Span::styled(" a ", Style::default().fg(CLAURST_ACCENT).add_modifier(Modifier::BOLD)),
+        Span::raw("auth  "),
         Span::styled(" r ", Style::default().fg(CLAURST_ACCENT).add_modifier(Modifier::BOLD)),
         Span::raw("reconnect"),
     ]);
@@ -593,7 +595,7 @@ mod tests {
     #[test]
     fn mcp_view_state_defaults() {
         let state = McpViewState::new();
-        assert!(!state.open);
+        assert!(!state.visible);
         assert!(!state.error_expanded);
         assert_eq!(state.selected_server, 0);
     }
@@ -604,7 +606,7 @@ mod tests {
         state.error_expanded = true;
         state.open(vec![make_server("test", McpViewStatus::Connected, None)]);
         assert!(!state.error_expanded, "open() should reset error_expanded");
-        assert!(state.open);
+        assert!(state.visible);
     }
 
     #[test]
@@ -645,6 +647,19 @@ mod tests {
         let buf = terminal.backend().buffer().clone();
         let content: String = buf.content().iter().map(|c| c.symbol().chars().next().unwrap_or(' ')).collect();
         assert!(content.contains("timeout") || content.contains("Error Detail"));
+    }
+
+    #[test]
+    fn mcp_view_footer_renders_auth_hotkey() {
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        let mut state = McpViewState::new();
+        state.open(vec![make_server("fs-server", McpViewStatus::Connected, None)]);
+        terminal.draw(|frame| {
+            render_mcp_view(&state, frame.area(), frame.buffer_mut());
+        }).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let content: String = buf.content().iter().map(|c| c.symbol().chars().next().unwrap_or(' ')).collect();
+        assert!(content.contains("auth") || content.contains(" a "));
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! Named commands (e.g. `claude agents`, `claude ide`, `claude branch`, …).
+//! Named commands (e.g. `claurst agents`, `claurst ide`, `claurst branch`, …).
 //!
 //! These complement slash commands with more complex top-level flows.
 //! A named command is invoked when the *first* CLI argument matches one
@@ -23,15 +23,15 @@ use crate::{CommandContext, CommandResult};
 // Trait
 // ---------------------------------------------------------------------------
 
-/// A top-level named command (`claude <name> [args…]`).
+/// A top-level named command (`claurst <name> [args…]`).
 pub trait NamedCommand: Send + Sync {
     /// Primary command name, e.g. `"agents"`.
     fn name(&self) -> &str;
 
-    /// One-line description used in `claude --help`.
+    /// One-line description used in `claurst --help`.
     fn description(&self) -> &str;
 
-    /// Usage hint shown in `claude <name> --help`.
+    /// Usage hint shown in `claurst <name> --help`.
     fn usage(&self) -> &str;
 
     /// Execute the command.  `args` is the slice of arguments *after* the
@@ -48,7 +48,7 @@ pub struct AgentsCommand;
 impl NamedCommand for AgentsCommand {
     fn name(&self) -> &str { "agents" }
     fn description(&self) -> &str { "Manage and configure sub-agents" }
-    fn usage(&self) -> &str { "claude agents [list|create|edit|delete] [name]" }
+    fn usage(&self) -> &str { "claurst agents [list|create|edit|delete] [name]" }
 
     fn execute_named(&self, args: &[&str], ctx: &CommandContext) -> CommandResult {
         match args.first().copied().unwrap_or("list") {
@@ -61,7 +61,7 @@ impl NamedCommand for AgentsCommand {
                     return CommandResult::Message(
                         "Available Agents (0)\n\n\
                          No custom agents defined. Create one with /new-agent\n\
-                         or run: claude agents create <name>"
+                         or run: claurst agents create <name>"
                             .to_string(),
                     );
                 }
@@ -81,7 +81,7 @@ impl NamedCommand for AgentsCommand {
                         ));
                     }
                 }
-                out.push_str("\nUse 'claude agents create <name>' to add a new agent.");
+                out.push_str("\nUse 'claurst agents create <name>' to add a new agent.");
                 CommandResult::Message(out)
             }
             "create" => {
@@ -101,7 +101,7 @@ impl NamedCommand for AgentsCommand {
                 let name = match args.get(1).copied() {
                     Some(n) => n,
                     None => return CommandResult::Error(
-                        "Usage: claude agents edit <name>".to_string(),
+                        "Usage: claurst agents edit <name>".to_string(),
                     ),
                 };
                 CommandResult::Message(format!(
@@ -112,7 +112,7 @@ impl NamedCommand for AgentsCommand {
                 let name = match args.get(1).copied() {
                     Some(n) => n,
                     None => return CommandResult::Error(
-                        "Usage: claude agents delete <name>".to_string(),
+                        "Usage: claurst agents delete <name>".to_string(),
                     ),
                 };
                 CommandResult::Message(format!(
@@ -133,12 +133,12 @@ pub struct AddDirCommand;
 impl NamedCommand for AddDirCommand {
     fn name(&self) -> &str { "add-dir" }
     fn description(&self) -> &str { "Add a directory to Claurst's allowed workspace paths" }
-    fn usage(&self) -> &str { "claude add-dir <path>" }
+    fn usage(&self) -> &str { "claurst add-dir <path>" }
 
     fn execute_named(&self, args: &[&str], _ctx: &CommandContext) -> CommandResult {
         let raw = match args.first() {
             Some(p) => *p,
-            None => return CommandResult::Error("Usage: claude add-dir <path>".to_string()),
+            None => return CommandResult::Error("Usage: claurst add-dir <path>".to_string()),
         };
 
         let path = std::path::Path::new(raw);
@@ -192,7 +192,7 @@ pub struct BranchCommand;
 impl NamedCommand for BranchCommand {
     fn name(&self) -> &str { "branch" }
     fn description(&self) -> &str { "Create a branch of the current conversation at this point" }
-    fn usage(&self) -> &str { "claude branch [create|list|switch] [name|id]" }
+    fn usage(&self) -> &str { "claurst branch [create|list|switch] [name|id]" }
 
     fn execute_named(&self, args: &[&str], ctx: &CommandContext) -> CommandResult {
         match args.first().copied().unwrap_or("") {
@@ -230,7 +230,7 @@ impl NamedCommand for BranchCommand {
                         let title = new_session.title.as_deref().unwrap_or("(untitled)");
                         CommandResult::Message(format!(
                             "Created branch: \"{title}\"\nNew session ID: {}\n\
-                             To resume original: claude -r {}\n\
+                             To resume original: claurst -r{}\n\
                              To switch to branch: /branch switch {}",
                             new_session.id,
                             ctx.session_id,
@@ -273,7 +273,7 @@ impl NamedCommand for BranchCommand {
                             b.title.as_deref().unwrap_or("(untitled)")
                         ));
                     }
-                    out.push_str("\nUse: claude branch switch <id>");
+                    out.push_str("\nUse: claurst branch switch <id>");
                     CommandResult::Message(out)
                 }
             }
@@ -282,7 +282,7 @@ impl NamedCommand for BranchCommand {
                     Some(i) if !i.is_empty() => i.to_string(),
                     _ => {
                         return CommandResult::Error(
-                            "Usage: claude branch switch <session-id>".to_string(),
+                            "Usage: claurst branch switch <session-id>".to_string(),
                         )
                     }
                 };
@@ -297,7 +297,7 @@ impl NamedCommand for BranchCommand {
                     Err(e) => CommandResult::Error(format!("Could not load session '{id}': {e}")),
                 }
             }
-            sub => CommandResult::Error(format!("Unknown branch subcommand: '{sub}'\nUsage: claude branch [create|list|switch] [name|id]")),
+            sub => CommandResult::Error(format!("Unknown branch subcommand: '{sub}'\nUsage: claurst branch [create|list|switch] [name|id]")),
         }
     }
 }
@@ -311,7 +311,7 @@ pub struct TagCommand;
 impl NamedCommand for TagCommand {
     fn name(&self) -> &str { "tag" }
     fn description(&self) -> &str { "Toggle a searchable tag on the current session" }
-    fn usage(&self) -> &str { "claude tag [list|add|remove|toggle] [tag]" }
+    fn usage(&self) -> &str { "claurst tag [list|add|remove|toggle] [tag]" }
 
     fn execute_named(&self, args: &[&str], ctx: &CommandContext) -> CommandResult {
         let session_id = ctx.session_id.clone();
@@ -350,7 +350,7 @@ impl NamedCommand for TagCommand {
                     Some(t) if !t.is_empty() => t.to_string(),
                     _ => {
                         return CommandResult::Error(
-                            "Usage: claude tag add <tag>".to_string(),
+                            "Usage: claurst tag add <tag>".to_string(),
                         )
                     }
                 };
@@ -372,7 +372,7 @@ impl NamedCommand for TagCommand {
                     Some(t) if !t.is_empty() => t.to_string(),
                     _ => {
                         return CommandResult::Error(
-                            "Usage: claude tag remove <tag>".to_string(),
+                            "Usage: claurst tag remove <tag>".to_string(),
                         )
                     }
                 };
@@ -392,7 +392,7 @@ impl NamedCommand for TagCommand {
                     Some(t) if !t.is_empty() => t.to_string(),
                     _ => {
                         return CommandResult::Error(
-                            "Usage: claude tag toggle <tag>".to_string(),
+                            "Usage: claurst tag toggle <tag>".to_string(),
                         )
                     }
                 };
@@ -434,7 +434,7 @@ impl NamedCommand for TagCommand {
                 }
             }
             sub => CommandResult::Error(format!(
-                "Unknown tag subcommand: '{sub}'\nUsage: claude tag [list|add|remove|toggle] [tag]"
+                "Unknown tag subcommand: '{sub}'\nUsage: claurst tag [list|add|remove|toggle] [tag]"
             )),
         }
     }
@@ -449,7 +449,7 @@ pub struct PassesCommand;
 impl NamedCommand for PassesCommand {
     fn name(&self) -> &str { "passes" }
     fn description(&self) -> &str { "Share a free week of Claurst with friends" }
-    fn usage(&self) -> &str { "claude passes" }
+    fn usage(&self) -> &str { "claurst passes" }
 
     fn execute_named(&self, _args: &[&str], _ctx: &CommandContext) -> CommandResult {
         CommandResult::Message(
@@ -494,7 +494,7 @@ pub struct IdeCommand;
 impl NamedCommand for IdeCommand {
     fn name(&self) -> &str { "ide" }
     fn description(&self) -> &str { "Manage IDE integrations and show status" }
-    fn usage(&self) -> &str { "claude ide [status|connect|disconnect|open]" }
+    fn usage(&self) -> &str { "claurst ide [status|connect|disconnect|open]" }
 
     fn execute_named(&self, _args: &[&str], _ctx: &CommandContext) -> CommandResult {
         // ---- Environment-based IDE detection --------------------------------
@@ -511,15 +511,13 @@ impl NamedCommand for IdeCommand {
         };
 
         // ---- Lockfile-based connection status --------------------------------
-        let lockfile_dir = dirs::home_dir()
-            .map(|h| h.join(".claurst").join("ide"))
-            .unwrap_or_default();
+        let lockfile_dir = claurst_core::config::Settings::config_dir().join("ide");
 
         let mut ides = Vec::new();
         if let Ok(entries) = std::fs::read_dir(&lockfile_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.extension().map_or(false, |e| e == "lock") {
+                if path.extension().is_some_and(|e| e == "lock") {
                     if let Ok(lock_content) = std::fs::read_to_string(&path) {
                         if let Ok(info) = serde_json::from_str::<serde_json::Value>(&lock_content) {
                             let pid = info["pid"].as_u64().unwrap_or(0);
@@ -548,7 +546,7 @@ impl NamedCommand for IdeCommand {
         let connection_section = if ides.is_empty() {
             "No active IDE extension connections found.".to_string()
         } else {
-            format!("Connected IDEs:\n{}\n\nUse 'claude ide open <file>' to open a file in the IDE.", ides.join("\n"))
+            format!("Connected IDEs:\n{}\n\nUse 'claurst ide open <file>' to open a file in the IDE.", ides.join("\n"))
         };
 
         CommandResult::Message(format!("{env_section}\n\n{connection_section}"))
@@ -564,7 +562,7 @@ pub struct PrCommentsCommand;
 impl NamedCommand for PrCommentsCommand {
     fn name(&self) -> &str { "pr-comments" }
     fn description(&self) -> &str { "Get review comments from the current GitHub pull request" }
-    fn usage(&self) -> &str { "claude pr-comments" }
+    fn usage(&self) -> &str { "claurst pr-comments" }
 
     fn execute_named(&self, _args: &[&str], _ctx: &CommandContext) -> CommandResult {
         // Step 1: Get current git remote + PR info via gh CLI
@@ -636,7 +634,7 @@ pub struct DesktopCommand;
 impl NamedCommand for DesktopCommand {
     fn name(&self) -> &str { "desktop" }
     fn description(&self) -> &str { "Download and set up Claurst Desktop app" }
-    fn usage(&self) -> &str { "claude desktop" }
+    fn usage(&self) -> &str { "claurst desktop" }
 
     fn execute_named(&self, _args: &[&str], ctx: &CommandContext) -> CommandResult {
         let os = std::env::consts::OS;
@@ -665,7 +663,7 @@ impl NamedCommand for DesktopCommand {
         // If a remote session is active the user is already bridged — show a
         // deep link so they can open the current session in Desktop.
         if let Some(ref session_url) = ctx.remote_session_url {
-            let session_id = session_url.split('/').last().unwrap_or("");
+            let session_id = session_url.split('/').next_back().unwrap_or("");
             let deep_link = format!("claude://session/{}", session_id);
 
             let mut msg = String::new();
@@ -798,7 +796,7 @@ pub struct MobileCommand;
 impl NamedCommand for MobileCommand {
     fn name(&self) -> &str { "mobile" }
     fn description(&self) -> &str { "Download the Claurst mobile app" }
-    fn usage(&self) -> &str { "claude mobile [ios|android]" }
+    fn usage(&self) -> &str { "claurst mobile [ios|android]" }
 
     fn execute_named(&self, args: &[&str], ctx: &CommandContext) -> CommandResult {
         let ios_url     = "https://apps.apple.com/app/claude-by-anthropic/id6473753684";
@@ -869,7 +867,7 @@ pub struct InstallGithubAppCommand;
 impl NamedCommand for InstallGithubAppCommand {
     fn name(&self) -> &str { "install-github-app" }
     fn description(&self) -> &str { "Set up Claurst GitHub Actions for a repository" }
-    fn usage(&self) -> &str { "claude install-github-app" }
+    fn usage(&self) -> &str { "claurst install-github-app" }
 
     fn execute_named(&self, _args: &[&str], ctx: &CommandContext) -> CommandResult {
         let provider_id = ctx.config.selected_provider_id();
@@ -906,7 +904,7 @@ pub struct RemoteSetupCommand;
 impl NamedCommand for RemoteSetupCommand {
     fn name(&self) -> &str { "remote-setup" }
     fn description(&self) -> &str { "Check and configure a remote Claurst environment" }
-    fn usage(&self) -> &str { "claude remote-setup" }
+    fn usage(&self) -> &str { "claurst remote-setup" }
 
     fn execute_named(&self, _args: &[&str], ctx: &CommandContext) -> CommandResult {
         use std::net::ToSocketAddrs;
@@ -952,7 +950,7 @@ impl NamedCommand for RemoteSetupCommand {
             }
         ));
 
-        // Step 3: Check claude config dir exists
+        // Step 3: Check claurst config dir exists
         let config_dir = claurst_core::config::Settings::config_dir();
         let has_config = config_dir.exists();
         steps.push(format!(
@@ -961,7 +959,7 @@ impl NamedCommand for RemoteSetupCommand {
             if has_config {
                 format!("exists at {}", config_dir.display())
             } else {
-                "missing \u{2014} run 'claude' once to initialize".to_string()
+                "missing \u{2014} run 'claurst' once to initialize".to_string()
             }
         ));
 
@@ -1000,9 +998,9 @@ impl NamedCommand for RemoteSetupCommand {
              {}",
             steps.join("\n"),
             if all_ok {
-                "\u{2713} All checks passed. Claurst is ready for remote use.\nStart a session: claude --bridge"
+                "\u{2713} All checks passed. Claurst is ready for remote use.\nStart a session: claurst --bridge"
             } else {
-                "\u{2717} Some checks failed. Fix the issues above and run 'claude remote-setup' again."
+                "\u{2717} Some checks failed. Fix the issues above and run 'claurst remote-setup' again."
             }
         ))
     }
@@ -1017,7 +1015,7 @@ pub struct StickersCommand;
 impl NamedCommand for StickersCommand {
     fn name(&self) -> &str { "stickers" }
     fn description(&self) -> &str { "Open the Claurst sticker page in your browser" }
-    fn usage(&self) -> &str { "claude stickers" }
+    fn usage(&self) -> &str { "claurst stickers" }
 
     fn execute_named(&self, _args: &[&str], _ctx: &CommandContext) -> CommandResult {
         let url = "https://www.stickermule.com/claudecode";
@@ -1039,7 +1037,7 @@ pub struct UltraplanCommand;
 impl NamedCommand for UltraplanCommand {
     fn name(&self) -> &str { "ultraplan" }
     fn description(&self) -> &str { "Launch Ultraplan agentic code planner with extended thinking" }
-    fn usage(&self) -> &str { "claude ultraplan [--effort=medium|high|maximum]" }
+    fn usage(&self) -> &str { "claurst ultraplan [--effort=medium|high|maximum]" }
 
     fn execute_named(&self, args: &[&str], _ctx: &CommandContext) -> CommandResult {
         // Parse effort level from args
@@ -1070,6 +1068,30 @@ impl NamedCommand for UltraplanCommand {
 }
 
 // ---------------------------------------------------------------------------
+// stats — persisted session analytics
+//
+// Reuses the existing `StatsCommand` struct (which already implements the
+// slash form for the *current* session). The `NamedCommand` form reads
+// JSONL transcripts on disk and produces aggregated views. Logic lives in
+// `crate::stats`.
+// ---------------------------------------------------------------------------
+
+impl NamedCommand for crate::StatsCommand {
+    fn name(&self) -> &str { "stats" }
+    fn description(&self) -> &str {
+        "Aggregate token / cost / tool stats across saved sessions"
+    }
+    fn usage(&self) -> &str {
+        "claurst stats [summary|sessions|tools|daily|session <id>] \
+         [--days N] [--top N] [--all-projects] [--json]"
+    }
+
+    fn execute_named(&self, args: &[&str], ctx: &CommandContext) -> CommandResult {
+        crate::stats::run(args, ctx)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Registry
 // ---------------------------------------------------------------------------
 
@@ -1089,6 +1111,7 @@ pub fn all_named_commands() -> Vec<Box<dyn NamedCommand>> {
         Box::new(RemoteSetupCommand),
         Box::new(StickersCommand),
         Box::new(UltraplanCommand),
+        Box::new(crate::StatsCommand),
     ]
 }
 
@@ -1119,6 +1142,7 @@ mod tests {
             session_title: None,
             remote_session_url: None,
             mcp_manager: None,
+            mcp_auth_runner: None,
         }
     }
 
@@ -1202,7 +1226,7 @@ mod tests {
 
     #[test]
     fn test_branch_create_no_session_returns_error() {
-        let ctx = make_ctx(); // session_id = "named-test-session" — no saved session
+        let _ctx = make_ctx(); // session_id = "named-test-session" — no saved session
         let cmd = BranchCommand;
         // Calling create on a session that isn't "pre-session" but also doesn't exist
         // on disk: we can't call block_in_place outside a tokio runtime in a sync test,

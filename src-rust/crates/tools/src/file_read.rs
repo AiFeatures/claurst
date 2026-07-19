@@ -19,6 +19,9 @@ struct FileReadInput {
 
 #[async_trait]
 impl Tool for FileReadTool {
+    // Gates itself: calls `ctx.check_permission_for_path` in `execute()` (#210).
+    fn self_gates(&self) -> bool { true }
+
     fn name(&self) -> &str {
         claurst_core::constants::TOOL_NAME_FILE_READ
     }
@@ -63,6 +66,16 @@ impl Tool for FileReadTool {
 
         let path = ctx.resolve_path(&params.file_path);
         debug!(path = %path.display(), "Reading file");
+
+        // Permission check
+        if let Err(e) = ctx.check_permission_for_path(
+            self.name(),
+            &format!("Read {}", path.display()),
+            path.clone(),
+            true,
+        ) {
+            return ToolResult::error(e.to_string());
+        }
 
         // Check if file exists
         if !path.exists() {

@@ -25,6 +25,9 @@ struct ListMcpResourcesInput {
 
 #[async_trait]
 impl Tool for ListMcpResourcesTool {
+    // Gates itself: calls `ctx.check_permission` in `execute()` (#210).
+    fn self_gates(&self) -> bool { true }
+
     fn name(&self) -> &str { "ListMcpResources" }
 
     fn description(&self) -> &str {
@@ -52,6 +55,21 @@ impl Tool for ListMcpResourcesTool {
             Ok(p) => p,
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
         };
+
+        if let Err(e) = ctx.check_permission(
+            self.name(),
+            &format!(
+                "List MCP resources{}",
+                params
+                    .server
+                    .as_deref()
+                    .map(|s| format!(" for {}", s))
+                    .unwrap_or_default()
+            ),
+            true,
+        ) {
+            return ToolResult::error(e.to_string());
+        }
 
         let manager = match &ctx.mcp_manager {
             Some(m) => m,
@@ -91,6 +109,9 @@ struct ReadMcpResourceInput {
 
 #[async_trait]
 impl Tool for ReadMcpResourceTool {
+    // Gates itself: calls `ctx.check_permission` in `execute()` (#210).
+    fn self_gates(&self) -> bool { true }
+
     fn name(&self) -> &str { "ReadMcpResource" }
 
     fn description(&self) -> &str {
@@ -122,6 +143,14 @@ impl Tool for ReadMcpResourceTool {
             Ok(p) => p,
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
         };
+
+        if let Err(e) = ctx.check_permission(
+            self.name(),
+            &format!("Read MCP resource {}:{}", params.server, params.uri),
+            true,
+        ) {
+            return ToolResult::error(e.to_string());
+        }
 
         let manager = match &ctx.mcp_manager {
             Some(m) => m,

@@ -158,7 +158,12 @@ impl Tool for MonitorTool {
                                         .output();
                                 }
                             }
-                            global_registry().update_status(&id, TaskStatus::Cancelled);
+                            // Signal the task's cancellation token (if any) and
+                            // mark it Cancelled. For an in-process background
+                            // agent this is what actually stops the running loop
+                            // (issue #219); the pid-kill above covers external
+                            // OS child processes.
+                            global_registry().cancel(&id);
                             ToolResult::success(format!("Task {} cancelled.", id))
                         } else {
                             ToolResult::error(format!(
@@ -268,6 +273,10 @@ mod tests {
             config: Config::default(),
             managed_agent_config: None,
             completion_notifier: None,
+            pending_permissions: None,
+            permission_manager: None,
+            user_question_tx: None,
+            cancel_token: tokio_util::sync::CancellationToken::new(),
         }
     }
 }

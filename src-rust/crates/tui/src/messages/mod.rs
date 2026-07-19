@@ -27,7 +27,12 @@ pub use markdown_enhanced::{
 };
 
 /// Context passed to all renderers.
-pub struct RenderContext {
+///
+/// `tool_names` and `expanded_thinking` are borrowed rather than owned: the
+/// transcript builder holds a single copy of each per render pass and lends it
+/// to every message renderer, so the hot path no longer clones a `HashMap` and
+/// a `HashSet` for every assistant message (see issue #222).
+pub struct RenderContext<'a> {
     /// Current terminal width (for word-wrap decisions).
     pub width: u16,
     /// Whether syntax highlighting is enabled.
@@ -36,19 +41,26 @@ pub struct RenderContext {
     pub show_thinking: bool,
     /// Maps `tool_use_id` → `tool_name` so ToolResult blocks can dispatch to
     /// the correct specialized renderer (e.g. Bash output vs. generic result).
-    pub tool_names: HashMap<String, String>,
+    pub tool_names: &'a HashMap<String, String>,
     /// Set of thinking block content hashes that are expanded per-block.
-    pub expanded_thinking: std::collections::HashSet<u64>,
+    pub expanded_thinking: &'a std::collections::HashSet<u64>,
 }
 
-impl Default for RenderContext {
+/// Shared empty collections so `RenderContext::default()` can hand out
+/// `'static` borrows without allocating.
+static EMPTY_TOOL_NAMES: std::sync::LazyLock<HashMap<String, String>> =
+    std::sync::LazyLock::new(HashMap::new);
+static EMPTY_EXPANDED_THINKING: std::sync::LazyLock<std::collections::HashSet<u64>> =
+    std::sync::LazyLock::new(std::collections::HashSet::new);
+
+impl Default for RenderContext<'static> {
     fn default() -> Self {
         Self {
             width: 80,
             highlight: true,
             show_thinking: false,
-            tool_names: HashMap::new(),
-            expanded_thinking: std::collections::HashSet::new(),
+            tool_names: &EMPTY_TOOL_NAMES,
+            expanded_thinking: &EMPTY_EXPANDED_THINKING,
         }
     }
 }
@@ -69,6 +81,13 @@ const TRANSCRIPT_MUTED: Color = Color::Rgb(139, 139, 153);
 const TRANSCRIPT_SUBTLE: Color = Color::Rgb(112, 112, 126);
 
 const TOOL_RESULT_MAX_LINES: usize = 30;
+
+/// Accent color for goal-event blocks (warm amber/gold).
+const GOAL_ACCENT: Color = Color::Rgb(255, 170, 50);
+/// Body text color for goal-event objective display.
+const GOAL_BODY: Color = Color::Rgb(215, 180, 110);
+/// Muted color for goal continuation turn markers.
+const GOAL_MUTED: Color = Color::Rgb(130, 115, 75);
 
 /// Render a code block with optional language label. Uses basic styling
 /// since full syntect integration is behind a feature flag.
@@ -182,30 +201,23 @@ fn apply_block_style(mut line: Line<'static>, width: u16) -> Line<'static> {
 fn empty_block_line(width: u16) -> Line<'static> {
     apply_block_style(Line::from(""), width)
 }
-
-fn short_model_name(model: &str) -> String {
-    model
-        .split_once('/')
-        .map(|(_, model)| model)
-        .unwrap_or(model)
-        .to_string()
-}
-
-fn title_case_mode(mode: &str) -> String {
-    let mut chars = mode.chars();
-    match chars.next() {
-        Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
-        None => String::new(),
-    }
-}
-
 fn render_attachment_chip(kind: &str, label: String) -> Line<'static> {
+    render_attachment_chip_colored(kind, label, CLAUDE_ORANGE, Color::Black)
+}
+
+fn render_file_chip(label: String) -> Line<'static> {
+    // Use a steel-blue badge with white text for file injections — distinct from
+    // the orange img/doc chips and readable on dark terminal backgrounds.
+    render_attachment_chip_colored("file", label, Color::Rgb(51, 102, 170), Color::White)
+}
+
+fn render_attachment_chip_colored(kind: &str, label: String, badge_bg: Color, badge_fg: Color) -> Line<'static> {
     Line::from(vec![
         Span::styled(
             format!(" {} ", kind),
             Style::default()
-                .fg(Color::Black)
-                .bg(CLAUDE_ORANGE)
+                .fg(badge_fg)
+                .bg(badge_bg)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
@@ -224,47 +236,24 @@ fn user_metadata_line(_meta: Option<&TurnMetadata>) -> Option<Line<'static>> {
 pub fn render_transcript_assistant_meta(meta: Option<&TurnMetadata>, accent: Color) -> Option<Line<'static>> {
     let meta = meta?;
 
-    // Always show at least mode — matches OpenCode's "Build · Model · Duration"
-    let mode = meta
-        .agent_mode
-        .as_deref()
-        .filter(|m| !m.is_empty())
-        .map(title_case_mode)
-        .unwrap_or_else(|| "Build".to_string());
+    // Only show interrupted status — mode, model, and duration are already
+    // displayed in the status line above the prompt.
+    if !meta.interrupted {
+        return None;
+    }
 
-    let mut spans = vec![
+    let spans = vec![
         Span::styled(
             "   \u{25a3} ",
             Style::default()
                 .fg(accent)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(mode, Style::default().fg(TRANSCRIPT_TEXT)),
-    ];
-
-    if let Some(model) = meta.model_name.as_deref().filter(|m| !m.is_empty()) {
-        spans.push(Span::styled(" \u{00b7} ", Style::default().fg(TRANSCRIPT_SUBTLE)));
-        spans.push(Span::styled(
-            short_model_name(model),
-            Style::default().fg(TRANSCRIPT_MUTED),
-        ));
-    }
-
-    if let Some(duration) = meta.duration.as_deref().filter(|d| !d.is_empty()) {
-        spans.push(Span::styled(" \u{00b7} ", Style::default().fg(TRANSCRIPT_SUBTLE)));
-        spans.push(Span::styled(
-            duration.to_string(),
-            Style::default().fg(TRANSCRIPT_MUTED),
-        ));
-    }
-
-    if meta.interrupted {
-        spans.push(Span::styled(" \u{00b7} ", Style::default().fg(TRANSCRIPT_SUBTLE)));
-        spans.push(Span::styled(
+        Span::styled(
             "interrupted",
             Style::default().fg(TRANSCRIPT_MUTED),
-        ));
-    }
+        ),
+    ];
 
     Some(Line::from(spans))
 }
@@ -278,14 +267,138 @@ pub fn render_transcript_live_text(text: &str, width: u16) -> Vec<Line<'static>>
     )
 }
 
+/// Segments of a potentially file-injected text block.
+enum TextSegment {
+    Plain(String),
+    FileBlock(String), // path attribute value
+}
+
+/// Normalize `@token` references in user text when those files were already shown
+/// as chips. Replaces `@long/absolute/path/file.rs` with just `@file.rs` so the
+/// text stays readable ("Delete @file.rs" still makes sense) without showing the
+/// full path noise.
+fn normalize_at_tokens(
+    text: &str,
+    injected: &std::collections::HashSet<String>,
+) -> String {
+    let mut result = String::with_capacity(text.len());
+    for word in text.split_inclusive(|c: char| c.is_whitespace()) {
+        let trimmed = word.trim_end_matches(|c: char| c.is_whitespace());
+        let trailing: &str = &word[trimmed.len()..];
+
+        if trimmed.starts_with('@') && trimmed.len() > 1 {
+            let mut path_part = trimmed[1..].to_string();
+            // Strip trailing punctuation (same logic as parse_at_refs)
+            while !path_part.is_empty() && path_part.ends_with(|c: char| c.is_ascii_punctuation()) && !path_part.ends_with('/') {
+                path_part.pop();
+            }
+            let punct_suffix = &trimmed[1 + path_part.len()..];
+
+            let basename = std::path::Path::new(&path_part)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path_part.clone());
+
+            let matches = injected.iter().any(|p| {
+                p == &path_part
+                    || std::path::Path::new(p).file_name().map(|n| n.to_string_lossy().as_ref() == path_part.as_str()).unwrap_or(false)
+                    || p.ends_with(&format!("/{}", path_part))
+            });
+
+            if matches && basename != path_part {
+                // Shorten to just the filename
+                result.push('@');
+                result.push_str(&basename);
+                result.push_str(punct_suffix);
+                result.push_str(trailing);
+                continue;
+            }
+        }
+        result.push_str(word);
+    }
+    result
+}
+
+/// Split text that may contain `<file path="...">...</file>` injection blocks
+/// into alternating Plain and FileBlock segments.
+fn extract_file_segments(text: &str) -> Vec<TextSegment> {
+    let mut result = Vec::new();
+    let mut remaining = text;
+    const OPEN: &str = "<file path=\"";
+    const CLOSE: &str = "</file>";
+
+    while let Some(start) = remaining.find(OPEN) {
+        if start > 0 {
+            result.push(TextSegment::Plain(remaining[..start].to_string()));
+        }
+        let after = &remaining[start + OPEN.len()..];
+        if let Some(path_end) = after.find('"') {
+            let path = after[..path_end].to_string();
+            let after_open_tag = &remaining[start..];
+            if let Some(close_pos) = after_open_tag.find(CLOSE) {
+                let consumed = start + close_pos + CLOSE.len();
+                // skip one trailing newline if present
+                let consumed = if remaining[consumed..].starts_with('\n') { consumed + 1 } else { consumed };
+                result.push(TextSegment::FileBlock(path));
+                remaining = &remaining[consumed..];
+            } else {
+                result.push(TextSegment::Plain(remaining[start..].to_string()));
+                remaining = "";
+                break;
+            }
+        } else {
+            result.push(TextSegment::Plain(remaining[start..].to_string()));
+            remaining = "";
+            break;
+        }
+    }
+
+    if !remaining.is_empty() {
+        result.push(TextSegment::Plain(remaining.to_string()));
+    }
+    result
+}
+
 pub fn render_transcript_user_message(
     msg: &Message,
     meta: Option<&TurnMetadata>,
     width: u16,
 ) -> Vec<Line<'static>> {
+    // Goal-event messages injected by the /goal machinery render as a compact
+    // event block, not as a user input bubble. The same applies to the user's
+    // own `/goal <objective>` typing — replace it with the yellow GOAL ACTIVE
+    // badge so the raw slash command doesn't sit next to the `[Goal started]`
+    // event the machinery injects right after.
+    if let Some(ContentBlock::Text { text }) = msg.content_blocks().into_iter().next() {
+        if is_goal_event_message(&text) {
+            return render_goal_event(&text, width);
+        }
+        if let Some(objective) = extract_goal_slash_objective(&text) {
+            return render_goal_active_block(&objective);
+        }
+    }
+
     let inner_width = width.saturating_sub(4).max(10);
     let mut lines = Vec::new();
     let mut pending_text = String::new();
+
+    // Collect the absolute paths of every injected file so we can strip the
+    // corresponding @token references from the user's original text block.
+    let injected_paths: std::collections::HashSet<String> = msg.content_blocks()
+        .iter()
+        .filter_map(|b| {
+            if let ContentBlock::Text { text } = b {
+                if text.contains("<file path=\"") { Some(text) } else { None }
+            } else {
+                None
+            }
+        })
+        .flat_map(|text| {
+            extract_file_segments(text).into_iter().filter_map(|s| {
+                if let TextSegment::FileBlock(p) = s { Some(p) } else { None }
+            })
+        })
+        .collect();
 
     let flush_text = |buffer: &mut String, target: &mut Vec<Line<'static>>| {
         if buffer.is_empty() {
@@ -301,10 +414,44 @@ pub fn render_transcript_user_message(
     for block in msg.content_blocks() {
         match block {
             ContentBlock::Text { text } => {
-                if !pending_text.is_empty() {
-                    pending_text.push('\n');
+                if text.contains("<file path=\"") {
+                    flush_text(&mut pending_text, &mut lines);
+                    for segment in extract_file_segments(&text) {
+                        match segment {
+                            TextSegment::FileBlock(path) => {
+                                let label = std::path::Path::new(&path)
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or(path);
+                                lines.push(render_file_chip(label));
+                            }
+                            TextSegment::Plain(t) => {
+                                if !t.trim().is_empty() {
+                                    if !pending_text.is_empty() {
+                                        pending_text.push('\n');
+                                    }
+                                    pending_text.push_str(&t);
+                                }
+                            }
+                        }
+                    }
+                } else if !injected_paths.is_empty() {
+                    // Shorten @long/path/file.rs → @file.rs since the chips already
+                    // show the full path context.
+                    let cleaned = normalize_at_tokens(&text, &injected_paths);
+                    let trimmed = cleaned.trim();
+                    if !trimmed.is_empty() {
+                        if !pending_text.is_empty() {
+                            pending_text.push('\n');
+                        }
+                        pending_text.push_str(trimmed);
+                    }
+                } else {
+                    if !pending_text.is_empty() {
+                        pending_text.push('\n');
+                    }
+                    pending_text.push_str(&text);
                 }
-                pending_text.push_str(&text);
             }
             ContentBlock::Image { source } => {
                 flush_text(&mut pending_text, &mut lines);
@@ -404,9 +551,10 @@ pub fn render_transcript_reasoning_block(
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let heading = reasoning_heading(text).unwrap_or_else(|| "Thinking".to_string());
+    let chevron = if expanded { "▼" } else { "▶" };
     lines.push(Line::from(vec![
         Span::styled(
-            "  Thinking: ",
+            format!("  {} Thinking: ", chevron),
             Style::default()
                 .fg(TRANSCRIPT_MUTED)
                 .add_modifier(Modifier::ITALIC),
@@ -430,6 +578,205 @@ pub fn render_transcript_reasoning_block(
     }
 
     lines
+}
+
+/// Render the thinking content body (without header) for live streaming display.
+pub fn render_thinking_live_content(text: &str, width: u16) -> Vec<Line<'static>> {
+    let rendered = render_markdown(text, width.saturating_sub(6));
+    indent_lines(rendered, "    ", Style::default(), TRANSCRIPT_MUTED)
+}
+
+/// Returns lines for each content block with an optional thinking hash tag.
+/// The hash is `Some(hash)` only for the header line of a Thinking block,
+/// enabling click-to-expand in the TUI.
+pub fn render_transcript_assistant_message_tagged(
+    msg: &Message,
+    ctx: &RenderContext,
+) -> Vec<(Line<'static>, Option<u64>)> {
+    let mut out: Vec<(Line<'static>, Option<u64>)> = Vec::new();
+    let mut pending_text = String::new();
+
+    let flush_text = |buffer: &mut String, target: &mut Vec<(Line<'static>, Option<u64>)>, width: u16| {
+        if buffer.is_empty() {
+            return;
+        }
+        for line in render_transcript_live_text(buffer, width) {
+            target.push((line, None));
+        }
+        buffer.clear();
+    };
+
+    for block in msg.content_blocks() {
+        match block {
+            ContentBlock::Text { text } => {
+                if !pending_text.is_empty() {
+                    pending_text.push('\n');
+                }
+                pending_text.push_str(&text);
+            }
+            ContentBlock::Thinking { thinking, .. } => {
+                flush_text(&mut pending_text, &mut out, ctx.width);
+                let thinking_hash = {
+                    use std::collections::hash_map::DefaultHasher;
+                    use std::hash::{Hash, Hasher};
+                    let mut h = DefaultHasher::new();
+                    thinking.hash(&mut h);
+                    h.finish()
+                };
+                let expanded = ctx.show_thinking || ctx.expanded_thinking.contains(&thinking_hash);
+                let block_lines = render_transcript_reasoning_block(&thinking, expanded, ctx.width);
+                for (i, line) in block_lines.into_iter().enumerate() {
+                    // Tag only the header line (index 0) with the hash so it's clickable.
+                    out.push((line, if i == 0 { Some(thinking_hash) } else { None }));
+                }
+            }
+            ContentBlock::RedactedThinking { .. } => {
+                flush_text(&mut pending_text, &mut out, ctx.width);
+                out.push((
+                    Line::from(vec![Span::styled(
+                        "  Thinking hidden".to_string(),
+                        Style::default()
+                            .fg(TRANSCRIPT_MUTED)
+                            .add_modifier(Modifier::ITALIC),
+                    )]),
+                    None,
+                ));
+            }
+            ContentBlock::ToolUse { name, input, .. } => {
+                flush_text(&mut pending_text, &mut out, ctx.width);
+                for line in indent_lines(
+                    render_tool_use_inner(&name, &input),
+                    "   ",
+                    Style::default(),
+                    TRANSCRIPT_TEXT,
+                ) {
+                    out.push((line, None));
+                }
+            }
+            ContentBlock::ToolResult { tool_use_id, content, is_error } => {
+                flush_text(&mut pending_text, &mut out, ctx.width);
+                let text = tool_result_text(&content);
+                let tool_name = ctx.tool_names.get(&tool_use_id).map(|name| name.as_str());
+                let rendered = if is_error.unwrap_or(false) {
+                    render_tool_result_error(&text)
+                } else {
+                    match tool_name {
+                        Some("Bash") | Some("PowerShell") => render_bash_output_block(&text, TOOL_RESULT_MAX_LINES),
+                        Some("Read") => render_file_read_result(&text),
+                        Some("Edit") => render_file_op_result(false),
+                        Some("Write") => render_file_op_result(true),
+                        _ => render_tool_result_success(&text, false),
+                    }
+                };
+                for line in indent_lines(rendered, "   ", Style::default(), TRANSCRIPT_TEXT) {
+                    out.push((line, None));
+                }
+            }
+            ContentBlock::Image { source } => {
+                flush_text(&mut pending_text, &mut out, ctx.width);
+                let label = render_image(&source).unwrap_or_else(|| {
+                    source
+                        .media_type
+                        .or(source.url)
+                        .unwrap_or_else(|| "assistant image".to_string())
+                });
+                for line in indent_lines(
+                    vec![render_attachment_chip("img", label)],
+                    "   ",
+                    Style::default(),
+                    TRANSCRIPT_TEXT,
+                ) {
+                    out.push((line, None));
+                }
+            }
+            ContentBlock::Document { title, context, source, .. } => {
+                flush_text(&mut pending_text, &mut out, ctx.width);
+                let label = title
+                    .or(context)
+                    .or(source.url)
+                    .or(source.media_type)
+                    .unwrap_or_else(|| "attached document".to_string());
+                for line in indent_lines(
+                    vec![render_attachment_chip("doc", label)],
+                    "   ",
+                    Style::default(),
+                    TRANSCRIPT_TEXT,
+                ) {
+                    out.push((line, None));
+                }
+            }
+            ContentBlock::UserLocalCommandOutput { command, output } => {
+                flush_text(&mut pending_text, &mut out, ctx.width);
+                for line in indent_lines(
+                    render_user_local_command_output(&command, &output, 30),
+                    "   ",
+                    Style::default(),
+                    TRANSCRIPT_TEXT,
+                ) {
+                    out.push((line, None));
+                }
+            }
+            ContentBlock::UserCommand { name, args } => {
+                flush_text(&mut pending_text, &mut out, ctx.width);
+                for line in indent_lines(
+                    render_user_command(&name, &args),
+                    "   ",
+                    Style::default(),
+                    TRANSCRIPT_TEXT,
+                ) {
+                    out.push((line, None));
+                }
+            }
+            ContentBlock::UserMemoryInput { key, value } => {
+                flush_text(&mut pending_text, &mut out, ctx.width);
+                for line in indent_lines(
+                    render_user_memory_input(&key, &value),
+                    "   ",
+                    Style::default(),
+                    TRANSCRIPT_TEXT,
+                ) {
+                    out.push((line, None));
+                }
+            }
+            ContentBlock::SystemAPIError { message, retry_secs } => {
+                flush_text(&mut pending_text, &mut out, ctx.width);
+                for line in indent_lines(
+                    render_system_api_error(&message, retry_secs),
+                    "   ",
+                    Style::default(),
+                    TRANSCRIPT_TEXT,
+                ) {
+                    out.push((line, None));
+                }
+            }
+            ContentBlock::CollapsedReadSearch { tool_name, paths, n_hidden } => {
+                flush_text(&mut pending_text, &mut out, ctx.width);
+                let path_refs: Vec<&str> = paths.iter().map(|path| path.as_str()).collect();
+                for line in indent_lines(
+                    render_collapsed_read_search(&tool_name, &path_refs, n_hidden),
+                    "   ",
+                    Style::default(),
+                    TRANSCRIPT_TEXT,
+                ) {
+                    out.push((line, None));
+                }
+            }
+            ContentBlock::TaskAssignment { id, subject, description } => {
+                flush_text(&mut pending_text, &mut out, ctx.width);
+                for line in indent_lines(
+                    render_task_assignment(&id, &subject, &description),
+                    "   ",
+                    Style::default(),
+                    TRANSCRIPT_TEXT,
+                ) {
+                    out.push((line, None));
+                }
+            }
+        }
+    }
+
+    flush_text(&mut pending_text, &mut out, ctx.width);
+    out
 }
 
 pub fn render_transcript_assistant_message(
@@ -768,6 +1115,10 @@ fn render_file_op_result(is_create: bool) -> Vec<Line<'static>> {
 /// Render a tool result (success variant) — generic fallback.
 pub fn render_tool_result_success(output: &str, truncated: bool) -> Vec<Line<'static>> {
     let total_lines = output.lines().count();
+    // Use explicit Gray (brighter than terminal default DarkGray) so tool
+    // output stays legible on themes where the default fg gets dimmed by
+    // surrounding styles. Issue #149: tool result text contrast was too low.
+    let body_style = Style::default().fg(Color::Gray);
     let mut lines: Vec<Line<'static>> = output
         .lines()
         .enumerate()
@@ -775,7 +1126,7 @@ pub fn render_tool_result_success(output: &str, truncated: bool) -> Vec<Line<'st
         .map(|(_, l)| {
             Line::from(vec![
                 Span::styled("  ", Style::default()),
-                Span::raw(l.to_string()),
+                Span::styled(l.to_string(), body_style),
             ])
         })
         .collect();
@@ -843,7 +1194,7 @@ pub fn render_tool_result_rejected(tool_name: &str, reason: &str) -> Vec<Line<'s
 pub fn render_attachment_message(kind_label: &str, content: &str, width: u16) -> Vec<Line<'static>> {
     // Reserve space for the "  [label] " prefix and a small margin.
     let prefix_len = kind_label.len() + 6; // "  [label] "
-    let preview_max = (width as usize).saturating_sub(prefix_len).max(20).min(120);
+    let preview_max = (width as usize).saturating_sub(prefix_len).clamp(20, 120);
     let preview: String = content.chars().take(preview_max).collect();
     let preview = if content.chars().count() > preview_max {
         format!("{preview}\u{2026}")
@@ -1113,9 +1464,14 @@ fn truncate_user_prompt_text(text: &str) -> String {
         return text.to_string();
     }
 
-    let head = &text[..TRUNCATE_USER_PROMPT_HEAD_CHARS.min(text.len())];
-    let tail_start = text.len().saturating_sub(TRUNCATE_USER_PROMPT_TAIL_CHARS);
-    let tail = &text[tail_start..];
+    // The *_CHARS constants count characters, not bytes. Slice by chars so a
+    // multibyte codepoint straddling the cut never panics (#221).
+    let head: String = text.chars().take(TRUNCATE_USER_PROMPT_HEAD_CHARS).collect();
+    let tail: String = {
+        let total_chars = text.chars().count();
+        let skip = total_chars.saturating_sub(TRUNCATE_USER_PROMPT_TAIL_CHARS);
+        text.chars().skip(skip).collect()
+    };
     let hidden_lines = text
         .chars()
         .take(TRUNCATE_USER_PROMPT_HEAD_CHARS)
@@ -1271,7 +1627,7 @@ pub fn render_message(msg: &Message, ctx: &RenderContext) -> Vec<Line<'static>> 
                     ctx.width,
                 ));
             }
-            ContentBlock::ToolUse { id, name, input } => {
+            ContentBlock::ToolUse { id, name, input, .. } => {
                 flush_text(&mut lines, &msg.role, &mut pending_text, ctx);
                 let rendered = render_tool_use_inner(&name, &input);
                 // Silence unused-variable warning on id — kept for symmetry with ToolResult lookup.
@@ -1396,7 +1752,18 @@ pub fn render_system_api_error(msg: &str, retry_secs: Option<u32>) -> Vec<Line<'
 
 /// Render a user command invocation (skill invocation display).
 /// Shows: `▸ ` in cyan bold + command name in cyan bold + " " + args in white.
+///
+/// Special case: `/goal <objective>` is replaced with a yellow `GOAL ACTIVE /
+/// Objective: <obj>` badge so the raw slash command doesn't sit next to the
+/// `[Goal started]` event the machinery injects right after it. Subcommands
+/// (`/goal status`, `pause`, `resume`, `clear`, `complete`) keep the normal
+/// rendering.
 pub fn render_user_command(name: &str, args: &str) -> Vec<Line<'static>> {
+    if name == "goal" {
+        if let Some(objective) = extract_goal_objective_from_args(args) {
+            return render_goal_active_block(&objective);
+        }
+    }
     vec![Line::from(vec![
         Span::styled(
             "\u{25b8} ",
@@ -1409,6 +1776,90 @@ pub fn render_user_command(name: &str, args: &str) -> Vec<Line<'static>> {
         Span::styled(" ".to_string(), Style::default()),
         Span::styled(args.to_string(), Style::default().fg(Color::White)),
     ])]
+}
+
+/// Recognizes a raw `/goal <objective>` user message. Returns the objective
+/// string when the first line is `/goal …` with actual objective text;
+/// returns `None` for subcommand forms, no-args, or anything that isn't a
+/// `/goal` slash command (including the case where the user pastes a
+/// multi-line message with `/goal …` somewhere in the middle).
+fn extract_goal_slash_objective(text: &str) -> Option<String> {
+    let first_line = text.lines().next()?;
+    let rest = first_line
+        .trim_start()
+        .strip_prefix("/goal")?
+        .strip_prefix(|c: char| c.is_whitespace())
+        .unwrap_or("");
+    let objective = extract_goal_objective_from_args(rest)?;
+    // Reject bare `/goal` (no following body) — strip_prefix above returned
+    // empty `rest`, which extract_goal_objective_from_args already handles.
+    if text.lines().count() > 1 {
+        // If the user typed more than just `/goal …`, fold the rest of the
+        // message into the objective so nothing is silently dropped.
+        let trailing: String = text.lines().skip(1).collect::<Vec<_>>().join("\n");
+        let trailing = trailing.trim();
+        if !trailing.is_empty() {
+            return Some(format!("{}\n{}", objective, trailing));
+        }
+    }
+    Some(objective)
+}
+
+/// Pulls the objective text out of the `args` portion of a `/goal …` slash
+/// command. Returns `None` for empty args or for the subcommand forms
+/// (`status`, `pause`, `resume`, `clear`, `complete`).
+fn extract_goal_objective_from_args(args: &str) -> Option<String> {
+    let trimmed = args.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Strip an optional `--tokens <budget>` prefix so the objective shown
+    // doesn't include the budget flag.
+    let rest = if let Some(after_flag) = trimmed.strip_prefix("--tokens") {
+        let after_flag = after_flag.trim_start();
+        after_flag.split_once(char::is_whitespace).map(|x| x.1)
+            .unwrap_or("")
+            .trim()
+    } else {
+        trimmed
+    };
+    if rest.is_empty() {
+        return None;
+    }
+    let first = rest
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if matches!(
+        first.as_str(),
+        "status" | "pause" | "resume" | "clear" | "complete"
+    ) {
+        return None;
+    }
+    Some(rest.to_string())
+}
+
+/// Render the yellow `GOAL ACTIVE / Objective: …` badge that replaces the
+/// `/goal <objective>` user-input line in the transcript.
+fn render_goal_active_block(objective: &str) -> Vec<Line<'static>> {
+    vec![
+        Line::from(vec![Span::styled(
+            "  GOAL ACTIVE".to_string(),
+            Style::default()
+                .fg(GOAL_ACCENT)
+                .add_modifier(Modifier::BOLD),
+        )]),
+        Line::from(vec![
+            Span::styled(
+                "  Objective: ".to_string(),
+                Style::default()
+                    .fg(GOAL_ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(objective.to_string(), Style::default().fg(GOAL_BODY)),
+        ]),
+    ]
 }
 
 /// Render a user memory input line.
@@ -1567,6 +2018,56 @@ pub fn render_grouped_tool_use(names: &[&str], expanded: bool) -> Vec<Line<'stat
     lines
 }
 
+// ---------------------------------------------------------------------------
+// Goal event rendering
+// ---------------------------------------------------------------------------
+
+/// Returns `true` when a user message was injected by the goal machinery
+/// (i.e. it should NOT render as a regular user message bubble).
+pub fn is_goal_event_message(text: &str) -> bool {
+    text.starts_with("[Goal started]")
+        || text.starts_with("[Goal continuation \u{2014}")  // em dash
+        || text.starts_with("[Goal continuation -")         // fallback
+}
+
+/// Extract the turn number from a "[Goal continuation — turn N]" header.
+fn extract_goal_turn(text: &str) -> Option<u32> {
+    // Find the first [...] bracket, search inside for "turn <N>"
+    let open = text.find('[')?;
+    let close = text.find(']')?;
+    if close <= open { return None; }
+    let segment = &text[open..close];
+    let tag = "turn ";
+    let idx = segment.rfind(tag)? + tag.len();
+    segment[idx..].trim().parse().ok()
+}
+
+/// Render a goal-event message block.
+///
+/// `[Goal started]` renders as nothing — the user's typed `/goal …` line
+/// already produces the canonical GOAL ACTIVE block via
+/// `render_goal_active_block`, so showing the kickoff event too would
+/// duplicate it.
+/// `[Goal continuation — turn N]` shows a compact inline turn marker.
+pub fn render_goal_event(text: &str, _width: u16) -> Vec<Line<'static>> {
+    if text.starts_with("[Goal continuation —") {
+        let turn = extract_goal_turn(text).unwrap_or(0);
+        return vec![Line::from(vec![
+            Span::styled(
+                "  \u{21ba} ".to_string(),  // ↺
+                Style::default().fg(GOAL_MUTED),
+            ),
+            Span::styled(
+                format!("goal \u{00b7} turn {}", turn),  // ·
+                Style::default().fg(GOAL_MUTED).add_modifier(Modifier::ITALIC),
+            ),
+        ])];
+    }
+
+    // [Goal started] — hidden.
+    Vec::new()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1589,6 +2090,7 @@ mod tests {
                 id: "tool-1".to_string(),
                 name: "read_file".to_string(),
                 input: serde_json::json!({ "path": "README.md" }),
+                thought_signature: None,
             },
             ContentBlock::ToolResult {
                 tool_use_id: "tool-1".to_string(),
@@ -1788,6 +2290,7 @@ mod tests {
             id: "tu-1".to_string(),
             name: "Bash".to_string(),
             input: serde_json::json!({"command": "ls -la"}),
+            thought_signature: None,
         }]);
         let rendered = render_message(&msg, &RenderContext::default())
             .into_iter()
@@ -1805,6 +2308,7 @@ mod tests {
             id: "tu-2".to_string(),
             name: "Read".to_string(),
             input: serde_json::json!({"file_path": "/tmp/foo.txt"}),
+            thought_signature: None,
         }]);
         let rendered = render_message(&msg, &RenderContext::default())
             .into_iter()
@@ -1825,6 +2329,7 @@ mod tests {
                 "subagent_type": "explore",
                 "description": "Trace the auth flow"
             }),
+            thought_signature: None,
         }]);
         let rendered = render_message(&msg, &RenderContext::default())
             .into_iter()
@@ -1839,7 +2344,7 @@ mod tests {
     fn bash_tool_result_renders_as_bash_output_with_tool_names_context() {
         let mut tool_names = HashMap::new();
         tool_names.insert("tu-bash-1".to_string(), "Bash".to_string());
-        let ctx = RenderContext { tool_names, ..Default::default() };
+        let ctx = RenderContext { tool_names: &tool_names, ..Default::default() };
 
         let msg = Message::user_blocks(vec![ContentBlock::ToolResult {
             tool_use_id: "tu-bash-1".to_string(),
@@ -1911,6 +2416,75 @@ mod tests {
         assert!(text.contains('\u{25b8}'), "should have ▸ prefix");
         assert!(text.contains("doctor"));
         assert!(text.contains("--verbose"));
+    }
+
+    #[test]
+    fn goal_objective_renders_goal_active_block_not_user_command() {
+        let result = render_user_command("goal", "Migrate to React");
+        let header = line_text(&result[0]);
+        let body = line_text(&result[1]);
+        assert!(header.contains("GOAL ACTIVE"));
+        assert!(!header.contains('\u{25b8}'), "should not show ▸ user-command prefix");
+        assert!(body.contains("Objective:"));
+        assert!(body.contains("Migrate to React"));
+    }
+
+    #[test]
+    fn goal_subcommands_render_as_normal_user_command() {
+        for sub in ["status", "pause", "resume", "clear", "complete"] {
+            let result = render_user_command("goal", sub);
+            let text = line_text(&result[0]);
+            assert!(text.contains('\u{25b8}'), "/goal {sub} should keep ▸ prefix");
+            assert!(text.contains(sub));
+        }
+    }
+
+    #[test]
+    fn goal_with_tokens_flag_strips_flag_from_objective() {
+        let result = render_user_command("goal", "--tokens 250K Migrate to React");
+        let body = line_text(&result[1]);
+        assert!(body.contains("Migrate to React"));
+        assert!(!body.contains("--tokens"), "flag should not appear in displayed objective");
+        assert!(!body.contains("250K"));
+    }
+
+    #[test]
+    fn extract_goal_objective_returns_none_for_subcommands_and_empty() {
+        assert!(extract_goal_objective_from_args("").is_none());
+        assert!(extract_goal_objective_from_args("   ").is_none());
+        assert!(extract_goal_objective_from_args("status").is_none());
+        assert!(extract_goal_objective_from_args("pause now").is_none()); // first token is subcommand
+        assert_eq!(
+            extract_goal_objective_from_args("Migrate to React").as_deref(),
+            Some("Migrate to React"),
+        );
+    }
+
+    #[test]
+    fn extract_goal_slash_objective_handles_typed_user_message() {
+        assert_eq!(
+            extract_goal_slash_objective("/goal build GPT 6 make no mistakes").as_deref(),
+            Some("build GPT 6 make no mistakes"),
+        );
+        assert_eq!(
+            extract_goal_slash_objective("/goal --tokens 250K Migrate to React").as_deref(),
+            Some("Migrate to React"),
+        );
+        // Subcommands fall through.
+        assert!(extract_goal_slash_objective("/goal status").is_none());
+        assert!(extract_goal_slash_objective("/goal").is_none());
+        // Not a /goal message.
+        assert!(extract_goal_slash_objective("just a normal message").is_none());
+        assert!(extract_goal_slash_objective("/goalbuild").is_none());
+    }
+
+    #[test]
+    fn extract_goal_slash_objective_folds_trailing_lines_into_objective() {
+        let text = "/goal Migrate to React\nwith strict typing\nand tests passing";
+        let extracted = extract_goal_slash_objective(text).unwrap();
+        assert!(extracted.starts_with("Migrate to React"));
+        assert!(extracted.contains("strict typing"));
+        assert!(extracted.contains("tests passing"));
     }
 
     #[test]
@@ -2083,7 +2657,19 @@ mod tests {
         let b_text: Vec<_> = b.iter().map(|l| line_text(l)).collect();
         assert_eq!(a_text, b_text);
     }
+
+    #[test]
+    fn truncate_user_prompt_text_handles_multibyte_over_limit() {
+        // >10K chars of a 3-byte codepoint. Pre-fix, the *_CHARS constants were
+        // used as BYTE offsets, slicing mid-codepoint (2500 % 3 == 1) (#221).
+        let text = "\u{2705}".repeat(11_000); // ✅ (3 bytes), 11K chars > 10K limit
+        let out = truncate_user_prompt_text(&text);
+        assert!(out.starts_with('\u{2705}'));
+        assert!(out.contains("lines"));
+        assert!(out.chars().count() < text.chars().count());
+
+        // Mixed multibyte content around both cut points must also be safe.
+        let mixed = "😀é✅ん".repeat(3_000);
+        let _ = truncate_user_prompt_text(&mixed); // no panic == pass
+    }
 }
-
-
-

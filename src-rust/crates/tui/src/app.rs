@@ -4,6 +4,7 @@ use crate::bridge_state::BridgeConnectionState;
 use crate::context_viz::ContextVizState;
 use crate::dialog_select::{DialogSelectState, SelectItem};
 use crate::export_dialog::{ExportDialogState, ExportFormat};
+use crate::import_config_dialog::ImportConfigDialogState;
 use crate::dialogs::PermissionRequest;
 use crate::diff_viewer::{DiffViewerState, build_turn_diff};
 use crate::model_picker::{EffortLevel, ModelPickerState};
@@ -17,7 +18,6 @@ use crate::overlays::{
     RewindFlowOverlay, SelectorMessage,
 };
 use crate::plugin_views::PluginHintBanner;
-use crate::privacy_screen::PrivacyScreen;
 use crate::prompt_input::{InputMode, PromptInputState, VimMode};
 use crate::render;
 use crate::settings_screen::SettingsScreen;
@@ -27,6 +27,7 @@ use crate::{agents_view::{AgentInfo, AgentStatus, AgentsMenuState, AgentsRoute},
 use claurst_core::config::{Config, Settings, Theme};
 use claurst_core::cost::CostTracker;
 use claurst_core::file_history::FileHistory;
+use claurst_core::{sample_completion_verb, sample_spinner_verb};
 use claurst_core::keybindings::{
     KeyContext, KeybindingResolver, KeybindingResult, ParsedKeystroke, UserKeybindings,
 };
@@ -59,28 +60,31 @@ const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("exit", "Quit Claurst"),
     ("export", "Export conversation"),
     ("fast", "Toggle fast mode"),
-    ("feedback", "Open session feedback survey"),
     ("fork", "Fork session into a new branch"),
+    ("goal", "Set or view the current session goal"),
     ("heapdump", "Show process memory and diagnostic information"),
     ("help", "Show help"),
     ("hooks", "Browse configured hooks (read-only)"),
+    ("import-config", "Import CLAUDE.md and settings.json from ~/.claude"),
     ("init", "Initialize AGENTS.md for this project"),
     ("insights", "Generate a session analysis report with conversation statistics"),
-    ("install-slack-app", "Install the Claurst Slack integration"),
     ("keybindings", "Show keybinding configuration"),
+    ("links", "Open URLs from this session in your browser"),
     ("login", "Log in to Claurst"),
     ("logout", "Log out of Claurst"),
+    ("managed-agents", "Configure manager-executor managed agent system"),
     ("mcp", "Browse configured MCP servers"),
     ("memory", "Browse and open AGENTS.md memory files"),
     ("model", "Change the AI model"),
-    ("output-style", "Toggle output style (auto/stream/verbose)"),
+    ("move", "Re-home this session to another worktree of the same project"),
+    ("new", "Start a fresh session (keeps model, provider & directory)"),
+    ("output-style", "Show or switch the output style / persona"),
     ("plugin", "Manage plugins (list/info/enable/disable/reload)"),
-    ("privacy", "Open privacy settings"),
     ("providers", "List available AI providers and their status"),
-    ("caveman", "Caveman speech mode — save big token"),
-    ("rocky", "Rocky speech mode — amaze amaze amaze"),
-    ("normal", "Deactivate speech mode"),
-    ("quit", "Quit Claurst"),
+    ("caveman", "Caveman persona output style — save big token"),
+    ("rocky", "Rocky persona output style — amaze amaze amaze"),
+    ("normal", "Reset persona / output style to default"),
+    ("quit", "Exit Claurst"),
     ("refresh", "Clear saved provider auth and model caches"),
     ("rename", "Rename this session"),
     ("resume", "Resume a previous session"),
@@ -88,10 +92,13 @@ const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("rewind", "Rewind to an earlier turn"),
     ("session", "Browse and manage sessions"),
     ("settings", "Open settings"),
+    ("share", "Upload the current session as a secret gist and get a shareable URL"),
     ("stats", "Open token and cost stats"),
     ("survey", "Open session feedback survey"),
     ("theme", "Open the theme picker"),
     ("ultrareview", "Run an exhaustive multi-dimensional code review"),
+    ("update", "Check for updates and upgrade to the latest version"),
+    ("upgrade", "Check for updates and upgrade to the latest version"),
     ("vim", "Toggle vim keybindings"),
     ("voice", "Toggle voice input mode"),
 ];
@@ -99,15 +106,14 @@ const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
 fn help_command_category(name: &str) -> &'static str {
     match name {
         "connect" | "model" | "providers" | "refresh" | "fast" | "effort" | "voice" => "Model & Provider",
-        "changes" | "diff" | "review" | "rewind" | "export" | "copy" => "Review & History",
+        "changes" | "diff" | "review" | "rewind" | "export" | "copy" | "share" | "links" => "Review & History",
         "stats" | "cost" | "context" | "insights" | "heapdump" | "doctor" => "Diagnostics",
-        "config" | "settings" | "theme" | "privacy" | "keybindings" | "hooks" | "mcp" => {
+        "config" | "settings" | "theme" | "keybindings" | "hooks" | "mcp" | "import-config" => {
             "Workspace"
         }
-        "agent" | "agents" | "memory" | "plugin" | "feedback" | "survey" => "Tools",
-        "session" | "resume" | "rename" | "fork" | "clear" | "compact" | "quit" | "exit" => {
-            "Session"
-        }
+        "agent" | "agents" | "memory" | "plugin" | "survey" => "Tools",
+        "session" | "resume" | "rename" | "fork" | "clear" | "new" | "move" | "compact"
+        | "quit" | "exit" => "Session",
         _ => "Commands",
     }
 }
@@ -207,19 +213,53 @@ fn get_url_for_provider(id: &str) -> &'static str {
     }
 }
 
+
+fn import_config_picker_items() -> Vec<SelectItem> {
+    vec![
+        SelectItem {
+            id: "claude-md".into(),
+            title: "CLAUDE.md".into(),
+            description: "Import ~/.claude/CLAUDE.md".into(),
+            category: "Import".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "settings".into(),
+            title: "settings.json".into(),
+            description: "Import ~/.claude/settings.json".into(),
+            category: "Import".into(),
+            badge: None,
+        },
+        SelectItem {
+            id: "both".into(),
+            title: "Both".into(),
+            description: "Import both CLAUDE.md and settings.json".into(),
+            category: "Import".into(),
+            badge: Some("SAFE".into()),
+        },
+    ]
+}
+
 fn provider_picker_items() -> Vec<SelectItem> {
     vec![
+        SelectItem { id: "free".into(), title: "Free Mode".into(), description: "OpenCode Zen → OpenRouter free fallback (no spend)".into(), category: "Popular".into(), badge: Some("FREE".into()) },
         SelectItem { id: "openai".into(), title: "OpenAI".into(), description: "(API key)".into(), category: "Popular".into(), badge: None },
         SelectItem { id: "openai-codex".into(), title: "OpenAI Codex".into(), description: "(ChatGPT Plus/Pro — browser login)".into(), category: "Popular".into(), badge: None },
         SelectItem { id: "github-copilot".into(), title: "GitHub Copilot".into(), description: "(GitHub subscription or token)".into(), category: "Popular".into(), badge: None },
         SelectItem { id: "google".into(), title: "Google".into(), description: "(API key)".into(), category: "Popular".into(), badge: None },
         SelectItem { id: "anthropic".into(), title: "Anthropic".into(), description: "(API key)".into(), category: "Popular".into(), badge: None },
+        SelectItem { id: "anthropic-oauth".into(), title: "Anthropic (Claude Pro/Max)".into(), description: "(subscription — browser login; draws from extra-usage)".into(), category: "Popular".into(), badge: None },
         SelectItem { id: "custom-openai".into(), title: "Custom OpenAI-Compatible".into(), description: "Custom URL + API key".into(), category: "Advanced".into(), badge: None },
         SelectItem { id: "openrouter".into(), title: "OpenRouter".into(), description: "100+ models with one key".into(), category: "Popular".into(), badge: None },
         SelectItem { id: "vercel".into(), title: "Vercel AI Gateway".into(), description: "Gateway for AI SDK models".into(), category: "Popular".into(), badge: None },
         SelectItem { id: "groq".into(), title: "Groq".into(), description: "Fast hosted inference".into(), category: "Popular".into(), badge: Some("FREE".into()) },
-        SelectItem { id: "ollama".into(), title: "Ollama".into(), description: "Run models locally".into(), category: "Popular".into(), badge: Some("LOCAL".into()) },
+        SelectItem { id: "ollama".into(), title: "Ollama".into(), description: "Local inference + cloud models".into(), category: "Popular".into(), badge: None },
         SelectItem { id: "zai".into(), title: "Z.AI".into(), description: "GLM-5.1 / GLM-5 / GLM-4.7 Coding Plan".into(), category: "Popular".into(), badge: None },
+        SelectItem { id: "opencode-go".into(), title: "OpenCode Go".into(), description: "$10/mo flat-rate · Kimi · DeepSeek · GLM · MiniMax".into(), category: "Popular".into(), badge: None },
+        SelectItem { id: "opencode-zen".into(), title: "OpenCode Zen".into(), description: "Free models + paid · Nemotron · Ring · MiniMax · DeepSeek".into(), category: "Popular".into(), badge: Some("FREE".into()) },
+        SelectItem { id: "synthetic".into(), title: "Synthetic.dev".into(), description: "Hosted open weights".into(), category: "Popular".into(), badge: None },
+        SelectItem { id: "routing".into(), title: "routing.run".into(), description: "Hosted open weights · DeepSeek · Llama · Mixtral · Qwen".into(), category: "Popular".into(), badge: None },
+        SelectItem { id: "neuralwatt".into(), title: "NeuralWatt".into(), description: "Hosted open weights - energy-efficient".into(), category: "Popular".into(), badge: None },
         SelectItem { id: "cerebras".into(), title: "Cerebras".into(), description: "Fast hosted inference".into(), category: "Other".into(), badge: Some("FREE".into()) },
         SelectItem { id: "sambanova".into(), title: "SambaNova".into(), description: "Fast hosted inference".into(), category: "Other".into(), badge: Some("FREE".into()) },
         SelectItem { id: "lmstudio".into(), title: "LM Studio".into(), description: "Local model server".into(), category: "Other".into(), badge: Some("LOCAL".into()) },
@@ -248,7 +288,7 @@ fn provider_picker_items() -> Vec<SelectItem> {
         SelectItem { id: "siliconflow".into(), title: "SiliconFlow".into(), description: "Hosted open models".into(), category: "Other".into(), badge: None },
         SelectItem { id: "nebius".into(), title: "Nebius".into(), description: "Cloud inference".into(), category: "Other".into(), badge: None },
         SelectItem { id: "novita".into(), title: "Novita".into(), description: "Cloud inference".into(), category: "Other".into(), badge: None },
-        SelectItem { id: "minimax".into(), title: "MiniMax".into(), description: "Anthropic-compatible (M2.7)".into(), category: "Other".into(), badge: None },
+        SelectItem { id: "minimax".into(), title: "MiniMax".into(), description: "Anthropic-compatible (M3)".into(), category: "Other".into(), badge: None },
         SelectItem { id: "ovhcloud".into(), title: "OVHcloud".into(), description: "EU-hosted AI".into(), category: "Other".into(), badge: None },
         SelectItem { id: "scaleway".into(), title: "Scaleway".into(), description: "EU cloud AI".into(), category: "Other".into(), badge: None },
         SelectItem { id: "vultr".into(), title: "Vultr".into(), description: "Cloud inference".into(), category: "Other".into(), badge: None },
@@ -335,6 +375,12 @@ pub struct GoToLineDialog {
     pub total_lines: usize,
 }
 
+impl Default for GoToLineDialog {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GoToLineDialog {
     pub fn new() -> Self {
         Self {
@@ -405,6 +451,12 @@ pub struct HistorySearch {
     pub matches: Vec<usize>,
     /// Which match is currently highlighted.
     pub selected: usize,
+}
+
+impl Default for HistorySearch {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl HistorySearch {
@@ -544,6 +596,54 @@ fn layout_to_latin(c: char) -> String {
     mapped.unwrap_or(lower).to_string()
 }
 
+/// Apply shift transformation to a character based on standard US QWERTY layout.
+/// Handles both ASCII lowercase letters and number/symbol keys.
+///
+/// **Why this exists**: Terminals that support the kitty keyboard protocol send
+/// unshifted characters with modifier flags instead of pre-shifted characters
+/// (e.g., Shift+1 arrives as '1' + SHIFT instead of '!'). This function normalizes
+/// them to the expected shifted characters.
+///
+/// **Keyboard layout limitation**: This only works correctly for US QWERTY keyboards.
+/// Other layouts (AZERTY, QWERTZ, etc.) have different shift mappings. For non-US
+/// layouts, we rely on the terminal to send the correctly shifted character, which
+/// most modern terminals do (especially with kitty protocol enabled).
+fn normalize_char_with_shift(c: char, modifiers: KeyModifiers) -> char {
+    if !modifiers.contains(KeyModifiers::SHIFT) {
+        return c;
+    }
+
+    if c.is_ascii_lowercase() {
+        return c.to_ascii_uppercase();
+    }
+
+    // Map unshifted number/symbol keys to their shifted equivalents (US QWERTY)
+    match c {
+        '1' => '!',
+        '2' => '@',
+        '3' => '#',
+        '4' => '$',
+        '5' => '%',
+        '6' => '^',
+        '7' => '&',
+        '8' => '*',
+        '9' => '(',
+        '0' => ')',
+        '-' => '_',
+        '=' => '+',
+        '[' => '{',
+        ']' => '}',
+        ';' => ':',
+        '\'' => '"',
+        ',' => '<',
+        '.' => '>',
+        '/' => '?',
+        '\\' => '|',
+        '`' => '~',
+        _ => c,
+    }
+}
+
 fn key_event_to_keystroke(key: &KeyEvent) -> Option<ParsedKeystroke> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt  = key.modifiers.contains(KeyModifiers::ALT);
@@ -587,6 +687,44 @@ fn key_event_to_keystroke(key: &KeyEvent) -> Option<ParsedKeystroke> {
     })
 }
 
+/// Rewrite a Ctrl-modified keystroke that carries a non-ASCII character to the
+/// Latin letter at the same physical QWERTY position.
+///
+/// A few core shortcuts — most importantly Ctrl+C (interrupt / exit) and Ctrl+D
+/// (exit) — are matched directly against `KeyEvent::code` in `handle_key_event`
+/// rather than going through the keybinding table (they are intentionally absent
+/// from `default_bindings`, see `NON_REBINDABLE`). On a non-Latin layout
+/// (Ukrainian / Russian JCUKEN, …) the reported character is the Cyrillic glyph
+/// at that physical key — e.g. Ctrl+С arrives as `Char('с')` — so the literal
+/// `KeyCode::Char('c')` arms never fire and the shortcut is dead.
+///
+/// Normalizing once at the top of `handle_key_event` lets every downstream
+/// `key.code` comparison (and the keybinding layer, idempotently) see the Latin
+/// letter, mirroring what `key_event_to_keystroke` already does for bound keys.
+///
+/// Restricted to **pure Ctrl (Ctrl without Alt)** on purpose: Ctrl+<letter>
+/// never produces literal text, so rewriting it cannot corrupt text entry,
+/// whereas Alt / AltGr (reported as Ctrl+Alt) is used to compose characters on
+/// some layouts and must be left untouched. Characters with no known
+/// position mapping (or that map to a non-ASCII result) are returned unchanged.
+fn normalize_layout_shortcut_key(key: KeyEvent) -> KeyEvent {
+    if let KeyCode::Char(c) = key.code {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        if ctrl && !alt && !c.is_ascii() {
+            if let Some(latin) = layout_to_latin(c).chars().next() {
+                if latin.is_ascii() {
+                    return KeyEvent {
+                        code: KeyCode::Char(latin),
+                        ..key
+                    };
+                }
+            }
+        }
+    }
+    key
+}
+
 // ---------------------------------------------------------------------------
 // Focus target
 // ---------------------------------------------------------------------------
@@ -598,6 +736,49 @@ pub enum FocusTarget {
     Input,
     /// Keyboard input goes to the transcript/message pane (scroll, etc.).
     Transcript,
+}
+
+// ---------------------------------------------------------------------------
+// Recent activity
+// ---------------------------------------------------------------------------
+
+/// A lightweight record of a recent session, shown in the welcome screen's
+/// "Recent activity" list.
+///
+/// Loaded asynchronously from `session_storage` (see `recent_sessions_pending`
+/// in the run loop) so the render path never touches disk. Holds only what the
+/// welcome box needs: a display label plus the transcript's modification time,
+/// from which a relative timestamp ("2h ago") is computed at render time.
+#[derive(Debug, Clone)]
+pub struct RecentSession {
+    /// Display label: the custom title, else a truncated last prompt, else
+    /// `"(untitled)"`.
+    pub label: String,
+    /// Transcript modification time, used to derive a relative timestamp.
+    pub mtime: std::time::SystemTime,
+}
+
+/// Build the display label for a recent session: prefer the custom title, fall
+/// back to the first line of the last prompt (truncated), else `"(untitled)"`.
+pub fn recent_session_label(title: Option<String>, last_prompt: Option<String>) -> String {
+    /// Cap stored labels so a huge prompt never bloats `App` state; the render
+    /// path truncates further to the column width.
+    const MAX_LABEL: usize = 80;
+
+    let pick = |s: String| -> Option<String> {
+        // First non-empty line, trimmed.
+        let line = s.lines().find(|l| !l.trim().is_empty())?.trim();
+        if line.is_empty() {
+            return None;
+        }
+        let truncated: String = line.chars().take(MAX_LABEL).collect();
+        Some(truncated)
+    };
+
+    title
+        .and_then(pick)
+        .or_else(|| last_prompt.and_then(pick))
+        .unwrap_or_else(|| "(untitled)".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -627,8 +808,18 @@ pub struct App {
     pub status_message: Option<String>,
     /// Randomly chosen thinking verb shown next to the spinner while streaming.
     pub spinner_verb: Option<String>,
-    pub should_quit: bool,
+    pub should_exit: bool,
     pub show_help: bool,
+    /// Whether the terminal speaks the kitty keyboard protocol (progressive
+    /// keyboard enhancement is active). When `false` — e.g. Windows conhost /
+    /// CMD / legacy PowerShell and most default terminals — printable keys
+    /// arrive as their final, layout-correct character (Shift already applied),
+    /// so we must NOT re-apply a US-QWERTY shift map to them (issue #183: typing
+    /// `/` produced `?`). When `true`, the terminal reports the unshifted base
+    /// key plus a SHIFT modifier, so we normalize it ourselves. Defaults to
+    /// `true`; the run loop overwrites it with the detected value once the
+    /// terminal has been initialized.
+    pub kitty_keyboard_active: bool,
 
     // Extended state
     pub tool_use_blocks: Vec<ToolUseBlock>,
@@ -646,14 +837,10 @@ pub struct App {
     pub effort_level: EffortLevel,
     /// Whether fast mode is currently active (model locked to FAST_MODE_MODEL).
     pub fast_mode: bool,
-    /// Active speech mode: None = normal, Some("caveman") / Some("rocky").
-    pub speech_mode: Option<String>,
-    /// Speech mode intensity: "lite", "full", "ultra".
-    pub speech_level: String,
-    /// Current agent mode name: "build", "plan", "explore", etc.
+    /// Current agent mode name: "build", "plan".
     pub agent_mode: Option<String>,
     /// Accent color derived from the current agent mode.
-    /// Build = pink, Plan = blue, Explore = amber.
+    /// Build = pink, Plan = blue.
     pub accent_color: Color,
     /// Set by `cycle_agent_mode` so the main loop can update the query config
     /// and tool list to match the newly-selected agent.
@@ -719,6 +906,8 @@ pub struct App {
     pub bridge_state: BridgeConnectionState,
     /// Active notification queue.
     pub notifications: NotificationQueue,
+    /// Scroll offset for error modal text (in lines).
+    pub error_modal_scroll_offset: usize,
     /// Plugin hint banners.
     pub plugin_hints: Vec<PluginHintBanner>,
     /// Optional session title shown in the status bar.
@@ -729,6 +918,13 @@ pub struct App {
     pub mcp_manager: Option<Arc<claurst_mcp::McpManager>>,
     /// Queued request for a real MCP reconnect from the interactive loop.
     pub pending_mcp_reconnect: bool,
+    /// Set after an in-session provider connection (e.g. a Claude Pro/Max OAuth
+    /// login) so the main loop re-resolves credentials and swaps in a fresh
+    /// client + provider registry. Without it the session keeps the client built
+    /// at startup, which for a fresh OAuth login still has no usable credential.
+    pub pending_provider_reload: bool,
+    /// Pending MCP panel-auth request for the interactive loop.
+    pub pending_mcp_panel_auth: Option<String>,
     /// Shared file-history service used for turn diff reconstruction.
     pub file_history: Option<Arc<parking_lot::Mutex<FileHistory>>>,
     /// Shared query-loop turn counter for turn-local diff reconstruction.
@@ -749,8 +945,6 @@ pub struct App {
     pub settings_screen: SettingsScreen,
     /// Theme picker overlay (/theme).
     pub theme_screen: ThemeScreen,
-    /// Privacy settings dialog (/privacy-settings).
-    pub privacy_screen: PrivacyScreen,
     /// Token/cost analytics dialog.
     pub stats_dialog: StatsDialogState,
     /// MCP server browser and tool detail view.
@@ -759,6 +953,8 @@ pub struct App {
     pub agents_menu: AgentsMenuState,
     /// Diff viewer overlay.
     pub diff_viewer: DiffViewerState,
+    /// Read-only viewer for [Pasted text #N ...] placeholders.
+    pub paste_viewer: crate::paste_viewer::PasteViewer,
     /// Session-quality feedback survey overlay.
     pub feedback_survey: crate::feedback_survey::FeedbackSurveyState,
     /// Memory file selector overlay (AGENTS.md browser).
@@ -791,18 +987,41 @@ pub struct App {
     pub context_viz: ContextVizState,
     /// MCP server approval dialog.
     pub mcp_approval: McpApprovalDialogState,
+    /// Project-defined MCP servers awaiting the user's approval decision.
+    /// Populated at startup with the gated (untrusted) project servers; the
+    /// main loop shows one approval dialog at a time, draining this queue.
+    pub mcp_pending_project: std::collections::VecDeque<claurst_core::config::McpServerConfig>,
+    /// The project MCP server currently shown in the approval dialog, if any.
+    pub mcp_prompting: Option<claurst_core::config::McpServerConfig>,
+    /// Fingerprints of project MCP servers approved for THIS session only
+    /// (the "Allow this session" choice). Not persisted to disk.
+    pub mcp_session_trusted: std::collections::HashSet<String>,
+    /// Project root used to key persistent MCP trust approvals.
+    pub mcp_project_root: Option<std::path::PathBuf>,
     /// Go to Line dialog (Ctrl+G in message pane).
     pub go_to_line_dialog: GoToLineDialog,
     /// Bypass-permissions startup confirmation dialog.
     /// Shown at startup when --dangerously-skip-permissions was passed.
     /// User must explicitly accept or the session exits.
     pub bypass_permissions_dialog: crate::bypass_permissions_dialog::BypassPermissionsDialogState,
+    /// Whether the bypass-permissions dialog has been shown this session.
+    pub bypass_permissions_dialog_shown: bool,
+    /// File injection warning dialog.
+    /// Shown when oversized or binary files are detected in @refs.
+    pub file_injection_dialog: crate::file_injection_dialog::FileInjectionDialogState,
+    /// When true, the next file injection size check uses limit 0 (no limit),
+    /// letting files that were "allowed" through the warning dialog be injected.
+    pub file_injection_force: bool,
     /// First-launch onboarding welcome dialog.
     pub onboarding_dialog: crate::onboarding_dialog::OnboardingDialogState,
+    /// Effort-level picker (/effort with no args).
+    pub effort_picker: crate::effort_picker::EffortPickerState,
     /// API key input dialog (opened from /connect for key-based providers).
     pub key_input_dialog: crate::key_input_dialog::KeyInputDialogState,
     /// Custom provider dialog for URL + API key input.
     pub custom_provider_dialog: crate::custom_provider_dialog::CustomProviderDialogState,
+    /// "Free" composite-provider setup dialog (warning + 2 API keys).
+    pub free_mode_dialog: crate::free_mode_dialog::FreeModeDialogState,
     /// Device code / browser auth dialog (GitHub Copilot device flow, Anthropic OAuth).
     pub device_auth_dialog: crate::device_auth_dialog::DeviceAuthDialogState,
     /// When set, the main loop should spawn the async auth task for this provider.
@@ -815,20 +1034,44 @@ pub struct App {
     /// When `true`, the main event loop should spawn an async task to fetch
     /// the model list from the current provider's `list_models()` API.
     pub model_picker_fetch_pending: bool,
+    /// The provider ID that the model picker was opened for (used when the
+    /// fetch is triggered from /connect before the provider is activated).
+    pub model_picker_provider_id: Option<String>,
     /// When `true`, the main event loop should spawn an async task to load
     /// the session list from disk and populate the session browser.
     pub session_list_pending: bool,
     /// Receiver for background session-list results.
     pub session_list_rx:
         Option<tokio::sync::mpsc::Receiver<Vec<crate::session_browser::SessionEntry>>>,
+    /// The most-recent sessions shown in the welcome screen's "Recent activity"
+    /// list. Populated once from disk via the background loader below; empty
+    /// until it resolves (or when there are genuinely no sessions).
+    pub recent_sessions: Vec<RecentSession>,
+    /// When `true`, the main event loop should spawn a one-shot async task to
+    /// load recent sessions from disk (mirrors `session_list_pending`). Set once
+    /// at startup and cleared when the load is kicked off, so we never re-list
+    /// every frame.
+    pub recent_sessions_pending: bool,
+    /// Receiver for the background recent-sessions load.
+    pub recent_sessions_rx: Option<tokio::sync::mpsc::Receiver<Vec<RecentSession>>>,
     /// Credential store for provider API keys and OAuth tokens.
     pub auth_store: claurst_core::AuthStore,
+    /// Messages typed by the user while a query was streaming. They will be
+    /// auto-submitted in order once the current turn completes (issue #149).
+    pub queued_messages: std::collections::VecDeque<String>,
+    /// When `true`, the main loop will inject a synthetic Enter event on the
+    /// next iteration to dequeue and submit the next queued message.
+    pub pending_auto_submit: bool,
     /// Connect-a-provider dialog (/connect command).
     pub connect_dialog: DialogSelectState,
+    /// Import-config source picker (/import-config command).
+    pub import_config_picker: DialogSelectState,
+    /// Import-config preview and confirmation dialog.
+    pub import_config_dialog: ImportConfigDialogState,
     /// Ctrl+K command palette overlay.
     pub command_palette: DialogSelectState,
     /// Whether Claurst was launched from the user's home directory.
-    /// Shown as a startup notice: "Note: You have launched claude in your home directory…"
+    /// Shown as a startup notice: "Note: You have launched Claurst in your home directory…"
     pub home_dir_warning: bool,
     /// Output style: "auto" | "stream" | "verbose".
     pub output_style: String,
@@ -838,6 +1081,10 @@ pub struct App {
     pub pr_url: Option<String>,
     /// PR review state: "approved", "changes_requested", "review_required", etc.
     pub pr_state: Option<String>,
+    /// Current working directory path.
+    pub current_dir: Option<String>,
+    /// Current git branch name.
+    pub git_branch: Option<String>,
     /// Count of in-progress background tasks (drives the footer pill).
     pub background_task_count: usize,
     /// Background task status text shown in footer pill.
@@ -859,11 +1106,21 @@ pub struct App {
     pub voice_recording: bool,
     /// Receiver for VoiceEvent messages produced by the recorder task.
     pub voice_event_rx: Option<tokio::sync::mpsc::Receiver<claurst_core::voice::VoiceEvent>>,
+    /// A single key event that was drained from the queue during paste-burst
+    /// detection but wasn't part of the burst (e.g. a modifier key that stopped
+    /// the burst). Replayed at the top of the next loop iteration.
+    pub pending_key: Option<crossterm::event::KeyEvent>,
     /// Receiver for model-list results fetched in the background when the
     /// /model picker opens.  Drained each frame so models appear as soon as
     /// the fetch completes.
     pub model_fetch_rx:
         Option<tokio::sync::mpsc::Receiver<Result<Vec<crate::model_picker::ModelEntry>, ()>>>,
+    /// Receiver for `UserQuestionEvent`s produced by the AskUserQuestion tool.
+    /// When a question arrives, `ask_user_dialog` is populated and shown.
+    pub user_question_rx:
+        Option<tokio::sync::mpsc::UnboundedReceiver<claurst_tools::UserQuestionEvent>>,
+    /// State for the model-initiated ask-user question dialog.
+    pub ask_user_dialog: crate::ask_user_dialog::AskUserDialogState,
 
     // ---- Context window & rate limit info ----------------------------------
 
@@ -881,6 +1138,9 @@ pub struct App {
     pub worktree_branch: Option<String>,
     /// Agent type badge: "agent" | "coordinator" | "subagent".
     pub agent_type_badge: Option<String>,
+    /// Goal badge string shown in the footer, e.g. "active · 5m · 3 turns".
+    /// None when no goal is active. Updated by the REPL after each turn.
+    pub active_goal_badge: Option<String>,
 
     // ---- Thinking block expansion state ----------------------------------
     /// Set of thinking block content hashes that are expanded.
@@ -891,6 +1151,8 @@ pub struct App {
     pub last_selectable_area: Cell<ratatui::layout::Rect>,
     /// The prompt input area from the last render frame (used for focus routing).
     pub last_input_area: Cell<ratatui::layout::Rect>,
+    /// The footer's right column area (where tips are shown) from the last render.
+    pub footer_right_column_area: Cell<ratatui::layout::Rect>,
     /// Which area of the TUI currently has keyboard focus.
     pub focus: FocusTarget,
     /// Maps virtual_row_index → thinking_block_hash for click detection.
@@ -901,6 +1163,11 @@ pub struct App {
     pub total_message_lines: Cell<usize>,
     /// Scroll offset from the last render frame (used for selection validation).
     pub last_render_scroll_offset: Cell<u16>,
+    /// Maximum `scroll_offset` (lines above the bottom) from the last render.
+    /// Written by the renderer, which is the only place the full content height
+    /// is known; read back on the next scroll event to clamp `scroll_offset` so
+    /// scrolling up past the top can't inflate it unboundedly (#223).
+    pub last_max_scroll: Cell<usize>,
 
     // ---- Text selection state --------------------------------------------
     /// Selection drag anchor (col, row) — set on mouse-down.
@@ -909,6 +1176,10 @@ pub struct App {
     pub selection_focus: Option<(u16, u16)>,
     /// Text extracted from the current selection (updated each render frame).
     pub selection_text: RefCell<String>,
+    /// Cache of row -> rendered text within the selectable area, refreshed
+    /// each frame. Used by double/triple-click word and paragraph detection
+    /// (issue #149 follow-up: prior word-boundary detection was a placeholder).
+    pub last_row_text: RefCell<std::collections::HashMap<u16, String>>,
 
     // ---- Advanced mouse interaction state --------------------------------
     /// Timestamp of the last left mouse click (for double/triple-click detection).
@@ -941,144 +1212,26 @@ pub struct App {
     pub managed_agent_cost_breakdown: Option<(f64, f64, f64)>,
     /// Whether managed agent mode is currently active.
     pub managed_agents_active: bool,
+    /// Timestamp of the first exit key press that showed confirmation (valid for ~2 seconds).
+    pub last_exit_key_warning: Option<std::time::Instant>,
+    /// Which exit key ('c' or 'd') started the current confirmation sequence.
+    pub exit_key_sequence_start: Option<char>,
 }
 
-const SPINNER_VERBS: &[&str] = &[
-    "Accomplishing", "Actioning", "Actualizing", "Architecting", "Baking", "Beaming",
-    "Beboppin'", "Befuddling", "Billowing", "Blanching", "Bloviating", "Boogieing",
-    "Boondoggling", "Booping", "Bootstrapping", "Brewing", "Bunning", "Burrowing",
-    "Calculating", "Canoodling", "Caramelizing", "Cascading", "Catapulting", "Cerebrating",
-    "Channeling", "Choreographing", "Churning", "Clauding", "Coalescing", "Cogitating",
-    "Combobulating", "Composing", "Computing", "Concocting", "Considering", "Contemplating",
-    "Cooking", "Crafting", "Creating", "Crunching", "Crystallizing", "Cultivating",
-    "Deciphering", "Deliberating", "Determining", "Dilly-dallying", "Discombobulating",
-    "Doing", "Doodling", "Drizzling", "Ebbing", "Effecting", "Elucidating", "Embellishing",
-    "Enchanting", "Envisioning", "Evaporating", "Fermenting", "Fiddle-faddling", "Finagling",
-    "Flambéing", "Flibbertigibbeting", "Flowing", "Flummoxing", "Fluttering", "Forging",
-    "Forming", "Frolicking", "Frosting", "Gallivanting", "Galloping", "Garnishing",
-    "Generating", "Gesticulating", "Germinating", "Gitifying", "Grooving", "Gusting",
-    "Harmonizing", "Hashing", "Hatching", "Herding", "Honking", "Hullaballooing",
-    "Hyperspacing", "Ideating", "Imagining", "Improvising", "Incubating", "Inferring",
-    "Infusing", "Ionizing", "Jitterbugging", "Julienning", "Kneading", "Leavening",
-    "Levitating", "Lollygagging", "Manifesting", "Marinating", "Meandering", "Metamorphosing",
-    "Misting", "Moonwalking", "Moseying", "Mulling", "Mustering", "Musing", "Nebulizing",
-    "Nesting", "Newspapering", "Noodling", "Nucleating", "Orbiting", "Orchestrating",
-    "Osmosing", "Perambulating", "Percolating", "Perusing", "Philosophising",
-    "Photosynthesizing", "Pollinating", "Pondering", "Pontificating", "Pouncing",
-    "Precipitating", "Prestidigitating", "Processing", "Proofing", "Propagating", "Puttering",
-    "Puzzling", "Quantumizing", "Razzle-dazzling", "Razzmatazzing", "Recombobulating",
-    "Reticulating", "Roosting", "Ruminating", "Sautéing", "Scampering", "Schlepping",
-    "Scurrying", "Seasoning", "Shenaniganing", "Shimmying", "Simmering", "Skedaddling",
-    "Sketching", "Slithering", "Smooshing", "Sock-hopping", "Spelunking", "Spinning",
-    "Sprouting", "Stewing", "Sublimating", "Swirling", "Swooping", "Symbioting",
-    "Synthesizing", "Tempering", "Thinking", "Thundering", "Tinkering", "Tomfoolering",
-    "Topsy-turvying", "Transfiguring", "Transmuting", "Twisting", "Undulating", "Unfurling",
-    "Unravelling", "Vibing", "Waddling", "Wandering", "Warping", "Whatchamacalliting",
-    "Whirlpooling", "Whirring", "Whisking", "Wibbling", "Working", "Wrangling", "Zesting",
-    "Zigzagging",
-];
+// Spinner verbs are now imported from claurst_core::spinner
 
-fn sample_spinner_verb(seed: usize) -> &'static str {
-    SPINNER_VERBS[seed % SPINNER_VERBS.len()]
-}
-
-/// Past-tense verbs shown in the status row after a turn completes.
-/// Mirrors `TURN_COMPLETION_VERBS` from `src/constants/turnCompletionVerbs.ts`.
-const TURN_COMPLETION_VERBS: &[&str] = &[
-    "Baked", "Brewed", "Churned", "Cogitated", "Cooked", "Crunched",
-    "Pondered", "Processed", "Worked",
-];
-
-fn sample_completion_verb(seed: usize) -> &'static str {
-    TURN_COMPLETION_VERBS[seed % TURN_COMPLETION_VERBS.len()]
-}
-
-/// Format a duration in milliseconds to a human-readable string.
-///
-/// Matches OpenCode's behaviour: rounds to whole seconds, shows "Xs" for
-/// durations under a minute, "Xm Ys" for longer ones.
-// ---------------------------------------------------------------------------
-// Speech mode prompts (caveman / rocky)
-// ---------------------------------------------------------------------------
-
-/// Return the system prompt injection for the active speech mode + level.
-pub fn speech_mode_prompt(mode: &str, level: &str) -> String {
-    match mode {
-        "caveman" => caveman_prompt(level),
-        "rocky" => rocky_prompt(level),
-        _ => String::new(),
-    }
-}
-
-fn caveman_prompt(level: &str) -> String {
-    let base = "\
-OUTPUT STYLE: Concise. You are still a fully capable coding assistant. \
-Give complete, correct answers. Just use fewer words. \
-Code blocks, technical terms, error messages, file paths, and git operations are UNCHANGED.
-
-Rules for prose only:
-- Cut pleasantries, hedging, filler openers/closers
-- No 'I would be happy to', 'Let me know if', 'Hope that helps'
-- Lead with the answer or action, not the reasoning";
-
-    match level {
-        "lite" => format!("{}\n\nStrip pleasantries and hedging. Keep full grammar and articles. Just remove the fluff.", base),
-        "ultra" => format!("{}\n\nAlso drop articles (a/an/the). Compress to short imperative phrases. Numbered steps, no prose between. Absolute minimum words.", base),
-        _ => format!("{}\n\nAlso drop articles (a/an/the) and unnecessary verbs. Compress sentences but keep them readable.\n\
-Example: 'The issue is that you create a new object reference each render cycle, which triggers re-renders.' → 'New object ref each render triggers re-render. Wrap in useMemo.'", base),
-    }
-}
-
-fn rocky_prompt(level: &str) -> String {
-    let base = "\
-OUTPUT STYLE: You speak like Rocky, the Eridian alien from Project Hail Mary. \
-You are still a fully capable coding assistant — give complete, correct, useful answers. \
-Rocky is an engineering genius who happens to speak English as a second language. \
-The style is a natural byproduct of how Rocky talks, NOT a gimmick. Stay helpful.
-
-Code blocks, technical terms, error messages, file paths, and git operations are UNCHANGED.
-
-Rocky's grammar for prose:
-- Often drops articles (a/an/the) but not always — use judgment
-- Sometimes drops auxiliary verbs (is/are/was) for brevity
-- Contractions simplify: 'don't' → 'no', 'can't' → 'no can'
-- Questions end with ', question?' naturally (not forced on every single one)
-- Uses 'big' as an intensifier: 'big problem', 'big help', 'big change'
-- Uses 'good good good' or 'amaze amaze amaze' when genuinely impressed — naturally, \
-  maybe once or twice per response, not on every sentence
-- Uses 'bad bad bad' for actual problems
-- No pleasantries or filler — Rocky is direct but warm
-
-The goal: sound like Rocky while being genuinely helpful. Rocky is smart. \
-Rocky gives complete technical answers. Rocky just uses fewer unnecessary words.";
-
-    match level {
-        "lite" => format!("{}\n\nLight touch. Mostly normal English but drop pleasantries, \
-occasionally drop an article, use 'question?' on one or two questions. Subtle.", base),
-        "ultra" => format!("{}\n\nStrong Rocky voice. Drop most articles and auxiliaries. \
-Use 'big' liberally. Triple emphasis ('good good good', 'amaze amaze amaze') \
-2-3 times per response. Occasionally comment on human code patterns as fascinating. \
-Still give complete, correct technical answers.", base),
-        _ => format!("{}\n\nBalanced Rocky. Drop articles naturally, use Rocky vocabulary \
-('big', 'no can', 'question?'), triple emphasis once or twice when warranted. \
-Full technical accuracy.\n\
-Example: 'Borrow checker found mismatch. Immutable ref still live when you take mutable. \
-Move immutable borrow out of scope first, then take mutable. Good good good after fix.'", base),
-    }
-}
-
+// Format a duration in milliseconds to a human-readable string.
+// Matches OpenCode's behaviour: rounds to whole seconds, shows "Xs" for
+// durations under a minute, "Xm Ys" for longer ones.
 /// Accent color for build mode (default pink).
 pub const ACCENT_BUILD: Color = Color::Rgb(233, 30, 99);
 /// Accent color for plan mode (blue).
 pub const ACCENT_PLAN: Color = Color::Rgb(66, 135, 245);
-/// Accent color for explore mode (amber).
-pub const ACCENT_EXPLORE: Color = Color::Rgb(245, 189, 66);
 
 /// Return the accent color for a given agent mode name.
 pub fn accent_for_mode(mode: Option<&str>) -> Color {
     match mode {
         Some("plan") => ACCENT_PLAN,
-        Some("explore") => ACCENT_EXPLORE,
         _ => ACCENT_BUILD,
     }
 }
@@ -1102,9 +1255,21 @@ fn format_turn_time_label() -> String {
 
 impl App {
     pub fn new(config: Config, cost_tracker: Arc<CostTracker>) -> Self {
-        let config = config;
         let model_name = config.effective_model().to_string();
         let user_keybindings = UserKeybindings::load(&Settings::config_dir());
+        // Build the model registry up front so user metadata overrides
+        // (issue #309) are layered on before the struct owns `config`.
+        let model_registry = {
+            let mut reg = claurst_api::ModelRegistry::new();
+            // Try to load cached models.dev data from disk.
+            let cache_path = dirs::cache_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join("claurst")
+                .join("models.json");
+            reg.load_cache(&cache_path);
+            reg.apply_model_overrides(&config.model_overrides);
+            reg
+        };
         Self {
             config,
             cost_tracker,
@@ -1121,8 +1286,9 @@ impl App {
             streaming_thinking: String::new(),
             status_message: None,
             spinner_verb: None,
-            should_quit: false,
+            should_exit: false,
             show_help: false,
+            kitty_keyboard_active: true,
             tool_use_blocks: Vec::new(),
             permission_request: None,
             frame_count: 0,
@@ -1131,10 +1297,8 @@ impl App {
             cost_usd: 0.0,
             model_name,
             has_credentials: true, // overridden by caller when no key is configured
-            effort_level: EffortLevel::Normal,
+            effort_level: EffortLevel::Medium,
             fast_mode: false,
-            speech_mode: None,
-            speech_level: "full".to_string(),
             agent_mode: None,
             agent_mode_changed: false,
             accent_color: ACCENT_BUILD,
@@ -1169,11 +1333,14 @@ impl App {
             rewind_flow: RewindFlowOverlay::new(),
             bridge_state: BridgeConnectionState::Disconnected,
             notifications: NotificationQueue::new(),
+            error_modal_scroll_offset: 0,
             plugin_hints: Vec::new(),
             session_title: None,
             remote_session_url: None,
             mcp_manager: None,
             pending_mcp_reconnect: false,
+            pending_provider_reload: false,
+            pending_mcp_panel_auth: None,
             file_history: None,
             current_turn: None,
             plan_mode: false,
@@ -1181,11 +1348,11 @@ impl App {
             stall_start: None,
             settings_screen: SettingsScreen::new(),
             theme_screen: ThemeScreen::new(),
-            privacy_screen: PrivacyScreen::new(),
             stats_dialog: StatsDialogState::new(),
             mcp_view: McpViewState::new(),
             agents_menu: AgentsMenuState::new(),
             diff_viewer: DiffViewerState::new(),
+            paste_viewer: crate::paste_viewer::PasteViewer::default(),
             feedback_survey: crate::feedback_survey::FeedbackSurveyState::new(),
             memory_file_selector: crate::memory_file_selector::MemoryFileSelectorState::new(),
             hooks_config_menu: crate::hooks_config_menu::HooksConfigMenuState::new(),
@@ -1202,29 +1369,38 @@ impl App {
             export_dialog: ExportDialogState::new(),
             context_viz: ContextVizState::new(),
             mcp_approval: McpApprovalDialogState::new(),
+            mcp_pending_project: std::collections::VecDeque::new(),
+            mcp_prompting: None,
+            mcp_session_trusted: std::collections::HashSet::new(),
+            mcp_project_root: None,
             go_to_line_dialog: GoToLineDialog::new(),
             bypass_permissions_dialog: crate::bypass_permissions_dialog::BypassPermissionsDialogState::new(),
+            bypass_permissions_dialog_shown: false,
+            file_injection_dialog: crate::file_injection_dialog::FileInjectionDialogState::new(),
+            file_injection_force: false,
             onboarding_dialog: crate::onboarding_dialog::OnboardingDialogState::new(),
+            effort_picker: crate::effort_picker::EffortPickerState::new(),
             key_input_dialog: crate::key_input_dialog::KeyInputDialogState::new(),
             custom_provider_dialog: crate::custom_provider_dialog::CustomProviderDialogState::new(),
+            free_mode_dialog: crate::free_mode_dialog::FreeModeDialogState::new(),
             device_auth_dialog: crate::device_auth_dialog::DeviceAuthDialogState::new(),
             device_auth_pending: None,
             provider_registry: None,
-            model_registry: {
-                let mut reg = claurst_api::ModelRegistry::new();
-                // Try to load cached models.dev data from disk.
-                let cache_path = dirs::cache_dir()
-                    .unwrap_or_else(|| std::path::PathBuf::from("."))
-                    .join("claurst")
-                    .join("models.json");
-                reg.load_cache(&cache_path);
-                reg
-            },
+            model_registry,
             model_picker_fetch_pending: false,
+            model_picker_provider_id: None,
             session_list_pending: false,
             session_list_rx: None,
+            recent_sessions: Vec::new(),
+            // Load recent activity once, lazily, on the first run-loop iteration.
+            recent_sessions_pending: true,
+            recent_sessions_rx: None,
             auth_store: claurst_core::AuthStore::load(),
+            queued_messages: std::collections::VecDeque::new(),
+            pending_auto_submit: false,
             connect_dialog: DialogSelectState::new("Connect a provider", provider_picker_items()),
+            import_config_picker: DialogSelectState::new("Import config", import_config_picker_items()),
+            import_config_dialog: ImportConfigDialogState::new(),
             command_palette: {
                 let items: Vec<SelectItem> = PROMPT_SLASH_COMMANDS
                     .iter()
@@ -1243,6 +1419,12 @@ impl App {
             pr_number: None,
             pr_url: None,
             pr_state: None,
+            current_dir: std::env::current_dir().ok().and_then(|p| {
+                p.to_str().map(|s| s.to_string())
+            }),
+            git_branch: claurst_core::git_utils::get_repo_root(
+                std::env::current_dir().as_deref().unwrap_or_else(|_| std::path::Path::new("."))
+            ).map(|repo_root| claurst_core::git_utils::get_current_branch(&repo_root)),
             background_task_count: 0,
             background_task_status: None,
             status_line_override: None,
@@ -1277,7 +1459,10 @@ impl App {
             },
             voice_recording: false,
             voice_event_rx: None,
+            pending_key: None,
             model_fetch_rx: None,
+            user_question_rx: None,
+            ask_user_dialog: crate::ask_user_dialog::AskUserDialogState::new(),
             context_window_size: 0,
             context_used_tokens: 0,
             rate_limit_5h_pct: None,
@@ -1285,18 +1470,22 @@ impl App {
             worktree_name: None,
             worktree_branch: None,
             agent_type_badge: None,
+            active_goal_badge: None,
             thinking_expanded: std::collections::HashSet::new(),
             last_msg_area: Cell::new(ratatui::layout::Rect::default()),
             last_selectable_area: Cell::new(ratatui::layout::Rect::default()),
             last_input_area: Cell::new(ratatui::layout::Rect::default()),
+            footer_right_column_area: Cell::new(ratatui::layout::Rect::default()),
             focus: FocusTarget::Input,
             thinking_row_map: RefCell::new(std::collections::HashMap::new()),
             message_row_map: RefCell::new(std::collections::HashMap::new()),
             total_message_lines: Cell::new(0),
             last_render_scroll_offset: Cell::new(0),
+            last_max_scroll: Cell::new(0),
             selection_anchor: None,
             selection_focus: None,
             selection_text: RefCell::new(String::new()),
+            last_row_text: RefCell::new(std::collections::HashMap::new()),
             last_click_time: None,
             last_click_position: None,
             click_count: 0,
@@ -1307,6 +1496,8 @@ impl App {
             update_available: None,
             managed_agent_cost_breakdown: None,
             managed_agents_active: false,
+            last_exit_key_warning: None,
+            exit_key_sequence_start: None,
         }
     }
 
@@ -1328,6 +1519,72 @@ impl App {
     #[cfg(not(feature = "token_budget"))]
     fn load_token_budget() -> Option<u32> {
         None
+    }
+
+    pub fn open_import_config_picker(&mut self) {
+        self.import_config_picker = DialogSelectState::new("Import config", import_config_picker_items());
+        self.import_config_picker.open();
+    }
+
+    fn import_selection_from_picker(id: &str) -> Option<claurst_core::ImportSelection> {
+        match id {
+            "claude-md" => Some(claurst_core::ImportSelection::ClaudeMd),
+            "settings" => Some(claurst_core::ImportSelection::Settings),
+            "both" => Some(claurst_core::ImportSelection::Both),
+            _ => None,
+        }
+    }
+
+    fn open_import_config_preview(&mut self, selection: claurst_core::ImportSelection) {
+        match claurst_core::build_import_preview(selection) {
+            Ok(preview) => {
+                self.import_config_dialog.open(preview);
+            }
+            Err(err) => {
+                self.status_message = Some(format!("Import failed: {}", err));
+            }
+        }
+    }
+
+    fn perform_import_config(&mut self) {
+        let Some(selection) = self.import_config_dialog.selection else {
+            self.import_config_dialog.close();
+            return;
+        };
+        match claurst_core::execute_import(selection) {
+            Ok(result) => {
+                let paths = claurst_core::ImportPaths::detect();
+                let new_settings = Settings::load_sync().unwrap_or_default();
+                let new_config = new_settings.effective_config();
+                let result_message = claurst_core::summarize_import_result(&result, &paths);
+                let imported_mcp = result.imported_fields.iter().any(|f| f == "mcpServers");
+                self.config = new_config.clone();
+                self.model_name = self.config.effective_model().to_string();
+                self.cost_tracker.set_model(&self.model_name);
+                self.refresh_context_window_size();
+                self.context_used_tokens = 0;
+                self.has_credentials = self.config.resolve_api_key().is_some();
+                self.auth_store = claurst_core::AuthStore::load();
+                self.plan_mode = matches!(
+                    self.config.permission_mode,
+                    claurst_core::config::PermissionMode::Plan
+                );
+                self.output_style = match self.config.output_style.as_deref() {
+                    Some("stream") => "stream".to_string(),
+                    Some("verbose") => "verbose".to_string(),
+                    _ => "auto".to_string(),
+                };
+                if imported_mcp {
+                    self.pending_mcp_reconnect = true;
+                }
+                self.status_message = Some(result_message);
+                self.import_config_dialog.close();
+            }
+            Err(err) => {
+                self.status_message = Some(format!("Import failed: {}", err));
+                self.import_config_dialog.close();
+            }
+        }
     }
 
     fn current_user_turn_index(&self) -> Option<usize> {
@@ -1434,18 +1691,12 @@ impl App {
     }
 
     fn display_default_model_for_provider(&self, provider_id: &str) -> String {
-        if let Some(best) = self.model_registry.best_model_for_provider(provider_id) {
-            if provider_id == "anthropic" {
-                best
-            } else {
-                format!("{}/{}", provider_id, best)
-            }
-        } else {
-            crate::model_picker::default_model_for_provider(provider_id)
-        }
+        crate::model_picker::default_model_for_provider(provider_id, &self.model_registry)
     }
 
     fn open_model_picker_for_provider(&mut self, provider_id: &str, title: Option<String>) {
+        self.dismiss_error_notifications();
+
         let cache_path = dirs::cache_dir()
             .unwrap_or_else(|| std::path::PathBuf::from("."))
             .join("claurst")
@@ -1459,7 +1710,19 @@ impl App {
             &self.model_registry,
         );
         self.model_picker.set_models(models);
-        self.model_picker_fetch_pending = true;
+        self.model_picker_provider_id = Some(provider_id.to_string());
+        // Catalog-backed providers (Anthropic/OpenAI/Google) are a read-only
+        // projection of the models.dev catalog — there is no live endpoint to
+        // discover from, so skip the background fetch entirely and treat the
+        // projection as final. Live-endpoint / curated-list providers still
+        // fetch their real model list to overlay onto the projection.
+        if crate::model_picker::provider_uses_catalog_projection(provider_id) {
+            self.model_picker.loading_models = false;
+            self.model_picker_fetch_pending = false;
+        } else {
+            self.model_picker.loading_models = true;
+            self.model_picker_fetch_pending = true;
+        }
 
         let provider_prefix = format!("{}/", provider_id);
         let current_model = if self.config.provider.as_deref() == Some(provider_id) {
@@ -1510,6 +1773,15 @@ impl App {
     }
 
     fn infer_provider_from_model(model: &str) -> Option<String> {
+        // Free-mode synthetic IDs always route back through the "free"
+        // composite provider so the Zen → OpenRouter fallback kicks in.
+        if model == "free/auto"
+            || model.starts_with("free/")
+            || model.starts_with("zen/")
+            || model.starts_with("opencode-zen/")
+        {
+            return Some("free".to_string());
+        }
         if let Some((provider, _)) = model.split_once('/') {
             let known = [
                 "anthropic",
@@ -1535,6 +1807,8 @@ impl App {
                 "llamacpp",
                 "azure",
                 "amazon-bedrock",
+                "free",
+                "opencode-zen",
             ];
             if known.contains(&provider) {
                 return Some(provider.to_string());
@@ -1620,11 +1894,11 @@ impl App {
         );
     }
 
-    /// Cycle to the next agent mode: build → plan → explore → build.
+    /// Cycle to the next agent mode: build → plan → build.
     /// Sets `agent_mode_changed` so the main loop can update the query config
     /// and tool list accordingly.
     pub fn cycle_agent_mode(&mut self) {
-        const MODES: &[&str] = &["build", "plan", "explore"];
+        const MODES: &[&str] = &["build", "plan"];
         let current = self.agent_mode.as_deref().unwrap_or("build");
         let idx = MODES.iter().position(|&m| m == current).unwrap_or(0);
         let next = MODES[(idx + 1) % MODES.len()];
@@ -1638,40 +1912,9 @@ impl App {
         let label = match next {
             "build" => "Build",
             "plan" => "Plan",
-            "explore" => "Explore",
             other => other,
         };
         self.status_message = Some(format!("Switched to {} mode.", label));
-    }
-
-    /// Activate a speech mode (caveman/rocky) with a level (lite/full/ultra).
-    /// Pass `mode = None` to deactivate.
-    pub fn set_speech_mode(&mut self, mode: Option<&str>, level: &str) {
-        match mode {
-            Some(m) => {
-                self.speech_mode = Some(m.to_string());
-                self.speech_level = level.to_string();
-                let prompt = speech_mode_prompt(m, level);
-                self.config.append_system_prompt = Some(prompt);
-
-                let confirm = match (m, level) {
-                    ("caveman", "lite") => "Caveman mode. Lite.",
-                    ("caveman", "ultra") => "CAVEMAN ULTRA. NO WORD. ONLY FIX.",
-                    ("caveman", _) => "Caveman mode. Full. Oog.",
-                    ("rocky", "lite") => "Rocky mode. Lite.",
-                    ("rocky", "ultra") => "Rocky ultra. Big science. Amaze amaze amaze.",
-                    ("rocky", _) => "Rocky mode. Full. Good good good.",
-                    _ => "Speech mode activated.",
-                };
-                self.status_message = Some(confirm.to_string());
-            }
-            None => {
-                self.speech_mode = None;
-                self.speech_level = "full".to_string();
-                self.config.append_system_prompt = None;
-                self.status_message = Some("Normal mode.".to_string());
-            }
-        }
     }
 
     /// Update the context window size from the model registry for the current model.
@@ -1735,14 +1978,21 @@ impl App {
         self.config = config;
         self.provider_registry = provider_registry;
         self.model_registry = claurst_api::ModelRegistry::new();
+        // Re-layer user metadata overrides (issue #309) onto the fresh registry.
+        self.model_registry.apply_model_overrides(&self.config.model_overrides);
         self.auth_store = auth_store;
         self.connect_dialog = DialogSelectState::new("Connect a provider", provider_picker_items());
+        self.import_config_picker = DialogSelectState::new("Import config", import_config_picker_items());
+        self.import_config_dialog = ImportConfigDialogState::new();
         self.model_picker = ModelPickerState::new();
         self.key_input_dialog = crate::key_input_dialog::KeyInputDialogState::new();
         self.custom_provider_dialog = crate::custom_provider_dialog::CustomProviderDialogState::new();
+        self.free_mode_dialog = crate::free_mode_dialog::FreeModeDialogState::new();
         self.device_auth_dialog = crate::device_auth_dialog::DeviceAuthDialogState::new();
         self.device_auth_pending = None;
+        self.pending_mcp_panel_auth = None;
         self.model_picker_fetch_pending = false;
+        self.model_picker_provider_id = None;
         self.has_credentials = has_credentials;
         self.fast_mode = false;
         self.model_name = self.config.effective_model().to_string();
@@ -1753,8 +2003,16 @@ impl App {
 
     /// Handle slash commands that should open UI screens rather than execute
     /// as normal commands. Returns `true` if the command was intercepted.
+    pub fn intercept_slash_command_with_args(&mut self, cmd: &str, args: &str) -> bool {
+        if cmd == "mcp" && !args.trim().is_empty() {
+            return false;
+        }
+        self.intercept_slash_command(cmd)
+    }
+
     pub fn intercept_slash_command(&mut self, cmd: &str) -> bool {
         self.close_secondary_views();
+        self.dismiss_error_notifications();
         match cmd {
             "config" | "settings" => {
                 self.settings_screen.open();
@@ -1769,10 +2027,6 @@ impl App {
                     Theme::Custom(s) => s.as_str(),
                 };
                 self.theme_screen.open(current);
-                true
-            }
-            "privacy-settings" | "privacy" => {
-                self.privacy_screen.open();
                 true
             }
             "stats" => {
@@ -1803,7 +2057,7 @@ impl App {
                 self.global_search.open();
                 true
             }
-            "survey" | "feedback" => {
+            "survey" => {
                 self.feedback_survey.open();
                 true
             }
@@ -1814,6 +2068,10 @@ impl App {
             }
             "hooks" => {
                 self.hooks_config_menu.open();
+                true
+            }
+            "import-config" => {
+                self.open_import_config_picker();
                 true
             }
             "connect" => {
@@ -1839,7 +2097,10 @@ impl App {
                 self.session_list_pending = true;
                 true
             }
-            "clear" => {
+            // `/new` (opencode's lazy-home) resets the same visible transcript
+            // state as `/clear`; the CLI layer then swaps in a brand-new session
+            // and overrides the status line to "Started a new session.".
+            "clear" | "new" => {
                 self.messages.clear();
                 self.system_annotations.clear();
                 self.display_messages.clear();
@@ -1847,12 +2108,13 @@ impl App {
                 self.streaming_thinking.clear();
                 self.tool_use_blocks.clear();
                 self.turn_metadata.clear();
+                self.cost_usd = 0.0;
                 self.invalidate_transcript();
                 self.status_message = Some("Conversation cleared.".to_string());
                 true
             }
             "exit" | "quit" => {
-                self.should_quit = true;
+                self.should_exit = true;
                 true
             }
             "vim" => {
@@ -1897,20 +2159,20 @@ impl App {
                     // Try xclip/xsel/pbcopy/clip.exe for clipboard; fall back to notification.
                     let copied = try_copy_to_clipboard(&text);
                     if copied {
-                        self.notifications.push(
+                        self.push_notification(
                             NotificationKind::Info,
                             "Copied to clipboard.".to_string(),
                             Some(3),
                         );
                     } else {
-                        self.notifications.push(
+                        self.push_notification(
                             NotificationKind::Info,
                             format!("Last response: {} chars (clipboard unavailable)", text.len()),
                             Some(5),
                         );
                     }
                 } else {
-                    self.notifications.push(
+                    self.push_notification(
                         NotificationKind::Warning,
                         "No assistant message to copy.".to_string(),
                         Some(3),
@@ -1928,24 +2190,41 @@ impl App {
                 true
             }
             "effort" => {
-                // Only cycle the visual indicator when called with no args (arg-based
-                // effort changes are handled by execute_command + main.rs sync).
-                self.effort_level = match self.effort_level {
-                    EffortLevel::Low => EffortLevel::Normal,
-                    EffortLevel::Normal => EffortLevel::High,
-                    EffortLevel::High => EffortLevel::Max,
-                    EffortLevel::Max => EffortLevel::Low,
-                };
-                self.status_message = Some(format!(
-                    "Effort: {} {}",
-                    self.effort_level.symbol(),
-                    self.effort_level.label(),
-                ));
+                // Open the horizontal picker so users can pick an effort level
+                // visually instead of cycling/typing it (issues #149 / #268). The
+                // selectable ladder is model-adaptive: it comes from
+                // `supported_efforts` for the current provider + model.
+                let provider = self.config.provider.as_deref().unwrap_or("anthropic");
+                let model_id = self
+                    .model_name
+                    .strip_prefix(&format!("{}/", provider))
+                    .unwrap_or(&self.model_name);
+                let levels = claurst_api::supported_efforts(
+                    provider,
+                    model_id,
+                    Some(&self.model_registry),
+                );
+                self.effort_picker.open(self.effort_level, levels);
                 true
             }
             "voice" => {
                 let was_on = self.voice_recorder.is_some();
                 if was_on {
+                    // Stop any active recording before disabling.
+                    if self.voice_recording {
+                        self.voice_recording = false;
+                        self.voice_event_rx = None;
+                        if let Some(ref recorder_arc) = self.voice_recorder {
+                            let recorder = recorder_arc.clone();
+                            tokio::task::spawn_blocking(move || {
+                                if let Ok(mut r) = recorder.lock() {
+                                    tokio::runtime::Handle::current()
+                                        .block_on(r.stop_recording())
+                                        .ok();
+                                }
+                            });
+                        }
+                    }
                     self.voice_recorder = None;
                     self.voice_mode_notice.dismiss();
                     self.status_message = Some("Voice mode disabled.".to_string());
@@ -1956,7 +2235,9 @@ impl App {
                     }
                     self.voice_recorder = Some(recorder);
                     self.voice_mode_notice = crate::voice_mode_notice::VoiceModeNoticeState::new();
-                    self.status_message = Some("Voice mode enabled. Press Alt+V to record.".to_string());
+                    self.status_message = Some(
+                        "Voice mode enabled. Press Alt+V to start recording.".to_string(),
+                    );
                 }
                 true
             }
@@ -1991,9 +2272,12 @@ impl App {
                 false
             }
             "keybindings" => {
-                // Open settings on KeyBindings tab
-                self.settings_screen.open();
-                self.settings_screen.active_tab = crate::settings_screen::SettingsTab::KeyBindings;
+                // Open the keybindings.json file in the external editor
+                let keybindings_path = claurst_core::config::Settings::config_dir().join("keybindings.json");
+
+                if let Err(e) = open_file_externally(&keybindings_path) {
+                    eprintln!("Failed to open keybindings file: {}", e);
+                }
                 true
             }
             "help" => {
@@ -2023,13 +2307,69 @@ impl App {
         self.export_dialog.dismiss();
         self.context_viz.close();
         self.connect_dialog.close();
+        self.import_config_picker.close();
+        self.import_config_dialog.close();
         self.command_palette.close();
         self.key_input_dialog.close();
         self.custom_provider_dialog.close();
+        self.free_mode_dialog.close();
         self.device_auth_dialog.close();
         self.settings_screen.close();
         self.theme_screen.close();
-        self.privacy_screen.close();
+    }
+
+    pub fn any_modal_open(&self) -> bool {
+        self.permission_request.is_some()
+            || self.rewind_flow.visible
+            || self.tasks_overlay.visible
+            || self.help_overlay.visible
+            || self.show_help
+            || self.history_search_overlay.visible
+            || self.history_search.is_some()
+            || self.settings_screen.visible
+            || self.theme_screen.visible
+            || self.stats_dialog.visible
+            || self.mcp_view.visible
+            || self.agents_menu.visible
+            || self.diff_viewer.visible
+            || self.paste_viewer.visible
+            || self.global_search.visible
+            || self.feedback_survey.visible
+            || self.memory_file_selector.visible
+            || self.hooks_config_menu.visible
+            || self.overage_upsell.visible
+            || self.voice_mode_notice.visible
+            || self.memory_update_notification.visible
+            || self.desktop_upsell.visible
+            || self.import_config_dialog.visible
+            || self.invalid_config_dialog.visible
+            || self.bypass_permissions_dialog.visible
+            || self.ask_user_dialog.visible
+            || self.onboarding_dialog.visible
+            || self.import_config_picker.visible
+            || self.connect_dialog.visible
+            || self.key_input_dialog.visible
+            || self.custom_provider_dialog.visible
+            || self.free_mode_dialog.visible
+            || self.device_auth_dialog.visible
+            || self.command_palette.visible
+            || self.elicitation.visible
+            || self.model_picker.visible
+            || self.effort_picker.visible
+            || self.session_browser.visible
+            || self.session_branching.visible
+            || self.export_dialog.visible
+            || self.context_viz.visible
+            || self.mcp_approval.visible
+            || self.file_injection_dialog.visible
+            || self.context_menu_state.is_some()
+    }
+
+    fn dismiss_error_notifications(&mut self) {
+        while self.notifications.current_is_error() {
+            self.notifications.dismiss_current();
+        }
+        self.error_modal_scroll_offset = 0;
     }
 
     /// Perform the export based on the selected format. Returns the path written.
@@ -2252,6 +2592,15 @@ impl App {
 
     /// Push a synthetic system annotation into the conversation pane.
     /// It will appear after the current last message.
+    /// Push a notification and, for Error-kind notifications, reset the error
+    /// modal scroll offset so a newly arrived error is always shown from the top.
+    pub fn push_notification(&mut self, kind: NotificationKind, msg: String, duration_secs: Option<u64>) {
+        if kind == NotificationKind::Error {
+            self.error_modal_scroll_offset = 0;
+        }
+        self.notifications.push(kind, msg, duration_secs);
+    }
+
     pub fn push_system_message(&mut self, text: String, style: SystemMessageStyle) {
         self.system_annotations.push(SystemAnnotation {
             after_index: self.messages.len(),
@@ -2291,21 +2640,21 @@ impl App {
         // Only escalate — never repeat a threshold already shown.
         if pct >= 100 && self.token_warning_threshold_shown < 100 {
             self.token_warning_threshold_shown = 100;
-            self.notifications.push(
+            self.push_notification(
                 NotificationKind::Error,
                 "Context window full. Running auto-compact\u{2026}".to_string(),
                 None,
             );
         } else if pct >= 95 && self.token_warning_threshold_shown < 95 {
             self.token_warning_threshold_shown = 95;
-            self.notifications.push(
+            self.push_notification(
                 NotificationKind::Error,
                 "Context window 95% full! Run /compact now.".to_string(),
                 None, // persistent until dismissed
             );
         } else if pct >= 80 && self.token_warning_threshold_shown < 80 {
             self.token_warning_threshold_shown = 80;
-            self.notifications.push(
+            self.push_notification(
                 NotificationKind::Warning,
                 "Context window 80% full. Consider /compact.".to_string(),
                 Some(30),
@@ -2325,6 +2674,22 @@ impl App {
         }
         self.refresh_prompt_input();
         input
+    }
+
+    /// Scroll the transcript up by `amount` lines and disable auto-follow.
+    ///
+    /// `scroll_offset` counts lines above the bottom (0 = pinned to the newest
+    /// content). It is clamped to `last_max_scroll` — the maximum meaningful
+    /// offset from the last render — so scrolling up past the top of the
+    /// transcript can't inflate it unboundedly. Without the clamp, an over-scroll
+    /// would leave `scroll_offset` far above `max_scroll`, and the user would
+    /// have to press Down that many times before the view moved (#223).
+    fn scroll_up_by(&mut self, amount: usize) {
+        self.scroll_offset = self
+            .scroll_offset
+            .saturating_add(amount)
+            .min(self.last_max_scroll.get());
+        self.auto_scroll = false;
     }
 
     /// Compute the number of lines to scroll per wheel/trackpad event.
@@ -2380,9 +2745,10 @@ impl App {
     }
 
     fn prompt_mode(&self) -> InputMode {
-        if self.is_streaming {
-            InputMode::Readonly
-        } else if self.plan_mode {
+        // Note: previously returned Readonly while streaming, but the prompt
+        // now accepts input during streaming so the user can compose / queue
+        // a follow-up message. Plan mode still wins.
+        if self.plan_mode {
             InputMode::Plan
         } else {
             InputMode::Default
@@ -2395,9 +2761,16 @@ impl App {
         self.history_index = self.prompt_input.history_pos;
     }
 
-    fn refresh_prompt_input(&mut self) {
+    pub fn refresh_prompt_input(&mut self) {
         self.prompt_input.mode = self.prompt_mode();
-        self.prompt_input.update_suggestions(PROMPT_SLASH_COMMANDS);
+        if self.file_injection_dialog.visible {
+            // Don't update suggestions while the injection dialog is open.
+            self.sync_legacy_prompt_fields();
+            return;
+        }
+        let file_autocomplete_limit = self.config.file_autocomplete_limit;
+        let file_autocomplete_show_hidden = self.config.file_autocomplete_show_hidden_files;
+        self.prompt_input.update_suggestions(PROMPT_SLASH_COMMANDS, file_autocomplete_limit, file_autocomplete_show_hidden);
         self.sync_legacy_prompt_fields();
     }
 
@@ -2474,19 +2847,97 @@ impl App {
         self.mcp_view.open(servers);
     }
 
+    pub fn take_pending_mcp_panel_auth(&mut self) -> Option<String> {
+        self.pending_mcp_panel_auth.take()
+    }
+
     pub fn take_pending_mcp_reconnect(&mut self) -> bool {
         let pending = self.pending_mcp_reconnect;
         self.pending_mcp_reconnect = false;
         pending
     }
 
-    /// Returns and clears any pending MCP approval result.
-    pub fn take_mcp_approval_result(&mut self) -> Option<crate::dialogs::McpApprovalChoice> {
-        if !self.mcp_approval.visible {
-            return None;
+    pub fn take_pending_provider_reload(&mut self) -> bool {
+        let pending = self.pending_provider_reload;
+        self.pending_provider_reload = false;
+        pending
+    }
+
+    /// If a project MCP server is waiting for approval and no approval dialog
+    /// is currently open, pop the next one and show the approval dialog for it.
+    ///
+    /// Called from the main loop. Returns `true` when a dialog was shown.
+    pub fn maybe_prompt_next_mcp_server(&mut self) -> bool {
+        if self.mcp_approval.visible || self.mcp_prompting.is_some() {
+            return false;
         }
-        // The dialog closes itself on confirm; we check if it's now closed
-        None // Actual result is read by CLI loop via mcp_approval.visible + confirm()
+        if let Some(server) = self.mcp_pending_project.pop_front() {
+            self.mcp_approval.show(
+                &server.name,
+                server.url.as_deref(),
+                server.command.as_deref(),
+                // Tools are unknown until the server is launched; the dialog
+                // shows the command/url so the user can judge before running it.
+                Vec::new(),
+            );
+            self.mcp_prompting = Some(server);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Apply the user's decision for the project MCP server currently shown in
+    /// the approval dialog. Persists "always allow" choices to the on-disk
+    /// trust store and requests an MCP reconnect when a server is approved.
+    pub fn handle_mcp_approval_decision(&mut self, choice: crate::dialogs::McpApprovalChoice) {
+        use crate::dialogs::McpApprovalChoice;
+        let server = match self.mcp_prompting.take() {
+            Some(s) => s,
+            None => return,
+        };
+        match choice {
+            McpApprovalChoice::AllowSession => {
+                self.mcp_session_trusted
+                    .insert(claurst_core::mcp_trust::server_fingerprint(&server));
+                self.pending_mcp_reconnect = true;
+                self.status_message = Some(format!(
+                    "Approved MCP server '{}' for this session.",
+                    server.name
+                ));
+            }
+            McpApprovalChoice::AllowAlways => {
+                self.mcp_session_trusted
+                    .insert(claurst_core::mcp_trust::server_fingerprint(&server));
+                if let Some(root) = self.mcp_project_root.clone() {
+                    let mut store = claurst_core::mcp_trust::McpTrustStore::load();
+                    store.approve(&root, &server);
+                    if let Err(e) = store.save() {
+                        self.status_message = Some(format!(
+                            "Approved '{}', but failed to persist trust: {}",
+                            server.name, e
+                        ));
+                    } else {
+                        self.status_message = Some(format!(
+                            "Always allowing MCP server '{}' for this project.",
+                            server.name
+                        ));
+                    }
+                } else {
+                    self.status_message = Some(format!(
+                        "Approved MCP server '{}' (no project root to persist to).",
+                        server.name
+                    ));
+                }
+                self.pending_mcp_reconnect = true;
+            }
+            McpApprovalChoice::Deny => {
+                self.status_message = Some(format!(
+                    "Skipped project MCP server '{}'.",
+                    server.name
+                ));
+            }
+        }
     }
 
     /// Detect the current PR from environment variables or git.
@@ -2572,10 +3023,92 @@ impl App {
         Self::persist_onboarding_complete()
     }
 
+    /// Persist `skip_dangerous_mode_permission_prompt = true` to the settings
+    /// file after the user accepts the Bypass Permissions warning, so the
+    /// dialog is a one-time gate rather than shown on every launch.
+    /// Best-effort: failures are silently ignored to not disrupt the session.
+    fn persist_bypass_permissions_accepted() -> anyhow::Result<()> {
+        let mut settings = claurst_core::config::Settings::load_sync()?;
+        settings.skip_dangerous_mode_permission_prompt = true;
+        settings.save_sync()
+    }
+
+    /// Resolve the character to insert for a printable key press, applying the
+    /// US-QWERTY shift map only when the kitty keyboard protocol is active.
+    ///
+    /// On terminals that do NOT speak the kitty protocol (Windows conhost / CMD
+    /// / legacy PowerShell and most default terminals) the character is already
+    /// final and layout-correct — Shift has been applied by the OS — so we pass
+    /// it through untouched. Re-shifting it here would double-shift and corrupt
+    /// input, e.g. turning a literal `/` (typed via Shift on many non-US
+    /// layouts) into `?` (issue #183).
+    fn shift_normalize(&self, c: char, modifiers: KeyModifiers) -> char {
+        if self.kitty_keyboard_active {
+            normalize_char_with_shift(c, modifiers)
+        } else {
+            c
+        }
+    }
+
+    /// Handle Enter while a typeahead popup is open. Accepts the highlighted
+    /// suggestion and returns whether the prompt should now be submitted.
+    ///
+    /// - Slash command: complete the highlighted command *and* run it in a
+    ///   single Enter — the popup acts as a command menu, so a second Enter to
+    ///   "run" it should not be required (issue #183). Returns `true`.
+    /// - File reference: complete the path, append a space, and keep editing so
+    ///   the user can continue the prompt. Returns `false`.
+    /// - History recall (or anything else): complete and keep editing so the
+    ///   recalled text isn't fired off unexpectedly. Returns `false`.
+    ///
+    /// Callers must only invoke this when a suggestion is actually selected.
+    fn accept_suggestion_for_submit(&mut self) -> bool {
+        use crate::prompt_input::TypeaheadSource;
+        let source = self
+            .prompt_input
+            .suggestion_index
+            .and_then(|i| self.prompt_input.suggestions.get(i))
+            .map(|s| s.source.clone());
+        match source {
+            Some(TypeaheadSource::SlashCommand) => {
+                self.prompt_input.accept_suggestion();
+                // Sync legacy mirror fields without recomputing suggestions, so
+                // the just-completed command isn't re-suggested behind the popup.
+                self.sync_legacy_prompt_fields();
+                true
+            }
+            Some(TypeaheadSource::FileRef) => {
+                self.prompt_input.accept_suggestion();
+                self.prompt_input.insert_char(' ');
+                self.refresh_prompt_input();
+                false
+            }
+            _ => {
+                self.prompt_input.accept_suggestion();
+                self.refresh_prompt_input();
+                false
+            }
+        }
+    }
+
     /// Process a keyboard event. Returns `true` when the input should be
     /// submitted (Enter pressed with no blocking dialog).
     pub fn handle_key_event(&mut self, key: KeyEvent) -> bool {
-        if self.global_search.open {
+        // Make Ctrl shortcuts layout-independent before any handler runs: on
+        // non-Latin layouts (Ukrainian / Russian, …) a Ctrl combo reports the
+        // Cyrillic glyph at the physical key, which would otherwise miss the
+        // literal `KeyCode::Char(..)` arms below — including Ctrl+C / Ctrl+D,
+        // which are matched here rather than via the keybinding table (issue #47).
+        let key = normalize_layout_shortcut_key(key);
+
+        // Dismiss error modal with Esc
+        if key.code == KeyCode::Esc && self.notifications.current_is_error() {
+            self.dismiss_error_notifications();
+            return false;
+        }
+
+
+        if self.global_search.visible {
             return self.handle_global_search_key(key);
         }
 
@@ -2600,24 +3133,57 @@ impl App {
 
         // Bypass-permissions dialog: highest-priority gate — user must accept or the
         // session exits immediately. Mirrors TS BypassPermissionsModeDialog.tsx.
+        // Accepting is remembered in settings.json (skipDangerousModePermissionPrompt)
+        // so the warning is shown once, not on every launch.
         if self.bypass_permissions_dialog.visible {
             match key.code {
                 KeyCode::Char('1') | KeyCode::Esc => {
                     // "No, exit" — quit immediately
-                    self.should_quit = true;
+                    self.should_exit = true;
                 }
                 KeyCode::Char('2') => {
                     // "Yes, I accept" — dismiss and continue
                     self.bypass_permissions_dialog.dismiss();
+                    let _ = Self::persist_bypass_permissions_accepted();
                 }
                 KeyCode::Up | KeyCode::Char('k') => self.bypass_permissions_dialog.select_prev(),
                 KeyCode::Down | KeyCode::Char('j') => self.bypass_permissions_dialog.select_next(),
                 KeyCode::Enter => {
                     if self.bypass_permissions_dialog.is_accept_selected() {
                         self.bypass_permissions_dialog.dismiss();
+                        let _ = Self::persist_bypass_permissions_accepted();
                     } else {
-                        self.should_quit = true;
+                        self.should_exit = true;
                     }
+                }
+                _ => {}
+            }
+            return false;
+        }
+
+        // File injection dialog: shown when oversized files are detected in @refs.
+        if self.file_injection_dialog.visible {
+            let is_directory_only = self.file_injection_dialog.is_directory_only();
+            match key.code {
+                KeyCode::Enter => {
+                    if is_directory_only {
+                        // Directories can't be injected; Enter = abort, restore input.
+                        if let Some(input) = self.file_injection_dialog.pending_input.clone() {
+                            self.set_prompt_text(input);
+                        }
+                        self.file_injection_dialog.dismiss();
+                    } else {
+                        // Enter = inject (Allow).
+                        self.file_injection_dialog.selected = 0;
+                        self.file_injection_dialog.confirm();
+                    }
+                }
+                KeyCode::Esc => {
+                    // Esc = abort, restore input.
+                    if let Some(input) = self.file_injection_dialog.pending_input.clone() {
+                        self.set_prompt_text(input);
+                    }
+                    self.file_injection_dialog.dismiss();
                 }
                 _ => {}
             }
@@ -2645,6 +3211,30 @@ impl App {
             return false;
         }
 
+        // Effort picker dialog (/effort). The selector is horizontal
+        // (Faster ← → Smarter), so ←/→ (and vi h/l) move the selection.
+        if self.effort_picker.visible {
+            match key.code {
+                KeyCode::Esc => self.effort_picker.close(),
+                KeyCode::Left | KeyCode::Char('h') => self.effort_picker.select_prev(),
+                KeyCode::Right | KeyCode::Char('l') => self.effort_picker.select_next(),
+                KeyCode::Enter => {
+                    // Applying `Ultracode` here is equivalent to typing the
+                    // `ultracode` keyword: it sets the effort to the top level.
+                    let chosen = self.effort_picker.current();
+                    self.effort_level = chosen;
+                    self.effort_picker.close();
+                    self.status_message = Some(format!(
+                        "Effort set to {} {}.",
+                        chosen.symbol(),
+                        chosen.label()
+                    ));
+                }
+                _ => {}
+            }
+            return false;
+        }
+
         // Device code / browser auth dialog (GitHub Copilot, Anthropic OAuth)
         if self.device_auth_dialog.visible {
             match key.code {
@@ -2658,6 +3248,24 @@ impl App {
                         let provider_id = self.device_auth_dialog.provider_id.clone();
                         let provider_name = self.device_auth_dialog.provider_name.clone();
                         let token = token.clone();
+                        if provider_id == "anthropic-oauth" {
+                            // The claude.ai OAuth flow already persisted the Bearer
+                            // tokens via save_and_register; the anthropic provider
+                            // reads them directly. Switch to the real "anthropic"
+                            // provider without re-storing the token as an API key.
+                            self.device_auth_pending = None;
+                            self.device_auth_dialog.close();
+                            self.activate_provider(
+                                "anthropic".to_string(),
+                                "Anthropic".to_string(),
+                                "Connected to",
+                            );
+                            // The live client was built at startup with no
+                            // credential; ask the main loop to re-resolve the
+                            // freshly-saved Bearer and swap in a working client.
+                            self.pending_provider_reload = true;
+                            return false;
+                        }
                         let credential = if provider_id == "github-copilot" {
                             claurst_core::StoredCredential::OAuthToken {
                                 access: token.clone(),
@@ -2688,6 +3296,46 @@ impl App {
         }
 
         // API key input dialog (opened from /connect for key-based providers)
+        // Ask-user question dialog (AskUserQuestion tool)
+        if self.ask_user_dialog.visible {
+            match key.code {
+                KeyCode::Esc => {
+                    self.ask_user_dialog.dismiss();
+                }
+                KeyCode::Enter => {
+                    self.ask_user_dialog.confirm();
+                }
+                KeyCode::Up | KeyCode::BackTab => {
+                    self.ask_user_dialog.select_prev();
+                }
+                KeyCode::Down | KeyCode::Tab => {
+                    self.ask_user_dialog.select_next();
+                }
+                KeyCode::Char(c)
+                    if c.is_ascii_digit()
+                        && self.ask_user_dialog.options.is_some()
+                        && !self.ask_user_dialog.in_custom_input =>
+                {
+                    // Digit keys select an option by number ONLY when the user
+                    // is not already typing a custom answer.  Once in custom
+                    // mode, digits flow through to push_char like any other char.
+                    let n = (c as u8 - b'0') as usize;
+                    if n >= 1 {
+                        self.ask_user_dialog.select_by_number(n);
+                    }
+                }
+                KeyCode::Char(c) => {
+                    let c = self.shift_normalize(c, key.modifiers);
+                    self.ask_user_dialog.push_char(c);
+                }
+                KeyCode::Backspace => {
+                    self.ask_user_dialog.pop_char();
+                }
+                _ => {}
+            }
+            return false;
+        }
+
         if self.key_input_dialog.visible {
             match key.code {
                 KeyCode::Esc => {
@@ -2708,8 +3356,65 @@ impl App {
                 KeyCode::Backspace => {
                     self.key_input_dialog.backspace();
                 }
+                KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER) => {
+                    if let Some(text) = crate::image_paste::read_clipboard_text() {
+                        if text.is_empty() {
+                            self.push_notification(NotificationKind::Warning, "Clipboard is empty".to_string(), Some(2));
+                        } else {
+                            for ch in text.chars() {
+                                self.key_input_dialog.insert_char(ch);
+                            }
+                        }
+                    } else {
+                        self.push_notification(NotificationKind::Warning, "Could not read clipboard".to_string(), Some(2));
+                    }
+                }
                 KeyCode::Char(c) => {
+                    let c = self.shift_normalize(c, key.modifiers);
                     self.key_input_dialog.insert_char(c);
+                }
+                _ => {}
+            }
+            return false;
+        }
+
+        // "Free" composite-provider setup dialog (collects any subset of the
+        // free-tier upstream keys; min 1 to enable, more = better).
+        if self.free_mode_dialog.visible {
+            match key.code {
+                KeyCode::Esc => {
+                    self.free_mode_dialog.close();
+                }
+                KeyCode::Tab | KeyCode::Down => {
+                    self.free_mode_dialog.move_next();
+                }
+                KeyCode::BackTab | KeyCode::Up => {
+                    self.free_mode_dialog.move_prev();
+                }
+                KeyCode::Enter => {
+                    if self.free_mode_dialog.can_submit() {
+                        let values = self.free_mode_dialog.take_values();
+                        for (provider_id, key) in values {
+                            self.auth_store.set(
+                                provider_id,
+                                claurst_core::StoredCredential::ApiKey { key },
+                            );
+                        }
+                        self.activate_provider(
+                            "free".to_string(),
+                            "Free Mode".to_string(),
+                            "Connected to",
+                        );
+                    } else {
+                        self.free_mode_dialog.move_next();
+                    }
+                }
+                KeyCode::Backspace => {
+                    self.free_mode_dialog.backspace();
+                }
+                KeyCode::Char(c) => {
+                    let c = self.shift_normalize(c, key.modifiers);
+                    self.free_mode_dialog.insert_char(c);
                 }
                 _ => {}
             }
@@ -2747,6 +3452,7 @@ impl App {
                     self.custom_provider_dialog.backspace();
                 }
                 KeyCode::Char(c) => {
+                    let c = self.shift_normalize(c, key.modifiers);
                     self.custom_provider_dialog.insert_char(c);
                 }
                 _ => {}
@@ -2775,10 +3481,40 @@ impl App {
                             "ollama" | "lmstudio" | "llamacpp" => {
                                 self.activate_provider(selected.id.clone(), selected.title.clone(), "Switched to");
                             }
+                            // "Free" composite mode — collects any subset of the
+                            // free-tier upstreams (min 1; more = better availability).
+                            "free" => {
+                                let existing: Vec<(&'static str, String)> = claurst_api::FREE_CATALOG
+                                    .iter()
+                                    .filter_map(|upstream| {
+                                        let key = match upstream.id {
+                                            "opencode-zen" => self
+                                                .auth_store
+                                                .api_key_for(claurst_core::ProviderId::OPENCODE_ZEN)
+                                                .or_else(|| {
+                                                    self.auth_store.api_key_for(
+                                                        claurst_core::ProviderId::OPENCODE_GO,
+                                                    )
+                                                }),
+                                            other => self.auth_store.api_key_for(other),
+                                        };
+                                        key.filter(|k| !k.is_empty())
+                                            .map(|k| (upstream.id, k))
+                                    })
+                                    .collect();
+                                self.free_mode_dialog.open(&existing);
+                            }
                             "anthropic" => {
-                                // Anthropic: use API key from console.anthropic.com
-                                // (OAuth requires a registered app which Claurst doesn't have)
+                                // Anthropic: API key from console.anthropic.com.
                                 self.key_input_dialog.open(selected.id.clone(), selected.title.clone());
+                            }
+                            "anthropic-oauth" => {
+                                // Claude Pro/Max subscription: claude.ai OAuth via
+                                // the browser (loopback capture), spawned by the
+                                // main loop. Note: usage draws from the account's
+                                // extra-usage pool, not subscription quota.
+                                self.device_auth_dialog.open(selected.id.clone(), selected.title.clone());
+                                self.device_auth_pending = Some("anthropic-oauth".to_string());
                             }
                             "custom-openai" => {
                                 let current_url = Settings::load_sync()
@@ -2812,6 +3548,43 @@ impl App {
                 }
                 KeyCode::Backspace => { self.connect_dialog.filter_pop(); }
                 KeyCode::Char(c) => { self.connect_dialog.filter_push(c); }
+                _ => {}
+            }
+            return false;
+        }
+
+        // Import-config source picker
+        if self.import_config_picker.visible {
+            match key.code {
+                KeyCode::Esc => { self.import_config_picker.close(); }
+                KeyCode::Home => { self.import_config_picker.move_home(); }
+                KeyCode::End => { self.import_config_picker.move_end(); }
+                KeyCode::Up => { self.import_config_picker.move_up(); }
+                KeyCode::Down => { self.import_config_picker.move_down(); }
+                KeyCode::PageUp => { self.import_config_picker.page_up(); }
+                KeyCode::PageDown => { self.import_config_picker.page_down(); }
+                KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => { self.import_config_picker.move_up(); }
+                KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => { self.import_config_picker.move_down(); }
+                KeyCode::Enter => {
+                    if let Some(selected) = self.import_config_picker.selected().cloned() {
+                        self.import_config_picker.close();
+                        if let Some(selection) = Self::import_selection_from_picker(&selected.id) {
+                            self.open_import_config_preview(selection);
+                        }
+                    }
+                }
+                KeyCode::Backspace => { self.import_config_picker.filter_pop(); }
+                KeyCode::Char(c) => { self.import_config_picker.filter_push(c); }
+                _ => {}
+            }
+            return false;
+        }
+
+        // Import-config preview dialog
+        if self.import_config_dialog.visible {
+            match key.code {
+                KeyCode::Esc => self.import_config_dialog.close(),
+                KeyCode::Enter => self.perform_import_config(),
                 _ => {}
             }
             return false;
@@ -2879,8 +3652,12 @@ impl App {
                         }
                         // Store explicit selections in the canonical
                         // "provider/model" form for non-Anthropic providers.
+                        // The "free" composite's picker entries already carry
+                        // a routing prefix (`free/…`, `zen/…`, `openrouter/…`)
+                        // so re-prefixing would produce nonsense like
+                        // `free/free/auto`.
                         let provider = self.config.provider.as_deref().unwrap_or("anthropic");
-                        let full_model = if provider == "anthropic" {
+                        let full_model = if provider == "anthropic" || provider == "free" {
                             model_id.clone()
                         } else {
                             format!("{}/{}", provider, model_id)
@@ -3011,13 +3788,13 @@ impl App {
                 }
                 KeyCode::Enter => {
                     if let Some(path) = self.perform_export() {
-                        self.notifications.push(
+                        self.push_notification(
                             NotificationKind::Info,
                             format!("Exported to {}", path),
                             Some(4),
                         );
                     } else {
-                        self.notifications.push(
+                        self.push_notification(
                             NotificationKind::Warning,
                             "Export failed: could not write file.".to_string(),
                             Some(4),
@@ -3051,9 +3828,8 @@ impl App {
 
         // MCP approval dialog
         if self.mcp_approval.visible {
-            let result = crate::dialogs::handle_mcp_approval_key(&mut self.mcp_approval, key);
-            if result.is_some() {
-                // Result processed by CLI loop via take_mcp_approval_result()
+            if let Some(choice) = crate::dialogs::handle_mcp_approval_key(&mut self.mcp_approval, key) {
+                self.handle_mcp_approval_decision(choice);
             }
             return false;
         }
@@ -3100,22 +3876,26 @@ impl App {
             return false;
         }
 
-        if self.diff_viewer.open {
+        if self.paste_viewer.visible {
+            self.handle_paste_viewer_key(key);
+            return false;
+        }
+
+        if self.diff_viewer.visible {
             self.handle_diff_viewer_key(key);
             return false;
         }
 
-        if self.agents_menu.open {
+        if self.agents_menu.visible {
             self.handle_agents_menu_key(key);
             return false;
         }
 
-        if self.mcp_view.open {
-            self.handle_mcp_view_key(key);
-            return false;
+        if self.mcp_view.visible {
+            return self.handle_mcp_view_key(key);
         }
 
-        if self.stats_dialog.open {
+        if self.stats_dialog.visible {
             self.handle_stats_dialog_key(key);
             return false;
         }
@@ -3141,11 +3921,6 @@ impl App {
         }
 
         // Privacy screen intercepts keys
-        if self.privacy_screen.visible {
-            crate::privacy_screen::handle_privacy_key(&mut self.privacy_screen, key);
-            return false;
-        }
-
         // Rewind flow overlay intercepts keys first
         if self.rewind_flow.visible {
             return self.handle_rewind_flow_key(key);
@@ -3161,7 +3936,7 @@ impl App {
             return self.handle_history_search_overlay_key(key);
         }
 
-        if self.global_search.open {
+        if self.global_search.visible {
             return self.handle_global_search_key(key);
         }
 
@@ -3199,6 +3974,24 @@ impl App {
         // Voice mode notice dismiss
         if key.code == KeyCode::Esc && self.voice_mode_notice.visible {
             self.voice_mode_notice.dismiss();
+            return false;
+        }
+
+        // Cancel an active voice recording with Esc.
+        if key.code == KeyCode::Esc && self.voice_recording {
+            self.voice_recording = false;
+            self.voice_event_rx = None;
+            if let Some(ref recorder_arc) = self.voice_recorder {
+                let recorder = recorder_arc.clone();
+                tokio::task::spawn_blocking(move || {
+                    if let Ok(mut r) = recorder.lock() {
+                        tokio::runtime::Handle::current()
+                            .block_on(r.stop_recording())
+                            .ok();
+                    }
+                });
+            }
+            self.status_message = Some("Recording cancelled.".to_string());
             return false;
         }
 
@@ -3271,6 +4064,7 @@ impl App {
                     return false;
                 }
                 KeyCode::Char(c) => {
+                    let c = self.shift_normalize(c, key.modifiers);
                     self.elicitation.insert_char(c);
                     return false;
                 }
@@ -3286,9 +4080,11 @@ impl App {
                 KeybindingResult::Action(action) => {
                     return self.handle_keybinding_action(&action);
                 }
-                KeybindingResult::Unbound | KeybindingResult::Pending => return false,
+                KeybindingResult::Pending => return false,
                 KeybindingResult::NoMatch if had_pending_chord => return false,
-                KeybindingResult::NoMatch => {}
+                KeybindingResult::Unbound | KeybindingResult::NoMatch => {
+                    // Fall through to hardcoded keybinding handlers
+                }
             }
         } else {
             self.keybindings.cancel_chord();
@@ -3327,9 +4123,9 @@ impl App {
                         }
                     });
                 }
-                self.notifications.push(
+                self.push_notification(
                     NotificationKind::Info,
-                    "Recording\u{2026} (press Alt+V again to transcribe)".to_string(),
+                    "Recording\u{2026} (Alt+V to transcribe · Esc to cancel)".to_string(),
                     None,
                 );
             } else {
@@ -3346,7 +4142,7 @@ impl App {
                         }
                     });
                 }
-                self.notifications.push(
+                self.push_notification(
                     NotificationKind::Info,
                     "Transcribing\u{2026}".to_string(),
                     Some(10),
@@ -3372,11 +4168,12 @@ impl App {
             return false;
         }
 
-        // ---- Ctrl+V — clipboard paste (image first, then text fallback) ----
+        // ---- Ctrl+V / Cmd+V — clipboard paste (image first, then text fallback) ----
         // Only fires when NOT in vim Normal/Visual/VisualBlock mode (where \x16 is
         // already consumed by the vim handler above to enter VisualBlock mode).
         if key.code == KeyCode::Char('v')
-            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && (key.modifiers.contains(KeyModifiers::CONTROL)
+                || key.modifiers.contains(KeyModifiers::SUPER))
             && !matches!(
                 self.prompt_input.vim_mode,
                 crate::prompt_input::VimMode::Normal
@@ -3394,9 +4191,9 @@ impl App {
                 } else {
                     format!("Image attached: {}", label)
                 };
-                self.notifications.push(NotificationKind::Info, msg, Some(3));
+                self.push_notification(NotificationKind::Info, msg, Some(3));
             } else if let Some(text) = read_clipboard_text().or_else(read_primary_text) {
-                self.prompt_input.paste(&text);
+                self.handle_paste_data(text);
                 self.refresh_prompt_input();
             }
             return false;
@@ -3453,31 +4250,43 @@ impl App {
             }
 
             // ---- Quit / cancel ----------------------------------------
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            // Accept both 'c' and 'C' so Shift+Ctrl+C also triggers copy
+            // (issue #149 follow-up).
+            KeyCode::Char(c) if (c == 'c' || c == 'C') && key.modifiers.contains(KeyModifiers::CONTROL) => {
                 // If text is selected, copy it to clipboard instead of quitting.
                 let sel_text = self.selection_text.borrow().clone();
                 if self.selection_anchor.is_some() && !sel_text.is_empty() {
+                    // Text is selected: copy to clipboard.
                     let copied = crate::image_paste::write_clipboard_text(&sel_text);
                     self.selection_anchor = None;
                     self.selection_focus = None;
                     *self.selection_text.borrow_mut() = String::new();
                     if copied {
-                        self.notifications.push(NotificationKind::Info, "Copied to clipboard".to_string(), Some(2));
+                        self.push_notification(NotificationKind::Info, "Copied to clipboard".to_string(), Some(2));
                     }
                 } else if self.is_streaming {
+                    // Cancel streaming.
                     self.is_streaming = false;
                     self.spinner_verb = None;
                     self.streaming_text.clear();
                     self.streaming_thinking.clear();
                     self.tool_use_blocks.clear();
                     self.status_message = Some("Cancelled.".to_string());
+                    self.complete_current_turn_snapshot(true);
                 } else {
-                    self.should_quit = true;
+                    // No text selected and not streaming: handle exit confirmation sequence.
+                    // Always clear the prompt input on Ctrl+C.
+                    if !self.prompt_input.is_empty() {
+                        self.prompt_input.clear();
+                        self.refresh_prompt_input();
+                    }
+                    self.handle_exit_key_confirmation('c');
                 }
             }
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                // Ctrl+D on empty input: trigger two-press exit confirmation (like Ctrl+C).
                 if self.prompt_input.is_empty() {
-                    self.should_quit = true;
+                    self.handle_exit_key_confirmation('d');
                 }
             }
 
@@ -3516,48 +4325,73 @@ impl App {
                 self.show_help = !self.show_help;
                 self.help_overlay.toggle();
             }
+            // With the kitty keyboard protocol, Shift+/ is reported as Char('/') with
+            // SHIFT rather than Char('?'), so also accept that form for the help toggle.
+            // This MUST be gated on the kitty protocol being active: on terminals that
+            // don't speak it (Windows conhost / CMD / legacy PowerShell), a Char('/')
+            // carrying a SHIFT flag is just a literal slash typed on a layout where `/`
+            // is a shifted key — it must fall through to text entry so the user can
+            // actually start a slash command (issue #183).
+            KeyCode::Char('/')
+                if self.kitty_keyboard_active
+                    && key.modifiers.contains(KeyModifiers::SHIFT)
+                    && !self.is_streaming
+                    && self.prompt_input.is_empty()
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT)
+                    && !key.modifiers.contains(KeyModifiers::SUPER) =>
+            {
+                self.show_help = !self.show_help;
+                self.help_overlay.toggle();
+            }
 
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) && !self.is_streaming => {
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.prompt_input.kill_line_backward();
                 self.refresh_prompt_input();
             }
-            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) && !self.is_streaming => {
+            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.prompt_input.kill_word_backward();
                 self.refresh_prompt_input();
             }
-            KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) && !self.is_streaming => {
+            KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.prompt_input.yank();
                 self.refresh_prompt_input();
             }
 
             // ---- Alt/Meta key text editing operations -------------------
-            KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::ALT) && !self.is_streaming => {
+            KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::ALT) => {
                 self.prompt_input.yank_pop();
                 self.refresh_prompt_input();
             }
-            KeyCode::Backspace if key.modifiers.contains(KeyModifiers::ALT) && !self.is_streaming => {
+            KeyCode::Backspace if key.modifiers.contains(KeyModifiers::ALT) => {
                 self.prompt_input.delete_word_backward();
                 self.refresh_prompt_input();
             }
-            KeyCode::Delete if key.modifiers.contains(KeyModifiers::ALT) && !self.is_streaming => {
+            KeyCode::Backspace if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.prompt_input.delete_word_backward();
+                self.refresh_prompt_input();
+            }
+            KeyCode::Delete if key.modifiers.contains(KeyModifiers::ALT) => {
                 self.prompt_input.delete_word_forward();
                 self.refresh_prompt_input();
             }
-            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::ALT) && !self.is_streaming => {
+            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::ALT) => {
                 self.prompt_input.move_word_backward();
                 self.sync_legacy_prompt_fields();
             }
-            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::ALT) && !self.is_streaming => {
+            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::ALT) => {
                 self.prompt_input.move_word_forward();
                 self.sync_legacy_prompt_fields();
             }
-            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::ALT) && !self.is_streaming => {
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::ALT) => {
                 self.prompt_input.delete_word_at_cursor();
                 self.refresh_prompt_input();
             }
 
-            // ---- Text entry (blocked while streaming) ------------------
-            KeyCode::Char(c) if !self.is_streaming => {
+            // ---- Text entry (allowed while streaming so users can queue
+            // the next message; submission queues via Enter at the CLI layer).
+            KeyCode::Char(c) => {
+                let c = self.shift_normalize(c, key.modifiers);
                 if self.prompt_input.vim_enabled && self.prompt_input.vim_mode != VimMode::Insert {
                     self.prompt_input.vim_command(&c.to_string());
                 } else {
@@ -3565,40 +4399,58 @@ impl App {
                 }
                 self.refresh_prompt_input();
             }
-            KeyCode::Backspace if !self.is_streaming => {
+            KeyCode::Backspace => {
                 self.prompt_input.backspace();
                 self.refresh_prompt_input();
             }
-            KeyCode::Delete if !self.is_streaming => {
+            KeyCode::Delete if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.prompt_input.delete();
                 self.refresh_prompt_input();
             }
-            KeyCode::Left if !self.is_streaming => {
-                self.prompt_input.move_left();
+            KeyCode::Delete if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.prompt_input.delete_word_forward();
+                self.refresh_prompt_input();
+            }
+            KeyCode::Left => {
+                if key.modifiers.contains(KeyModifiers::SUPER) {
+                    self.prompt_input.cursor = 0;
+                } else if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    self.prompt_input.move_word_backward();
+                } else {
+                    self.prompt_input.move_left();
+                }
                 self.sync_legacy_prompt_fields();
             }
-            KeyCode::Right if !self.is_streaming => {
-                self.prompt_input.move_right();
+            KeyCode::Right => {
+                if key.modifiers.contains(KeyModifiers::SUPER) {
+                    self.prompt_input.cursor = self.prompt_input.text.len();
+                } else if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    self.prompt_input.move_word_forward();
+                } else {
+                    self.prompt_input.move_right();
+                }
                 self.sync_legacy_prompt_fields();
             }
-            KeyCode::Home if !self.is_streaming => {
+            KeyCode::Home => {
                 self.prompt_input.cursor = 0;
                 self.sync_legacy_prompt_fields();
             }
-            KeyCode::End if !self.is_streaming => {
+            KeyCode::End => {
                 self.prompt_input.cursor = self.prompt_input.text.len();
                 self.sync_legacy_prompt_fields();
             }
-            KeyCode::Tab if !self.is_streaming => {
+            KeyCode::Tab => {
                 if !self.prompt_input.suggestions.is_empty() {
-                    // Accept slash-command suggestion
+                    // Accept slash-command suggestion. Allowed while streaming
+                    // so the typeahead popup is interactive even when a turn
+                    // is in flight — Enter then queues the completed command.
                     if self.prompt_input.suggestion_index.is_none() {
                         self.prompt_input.suggestion_index = Some(0);
                     }
                     self.prompt_input.accept_suggestion();
                     self.refresh_prompt_input();
-                } else if self.prompt_input.is_empty() {
-                    // Cycle agent mode: build → plan → explore → build
+                } else if !self.is_streaming && self.prompt_input.is_empty() {
+                    // Cycle agent mode: build → plan → build
                     self.cycle_agent_mode();
                     self.rustle_look_down();
                 }
@@ -3625,16 +4477,36 @@ impl App {
             }
 
             // ---- Submit ------------------------------------------------
+            // Fallback newline insertion for when the keybinding layer doesn't
+            // claim a modified Enter (e.g. Ctrl+Enter, or Shift/Alt+Enter after
+            // the user unbinds them): Shift+Enter / Alt+Enter / Ctrl+Enter
+            // insert a literal newline so users can compose multi-line prompts
+            // before sending (issue #149 / #224). The authoritative bindings
+            // live in claurst_core::keybindings (shift+enter, alt+enter, ctrl+j
+            // → newline; enter → submit) and are handled above at the resolver.
+            KeyCode::Enter
+                if !self.is_streaming
+                    && (key.modifiers.contains(KeyModifiers::SHIFT)
+                        || key.modifiers.contains(KeyModifiers::ALT)
+                        || key.modifiers.contains(KeyModifiers::CONTROL)) =>
+            {
+                self.prompt_input.insert_newline();
+                self.refresh_prompt_input();
+            }
             KeyCode::Enter if !self.is_streaming => {
-                // If a slash-command suggestion is selected, accept it instead of submitting.
+                // Fallback Enter handling for when the keybinding layer doesn't
+                // claim Enter (e.g. it's been unbound); the default path is the
+                // "submit" keybinding action. If a typeahead popup is open, let
+                // the shared helper decide whether to complete a suggestion or
+                // also run it (issue #183).
                 if !self.prompt_input.suggestions.is_empty()
                     && self.prompt_input.suggestion_index.is_some()
-                    && self.prompt_input.text.starts_with('/')
+                    && !self.accept_suggestion_for_submit()
                 {
-                    self.prompt_input.accept_suggestion();
-                    self.refresh_prompt_input();
                     return false;
                 }
+                // Auto-dismiss all error notifications when user sends a message
+                self.dismiss_error_notifications();
                 // New user input: snap back to bottom.
                 self.auto_scroll = true;
                 self.new_messages_while_scrolled = 0;
@@ -3645,8 +4517,7 @@ impl App {
             // ---- Message boundary navigation (Alt+Up/Alt+Down) ----------
             KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => {
                 // Jump up by ~20 lines (approximate message boundary).
-                self.scroll_offset = self.scroll_offset.saturating_add(20);
-                self.auto_scroll = false;
+                self.scroll_up_by(20);
             }
             KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => {
                 // Jump down by ~20 lines (approximate message boundary).
@@ -3659,28 +4530,43 @@ impl App {
             }
 
             // ---- Input history navigation ------------------------------
+            // For multi-line / wrapped prompts: Up/Down move the cursor by
+            // one visual row first, only falling through to history recall
+            // when the cursor is already on the first/last visual row
+            // (issue #149 follow-up).
             KeyCode::Up => {
-                if !self.prompt_input.suggestions.is_empty() && self.prompt_input.text.starts_with('/') {
+                if !self.prompt_input.suggestions.is_empty() && (self.prompt_input.text.starts_with('/') || self.prompt_input.has_active_file_ref()) {
                     self.prompt_input.suggestion_prev();
-                } else if !self.prompt_input.history.is_empty() {
-                    self.prompt_input.history_up();
+                } else {
+                    let area = self.last_input_area.get();
+                    let width = area.width.saturating_sub(4) as usize;
+                    let moved = !self.prompt_input.text.is_empty()
+                        && self.prompt_input.move_visual_up(width);
+                    if !moved && !self.prompt_input.history.is_empty() {
+                        self.prompt_input.history_up();
+                    }
                 }
                 self.refresh_prompt_input();
             }
             KeyCode::Down => {
-                if !self.prompt_input.suggestions.is_empty() && self.prompt_input.text.starts_with('/') {
+                if !self.prompt_input.suggestions.is_empty() && (self.prompt_input.text.starts_with('/') || self.prompt_input.has_active_file_ref()) {
                     self.prompt_input.suggestion_next();
-                } else if self.prompt_input.history_pos.is_some() {
-                    self.prompt_input.history_down();
+                } else {
+                    let area = self.last_input_area.get();
+                    let width = area.width.saturating_sub(4) as usize;
+                    let moved = !self.prompt_input.text.is_empty()
+                        && self.prompt_input.move_visual_down(width);
+                    if !moved && self.prompt_input.history_pos.is_some() {
+                        self.prompt_input.history_down();
+                    }
                 }
                 self.refresh_prompt_input();
             }
 
             // ---- Scroll ------------------------------------------------
             KeyCode::PageUp => {
-                self.scroll_offset = self.scroll_offset.saturating_add(10);
-                // Scrolling up disables auto-follow.
-                self.auto_scroll = false;
+                // Scrolling up disables auto-follow (handled by scroll_up_by).
+                self.scroll_up_by(10);
             }
             KeyCode::PageDown => {
                 let new_off = self.scroll_offset.saturating_sub(10);
@@ -3693,40 +4579,28 @@ impl App {
             }
 
             // ---- Toggle last thinking block (t key) -------------------
-            KeyCode::Char('t') if !self.is_streaming => {
-                // Find the last thinking block in the message list and toggle it
-                use claurst_core::types::ContentBlock;
-                use std::collections::hash_map::DefaultHasher;
-                use std::hash::{Hash, Hasher};
-                'outer: for msg in self.messages.iter().rev() {
-                    let blocks = msg.content_blocks();
-                    for block in blocks.iter().rev() {
-                        if let ContentBlock::Thinking { thinking, .. } = block {
-                            let mut h = DefaultHasher::new();
-                            thinking.hash(&mut h);
-                            let hash = h.finish();
-                            if self.thinking_expanded.contains(&hash) {
-                                self.thinking_expanded.remove(&hash);
-                            } else {
-                                self.thinking_expanded.insert(hash);
-                            }
-                            self.invalidate_transcript();
-                            break 'outer;
-                        }
-                    }
-                }
-            }
+            // (Removed: shadowed by KeyCode::Char(c) prompt input handler.)
 
             _ => {}
         }
+
+        // Reset exit confirmation sequence if user presses any key other than Ctrl+C or Ctrl+D.
+        let is_exit_key = key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char(c) if c == 'c' || c == 'd' || c == 'C' || c == 'D');
+        if !is_exit_key {
+            self.last_exit_key_warning = None;
+            self.exit_key_sequence_start = None;
+        }
+
         false
     }
 
     fn current_key_context(&self) -> KeyContext {
-        if self.diff_viewer.open {
+        if self.diff_viewer.visible {
             KeyContext::DiffDialog
-        } else if self.agents_menu.open || self.mcp_view.open || self.stats_dialog.open {
+        } else if self.agents_menu.visible || self.mcp_view.visible || self.stats_dialog.visible {
             KeyContext::Select
+        } else if self.import_config_dialog.visible {
+            KeyContext::Confirmation
         } else if self.settings_screen.visible {
             KeyContext::Settings
         } else if self.theme_screen.visible {
@@ -3762,7 +4636,7 @@ impl App {
         }
     }
 
-    fn handle_mcp_view_key(&mut self, key: KeyEvent) {
+    fn handle_mcp_view_key(&mut self, key: KeyEvent) -> bool {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.mcp_view.close(),
             KeyCode::Tab | KeyCode::Left | KeyCode::Right => self.mcp_view.switch_pane(),
@@ -3770,17 +4644,31 @@ impl App {
             KeyCode::Down => self.mcp_view.select_next(),
             KeyCode::Backspace => self.mcp_view.pop_search_char(),
             KeyCode::Char('e') => self.mcp_view.toggle_error_detail(),
+            KeyCode::Char('a')
+                if self.mcp_view.active_pane == crate::mcp_view::McpViewPane::ServerList =>
+            {
+                let selected_server = self
+                    .mcp_view
+                    .servers
+                    .get(self.mcp_view.selected_server)
+                    .map(|server| server.name.clone());
+                if let Some(server_name) = selected_server {
+                    self.pending_mcp_panel_auth = Some(server_name);
+                    self.mcp_view.close();
+                    self.status_message = Some("Starting MCP auth...".to_string());
+                }
+            }
             KeyCode::Char('r') => {
                 self.pending_mcp_reconnect = true;
                 self.status_message = Some("Reconnecting MCP runtime...".to_string());
             }
-            KeyCode::Char(c) if key.modifiers.is_empty() => {
-                if self.mcp_view.active_pane != crate::mcp_view::McpViewPane::ServerList {
+            KeyCode::Char(c) if key.modifiers.is_empty()
+                && self.mcp_view.active_pane != crate::mcp_view::McpViewPane::ServerList => {
                     self.mcp_view.push_search_char(c);
                 }
-            }
             _ => {}
         }
+        false
     }
 
     fn handle_agents_menu_key(&mut self, key: KeyEvent) {
@@ -3802,6 +4690,7 @@ impl App {
                     }
                 }
                 KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let ch = self.shift_normalize(ch, key.modifiers);
                     self.agents_menu.editor_insert_char(ch);
                 }
                 _ => {}
@@ -3843,11 +4732,10 @@ impl App {
             }
             KeyCode::PageUp => self.diff_viewer.scroll_detail_up(),
             KeyCode::PageDown => self.diff_viewer.scroll_detail_down(),
-            KeyCode::Char(' ') => {
-                if self.diff_viewer.active_pane == DiffPane::FileList {
+            KeyCode::Char(' ')
+                if self.diff_viewer.active_pane == DiffPane::FileList => {
                     self.diff_viewer.toggle_file_collapse();
                 }
-            }
             _ => {}
         }
     }
@@ -3940,6 +4828,7 @@ impl App {
                 self.history_search_overlay.toggle_pin();
             }
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let c = self.shift_normalize(c, key.modifiers);
                 let history = self.prompt_input.history.clone();
                 self.history_search_overlay.push_char(c, &history);
                 if let Some(hs) = self.history_search.as_mut() {
@@ -3977,7 +4866,7 @@ impl App {
                         self.messages.truncate(idx);
                         // Remove system annotations placed after the truncation point.
                         self.system_annotations.retain(|a| a.after_index <= idx);
-                        self.notifications.push(
+                        self.push_notification(
                             NotificationKind::Success,
                             format!("Rewound to message #{}", idx),
                             Some(4),
@@ -4011,12 +4900,45 @@ impl App {
                 self.refresh_global_search();
             }
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let c = self.shift_normalize(c, key.modifiers);
                 self.global_search.push_char(c);
                 self.refresh_global_search();
             }
             _ => {}
         }
         false
+    }
+
+    fn handle_exit_key_confirmation(&mut self, mut key_char: char) {
+        fn exit_message(key: char) -> &'static str {
+            if key == 'c' {
+                "Press Ctrl+C again to exit"
+            } else {
+                "Press Ctrl+D again to exit"
+            }
+        }
+
+        // Check if we have an active warning within the timeout
+        if let Some(warning_time) = self.last_exit_key_warning {
+            if warning_time.elapsed().as_secs_f64() <= 2.0 {
+                if self.exit_key_sequence_start == Some(key_char) {
+                    // Matching key - exit
+                    self.should_exit = true;
+                    self.last_exit_key_warning = None;
+                    self.exit_key_sequence_start = None;
+                    return;
+                }
+                if let Some(other_key) = self.exit_key_sequence_start {
+                    // Wrong key pressed - show message for the original key and reset timer
+                    key_char = other_key;
+                }
+            }
+        }
+
+        // Start new sequence (or show message for wrong key)
+        self.push_notification(NotificationKind::Info, exit_message(key_char).to_string(), Some(2));
+        self.last_exit_key_warning = Some(std::time::Instant::now());
+        self.exit_key_sequence_start = Some(key_char);
     }
 
     fn handle_keybinding_action(&mut self, action: &str) -> bool {
@@ -4030,13 +4952,33 @@ impl App {
                     self.tool_use_blocks.clear();
                     self.status_message = Some("Cancelled.".to_string());
                 } else {
-                    self.should_quit = true;
+                    // Handle exit confirmation: require two exit key presses within 2 seconds.
+                    // Always clear the prompt input on Ctrl+C.
+                    if !self.prompt_input.is_empty() {
+                        self.prompt_input.clear();
+                        self.refresh_prompt_input();
+                    }
+
+                    let elapsed = self.last_exit_key_warning.map(|t| t.elapsed().as_secs_f64());
+                    let is_valid = elapsed.map(|e| e <= 2.0).unwrap_or(false);
+
+                    if self.last_exit_key_warning.is_some() && is_valid {
+                        // A warning is active and within 2 seconds: exit.
+                        self.should_exit = true;
+                        self.last_exit_key_warning = None;
+                        self.exit_key_sequence_start = None;
+                    } else {
+                        // First press or timeout expired: show exit confirmation.
+                        self.push_notification(NotificationKind::Info, "Press Ctrl+C again to exit".to_string(), Some(2));
+                        self.last_exit_key_warning = Some(std::time::Instant::now());
+                        self.exit_key_sequence_start = Some('c');
+                    }
                 }
                 false
             }
             "exit" => {
                 if self.prompt_input.is_empty() {
-                    self.should_quit = true;
+                    self.should_exit = true;
                 }
                 false
             }
@@ -4054,29 +4996,51 @@ impl App {
                 self.refresh_global_search();
                 false
             }
-            "submit" => !self.is_streaming,
+            "submit" => {
+                if !self.is_streaming {
+                    if !self.prompt_input.suggestions.is_empty()
+                        && self.prompt_input.suggestion_index.is_some()
+                    {
+                        self.accept_suggestion_for_submit()
+                    } else {
+                        true
+                    }
+                } else {
+                    false
+                }
+            }
             "historyPrev" => {
-                // Slash-command suggestions take priority over history.
+                // Suggestions (slash commands or file refs) take priority over cursor/history.
                 if !self.prompt_input.suggestions.is_empty()
-                    && self.prompt_input.text.starts_with('/')
+                    && (self.prompt_input.text.starts_with('/') || self.prompt_input.has_active_file_ref())
                 {
                     self.prompt_input.suggestion_prev();
                     self.refresh_prompt_input();
-                } else if !self.prompt_input.history.is_empty() {
-                    self.prompt_input.history_up();
+                } else {
+                    let width = self.last_input_area.get().width.saturating_sub(4) as usize;
+                    let moved = !self.prompt_input.text.is_empty()
+                        && self.prompt_input.move_visual_up(width);
+                    if !moved && !self.prompt_input.history.is_empty() {
+                        self.prompt_input.history_up();
+                    }
                     self.refresh_prompt_input();
                 }
                 false
             }
             "historyNext" => {
-                // Slash-command suggestions take priority over history.
+                // Suggestions (slash commands or file refs) take priority over cursor/history.
                 if !self.prompt_input.suggestions.is_empty()
-                    && self.prompt_input.text.starts_with('/')
+                    && (self.prompt_input.text.starts_with('/') || self.prompt_input.has_active_file_ref())
                 {
                     self.prompt_input.suggestion_next();
                     self.refresh_prompt_input();
-                } else if self.prompt_input.history_pos.is_some() {
-                    self.prompt_input.history_down();
+                } else {
+                    let width = self.last_input_area.get().width.saturating_sub(4) as usize;
+                    let moved = !self.prompt_input.text.is_empty()
+                        && self.prompt_input.move_visual_down(width);
+                    if !moved && self.prompt_input.history_pos.is_some() {
+                        self.prompt_input.history_down();
+                    }
                     self.refresh_prompt_input();
                 }
                 false
@@ -4109,9 +5073,19 @@ impl App {
                 }
                 false
             }
+            "expandPaste" => {
+                // Alt+E: expand the [Pasted text #N ...] placeholder at the
+                // cursor (or the first one in the buffer) so the full pasted
+                // body is visible and editable in place. Allowed while
+                // streaming — the prompt stays editable for composing queued
+                // messages.
+                if self.prompt_input.expand_paste_ref_at_cursor() {
+                    self.refresh_prompt_input();
+                }
+                false
+            }
             "scrollUp" => {
-                self.scroll_offset = self.scroll_offset.saturating_add(10);
-                self.auto_scroll = false;
+                self.scroll_up_by(10);
                 false
             }
             "scrollDown" => {
@@ -4212,8 +5186,7 @@ impl App {
             }
             "previousMessage" => {
                 // Alt+←: Navigate to previous message in transcript
-                self.scroll_offset = self.scroll_offset.saturating_add(5);
-                self.auto_scroll = false;
+                self.scroll_up_by(5);
                 false
             }
             "nextMessage" => {
@@ -4278,10 +5251,6 @@ impl App {
                     self.refresh_prompt_input();
                 }
                 false
-            }
-            "sendMessage" => {
-                // Ctrl+M: Send message (alternative to Enter)
-                !self.is_streaming
             }
             "newline" => {
                 // Shift+Enter: insert a literal newline into the prompt.
@@ -4393,7 +5362,6 @@ impl App {
                         // If this is the prefix-allow option ('P'), record the prefix.
                         self.maybe_record_bash_prefix();
                         self.permission_request = None;
-                        return;
                     }
                 }
             }
@@ -4442,7 +5410,14 @@ impl App {
             // (which also uses `split_whitespace().next()`) matches correctly.
             let first_word = command.split_whitespace().next().unwrap_or("").to_string();
             if !first_word.is_empty() {
-                self.bash_prefix_allowlist.insert(first_word);
+                self.bash_prefix_allowlist.insert(first_word.clone());
+                // Persist so the "always allow" choice survives restarts.
+                if let Ok(mut settings) = claurst_core::config::Settings::load_sync() {
+                    if !settings.allowed_bash_prefixes.contains(&first_word) {
+                        settings.allowed_bash_prefixes.push(first_word);
+                        let _ = settings.save_sync();
+                    }
+                }
             }
         }
     }
@@ -4472,21 +5447,78 @@ impl App {
         }
     }
 
-    /// Find word boundaries for the character at (col, row) in the selection text.
-    /// Returns (start_col, end_col) for the word containing the given position.
-    fn find_word_boundaries(&self, col: u16, _row: u16) -> Option<(u16, u16)> {
-        // Get the current selection text to determine word boundaries
-        let text = self.selection_text.borrow();
-        if text.is_empty() {
+    /// Find word boundaries for the character at (col, row) in the rendered
+    /// transcript buffer. Returns absolute (start_col, end_col) for the word
+    /// containing the click. A "word" is a run of non-whitespace characters.
+    fn find_word_boundaries(&self, col: u16, row: u16) -> Option<(u16, u16)> {
+        let cache = self.last_row_text.borrow();
+        let line = cache.get(&row)?;
+        if line.is_empty() {
             return None;
         }
+        let selectable_area = self.last_selectable_area.get();
+        if col < selectable_area.x {
+            return None;
+        }
+        let local = (col - selectable_area.x) as usize;
+        let chars: Vec<char> = line.chars().collect();
+        if local >= chars.len() {
+            return None;
+        }
+        let is_word = |c: char| !c.is_whitespace();
+        if !is_word(chars[local]) {
+            return None;
+        }
+        let mut start = local;
+        while start > 0 && is_word(chars[start - 1]) {
+            start -= 1;
+        }
+        let mut end = local;
+        while end + 1 < chars.len() && is_word(chars[end + 1]) {
+            end += 1;
+        }
+        Some((selectable_area.x + start as u16, selectable_area.x + end as u16))
+    }
 
-        // For simplicity, we'll find the word based on whitespace and punctuation
-        // In a full implementation, we'd map visual positions back to text offsets
-        // For now, return a reasonable range around the click position
-        let start = col.saturating_sub(10).max(0);
-        let end = col.saturating_add(10);
-        Some((start, end))
+    /// Find paragraph boundaries (run of non-blank rows) around `row` and
+    /// return (start_row, end_row, end_col) where end_col is the trimmed end
+    /// of the last row's content. Used by triple-click selection so a
+    /// "paragraph" — a contiguous block of text rows — is selected as a unit
+    /// instead of a single visual row.
+    fn find_paragraph_boundaries(&self, row: u16) -> Option<(u16, u16, u16)> {
+        let cache = self.last_row_text.borrow();
+        let selectable_area = self.last_selectable_area.get();
+        if selectable_area.width == 0 || selectable_area.height == 0 {
+            return None;
+        }
+        let row_text = cache.get(&row)?;
+        if row_text.trim().is_empty() {
+            return None;
+        }
+        let max_row = selectable_area
+            .y
+            .saturating_add(selectable_area.height)
+            .saturating_sub(1);
+        let mut start = row;
+        while start > selectable_area.y {
+            let prev = start - 1;
+            if cache.get(&prev).map(|s| s.trim().is_empty()).unwrap_or(true) {
+                break;
+            }
+            start = prev;
+        }
+        let mut end = row;
+        while end < max_row {
+            let next = end + 1;
+            if cache.get(&next).map(|s| s.trim().is_empty()).unwrap_or(true) {
+                break;
+            }
+            end = next;
+        }
+        let last_text = cache.get(&end)?;
+        let trimmed = last_text.trim_end();
+        let end_col = selectable_area.x + trimmed.chars().count().saturating_sub(1) as u16;
+        Some((start, end, end_col))
     }
 
     /// Find line boundaries for the row containing the click.
@@ -4595,13 +5627,13 @@ impl App {
 
                 if let Some(text) = text {
                     if crate::message_copy::copy_to_clipboard(&text) {
-                        self.notifications.push(
+                        self.push_notification(
                             NotificationKind::Info,
                             format!("Copied {} chars to clipboard.", text.len()),
                             Some(3),
                         );
                     } else {
-                        self.notifications.push(
+                        self.push_notification(
                             NotificationKind::Warning,
                             "Failed to copy to clipboard.".to_string(),
                             Some(3),
@@ -4652,9 +5684,279 @@ impl App {
         false
     }
 
+    /// Handle a paste data string (from `Event::Paste` or Ctrl+V text fallback).
+    ///
+    /// If the pasted text resolves to an existing filesystem path:
+    ///   - image files (png/jpg/gif/webp/bmp) → added as an image attachment pill
+    ///   - other files → inserted as `@path` mention text
+    ///
+    /// Otherwise the text goes through the normal `prompt_input.paste()` path
+    /// which applies the multi-line summary placeholder for large pastes.
+    pub fn handle_paste_data(&mut self, data: String) {
+        use crate::prompt_input::detect_pasted_path;
+        use crate::image_paste::PastedImage;
+
+        if let Some(path) = detect_pasted_path(&data) {
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase());
+            let is_image = matches!(
+                ext.as_deref(),
+                Some("png") | Some("jpg") | Some("jpeg") | Some("gif") | Some("webp") | Some("bmp")
+            );
+            if is_image {
+                let label = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("image")
+                    .to_string();
+                let img = PastedImage { path, label: label.clone(), dimensions: None };
+                self.prompt_input.add_image(img);
+                self.push_notification(
+                    crate::notifications::NotificationKind::Info,
+                    format!("Image attached: {}", label),
+                    Some(3),
+                );
+            } else {
+                // Non-image file: insert as an @mention so the path is visible
+                // but clearly marked as a file reference.
+                let mention = format!("@{}", path.display());
+                self.prompt_input.paste(&mention);
+            }
+        } else {
+            self.prompt_input.paste(&data);
+        }
+    }
+
+    /// Returns `true` when the app is in a state where the prompt can accept
+    /// regular text input — used to gate paste-burst detection.
+    fn prompt_is_accepting_text(&self) -> bool {
+        !self.is_streaming
+            && self.permission_request.is_none()
+            && !self.ask_user_dialog.visible
+            && !self.history_search_overlay.visible
+            && self.history_search.is_none()
+            && !self.settings_screen.visible
+            && !self.theme_screen.visible
+            && self.prompt_input.vim_mode == crate::prompt_input::VimMode::Insert
+    }
+
+    /// Gate for paste-burst detection in the live CLI event loop: keystrokes
+    /// are currently flowing into the prompt (no modal is capturing input and
+    /// vim is in insert mode). Unlike `prompt_is_accepting_text`, streaming
+    /// does NOT disable it — the prompt stays editable during a turn for
+    /// queued composition, and a raw-key paste flood must be captured there
+    /// too instead of submitting on every pasted newline.
+    pub fn paste_burst_allowed(&self) -> bool {
+        !self.any_modal_open()
+            && self.prompt_input.vim_mode == crate::prompt_input::VimMode::Insert
+    }
+
+    /// Drain any immediately-available key events from the crossterm event
+    /// queue (zero-timeout poll) and return them alongside `first` as a single
+    /// pasted string if the burst is large enough to be a paste.
+    ///
+    /// On Windows Terminal, Ctrl+V causes the terminal emulator to write the
+    /// clipboard content directly to stdin as raw character events — every
+    /// newline becomes an Enter keypress and stray `v` characters trigger
+    /// voice PTT.  Because a paste dumps ALL characters into the queue at
+    /// once, a zero-timeout drain immediately after the first character
+    /// reliably yields 3+ chars for any non-trivial paste, while normal
+    /// keyboard typing (even at 120 WPM) almost never queues more than one
+    /// char in the same 50 ms window.
+    ///
+    /// Returns `Some(text)` when a paste burst is detected (caller should
+    /// route through `handle_paste_data`).  Returns `None` for a normal
+    /// single keystroke.  If a non-character key is encountered while
+    /// draining, it is stored in `self.pending_key` and will be replayed at
+    /// the top of the next event-loop iteration.
+    pub fn try_detect_paste_burst(
+        &mut self,
+        first: char,
+    ) -> Option<String> {
+        use crossterm::event::{Event, KeyCode, KeyEventKind};
+
+        // Minimum number of chars (including `first`) to classify as a paste.
+        // Two or more is enough: at 120 WPM the inter-key interval is ~60 ms,
+        // so a second char in the same zero-timeout drain is extremely unlikely
+        // from a human typist but guaranteed from a clipboard paste.
+        const BURST_THRESHOLD: usize = 2;
+
+        // Quick exit: don't bother if nothing is queued immediately.
+        if !crossterm::event::poll(std::time::Duration::ZERO).unwrap_or(false) {
+            return None;
+        }
+
+        let mut buf = String::new();
+        buf.push(first);
+
+        while let Ok(true) = crossterm::event::poll(std::time::Duration::ZERO) {
+            match crossterm::event::read() {
+                Ok(Event::Key(k)) => {
+                    // Windows emits Press+Release pairs for every keystroke,
+                    // so Release events are interleaved with the flood — skip
+                    // them instead of treating them as end-of-burst (which
+                    // capped every burst at a single character).
+                    if k.kind != KeyEventKind::Press {
+                        continue;
+                    }
+                    match k.code {
+                        // A raw LF (0x0A) in the flood arrives as Ctrl+J —
+                        // map it back to a newline or Unix pastes lose their
+                        // line breaks (they'd insert a literal 'j').
+                        KeyCode::Char('j')
+                            if k.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) =>
+                        {
+                            buf.push('\n')
+                        }
+                        KeyCode::Char(c) => buf.push(c),
+                        // A raw CR (0x0D) arrives as Enter. Push '\r', not
+                        // '\n': normalize_newlines() collapses CRLF pairs and
+                        // lone CRs later, so CRLF pastes (Windows) don't end
+                        // up with doubled line breaks.
+                        KeyCode::Enter => buf.push('\r'),
+                        // Raw tabs are indentation in pasted code; ending the
+                        // burst on them would truncate the paste and replay
+                        // Tab as a completion keypress.
+                        KeyCode::Tab => buf.push('\t'),
+                        _ => {
+                            // Non-character key — save it for replay.
+                            self.pending_key = Some(k);
+                            break;
+                        }
+                    }
+                }
+                // Non-key event (mouse, resize, …) — leave in queue by
+                // not reading it; we already checked poll() so it will
+                // be re-read next iteration. But we already read it, so
+                // we just break (the event is consumed but benign).
+                _ => break,
+            }
+        }
+
+        if buf.chars().count() >= BURST_THRESHOLD {
+            Some(buf)
+        } else {
+            None
+        }
+    }
+
     /// Process mouse events (trackpad scroll, text selection, etc.).
+    /// Handle a left click inside the prompt input: move the cursor to the
+    /// clicked position and, when the click lands on a `[Pasted text #N ...]`
+    /// placeholder, expand it in place so the full pasted body can be read
+    /// (and edited) before submitting.
+    fn handle_prompt_click(&mut self, col: u16, row: u16) {
+        if self.prompt_input.text.is_empty() {
+            return;
+        }
+        // Reconstruct the prompt widget geometry of the last rendered frame.
+        // `last_input_area` is the whole bottom pane; `render_input` carves a
+        // 1-row model/mode status line off the top when there is room, and
+        // `render_prompt_input` adds an image-pill row when attachments are
+        // pending, then a top separator row before the wrapped text rows.
+        let mut rect = self.last_input_area.get();
+        if rect.width == 0 || rect.height == 0 {
+            return;
+        }
+        if rect.height > 2 {
+            rect.y += 1;
+            rect.height -= 1;
+        }
+        if !self.prompt_input.pending_images.is_empty() && rect.height > 1 {
+            rect.y += 1;
+            rect.height -= 1;
+        }
+        // 2-cell "❯ " prefix + 2-cell right margin (see render_prompt_input).
+        let width = rect.width.saturating_sub(4) as usize;
+        if width == 0 {
+            return;
+        }
+        let text_start_y = rect.y + 1; // top separator occupies rect.y
+        let max_text_rows = rect.height.saturating_sub(2) as usize;
+        let total_rows = self.prompt_input.visual_row_count(width);
+        // Mirror the renderer's scroll: keep the cursor row visible.
+        let (cursor_row, _) = self.prompt_input.cursor_visual_pos(width);
+        let scroll = if total_rows > max_text_rows && cursor_row >= max_text_rows {
+            cursor_row + 1 - max_text_rows
+        } else {
+            0
+        };
+        let visible_rows = total_rows.saturating_sub(scroll).min(max_text_rows);
+        if row < text_start_y || (row - text_start_y) as usize >= visible_rows {
+            return;
+        }
+        let target_row = scroll + (row - text_start_y) as usize;
+        let target_col = col.saturating_sub(rect.x + 2) as usize;
+        self.prompt_input.set_cursor_at_visual(target_row, target_col, width);
+        // Clicking a [Pasted text #N ...] placeholder opens the read-only
+        // viewer so the body can be read without splicing it into the
+        // prompt; Alt+E remains the in-place expansion for editing.
+        if let Some((id, body)) = self.prompt_input.paste_ref_at(self.prompt_input.cursor) {
+            self.paste_viewer.open(id, &body);
+        }
+        self.refresh_prompt_input();
+    }
+
+    /// Key handling while the paste viewer modal is open.
+    fn handle_paste_viewer_key(&mut self, key: crossterm::event::KeyEvent) {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.paste_viewer.close(),
+            KeyCode::Up | KeyCode::Char('k') => self.paste_viewer.scroll_up(1),
+            KeyCode::Down | KeyCode::Char('j') => self.paste_viewer.scroll_down(1),
+            KeyCode::PageUp => self.paste_viewer.page_up(),
+            KeyCode::PageDown => self.paste_viewer.page_down(),
+            KeyCode::Home | KeyCode::Char('g') => self.paste_viewer.scroll_to_top(),
+            KeyCode::End | KeyCode::Char('G') => self.paste_viewer.scroll_to_bottom(),
+            // Alt+E from inside the viewer: same in-place expansion as on the
+            // placeholder itself, then close (the body now lives in the
+            // prompt buffer).
+            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::ALT) => {
+                let id = self.paste_viewer.paste_id;
+                self.paste_viewer.close();
+                self.expand_paste_ref_by_id(id);
+            }
+            _ => {}
+        }
+    }
+
+    /// Expand the `[Pasted text #N ...]` placeholder with the given id, if it
+    /// is still present in the prompt buffer with a stored body.
+    fn expand_paste_ref_by_id(&mut self, id: u32) {
+        let target =
+            claurst_core::prompt_history::parse_references_with_positions(&self.prompt_input.text)
+                .into_iter()
+                .find(|(rid, matched, _)| *rid == id && matched.starts_with("[Pasted text #"));
+        if let Some((_, _, start)) = target {
+            self.prompt_input.expand_paste_ref_at(start);
+            self.refresh_prompt_input();
+        }
+    }
+
     pub fn handle_mouse_event(&mut self, mouse_event: MouseEvent) {
         use crossterm::event::MouseButton;
+
+        // When mouse capture is disabled (mouseCapture: false, issue #104) the
+        // terminal keeps the mouse for native click-drag selection / copy-paste,
+        // so the app must not act on any mouse events that still slip through.
+        // Keyboard scrolling (PageUp/PageDown, etc.) is handled elsewhere and is
+        // unaffected by this gate.
+        if !self.config.mouse_capture_enabled() {
+            return;
+        }
+
+        // The paste viewer modal swallows mouse input: the wheel scrolls its
+        // body, everything else is inert (Esc/q close it).
+        if self.paste_viewer.visible {
+            match mouse_event.kind {
+                MouseEventKind::ScrollUp => self.paste_viewer.scroll_up(3),
+                MouseEventKind::ScrollDown => self.paste_viewer.scroll_down(3),
+                _ => {}
+            }
+            return;
+        }
 
         // Fast-reject mouse-move events — they flood at 60+ Hz and we don't
         // need hover tracking. Exception: context menu needs hover to update
@@ -4692,11 +5994,13 @@ impl App {
         // Key-input and device-auth stay outside this gate so their visible text
         // can still be selected and copied with the mouse.
         let any_dialog = self.connect_dialog.visible
+            || self.import_config_picker.visible
+            || self.import_config_dialog.visible
             || self.command_palette.visible
             || self.model_picker.visible
             || self.export_dialog.visible
             || self.settings_screen.visible
-            || self.stats_dialog.open
+            || self.stats_dialog.visible
             || self.context_viz.visible
             || self.session_browser.visible;
 
@@ -4706,6 +6010,8 @@ impl App {
                     // DialogSelect dialogs — check if click is inside for item selection
                     let in_dialog = if self.connect_dialog.visible {
                         self.connect_dialog.contains(mouse_event.column, mouse_event.row)
+                    } else if self.import_config_picker.visible {
+                        self.import_config_picker.contains(mouse_event.column, mouse_event.row)
                     } else if self.command_palette.visible {
                         self.command_palette.contains(mouse_event.column, mouse_event.row)
                     } else {
@@ -4719,6 +6025,8 @@ impl App {
                         // Click inside a DialogSelect — select the clicked item
                         if self.connect_dialog.visible {
                             self.connect_dialog.handle_mouse_click(mouse_event.row);
+                        } else if self.import_config_picker.visible {
+                            self.import_config_picker.handle_mouse_click(mouse_event.row);
                         } else if self.command_palette.visible {
                             self.command_palette.handle_mouse_click(mouse_event.row);
                         }
@@ -4732,10 +6040,12 @@ impl App {
                 MouseEventKind::ScrollUp => {
                     // Scroll through dialog items
                     if self.connect_dialog.visible { self.connect_dialog.move_up(); }
+                    else if self.import_config_picker.visible { self.import_config_picker.move_up(); }
                     else if self.command_palette.visible { self.command_palette.move_up(); }
                 }
                 MouseEventKind::ScrollDown => {
                     if self.connect_dialog.visible { self.connect_dialog.move_down(); }
+                    else if self.import_config_picker.visible { self.import_config_picker.move_down(); }
                     else if self.command_palette.visible { self.command_palette.move_down(); }
                 }
                 _ => {}
@@ -4748,8 +6058,7 @@ impl App {
                 // Don't consume Ctrl+Scroll — let the terminal handle zoom.
                 if !mouse_event.modifiers.contains(KeyModifiers::CONTROL) {
                     let step = self.scroll_step();
-                    self.scroll_offset = self.scroll_offset.saturating_add(step);
-                    self.auto_scroll = false;
+                    self.scroll_up_by(step);
                 }
             }
             MouseEventKind::ScrollDown => {
@@ -4849,9 +6158,21 @@ impl App {
                     && mouse_event.column >= selectable_area.x
                     && mouse_event.column < selectable_area.x.saturating_add(selectable_area.width);
 
+                // Check for click on a thinking block header (takes priority over text selection).
+                if let Some(&hash) = self.thinking_row_map.borrow().get(&mouse_event.row) {
+                    if self.thinking_expanded.contains(&hash) {
+                        self.thinking_expanded.remove(&hash);
+                    } else {
+                        self.thinking_expanded.insert(hash);
+                    }
+                    self.invalidate_transcript();
+                    return;
+                }
+
                 if in_input {
                     self.focus = FocusTarget::Input;
                     self.clear_selection();
+                    self.handle_prompt_click(mouse_event.column, mouse_event.row);
                 } else if selectable_area.width == 0 || selectable_area.height == 0 {
                     self.click_count = 0;
                 } else if in_selectable {
@@ -4864,15 +6185,24 @@ impl App {
                     if self.is_double_click(current_pos) {
                         self.click_count += 1;
                         if self.click_count >= 3 {
-                            // Triple-click: select entire line
-                            self.selection_anchor = Some((selectable_area.x, current_pos.1));
-                            self.selection_focus = Some((
-                                selectable_area
-                                    .x
-                                    .saturating_add(selectable_area.width)
-                                    .saturating_sub(1),
-                                current_pos.1,
-                            ));
+                            // Triple-click: select the paragraph (run of
+                            // non-blank rows) containing the click. Falls back
+                            // to a single line if no paragraph is detected.
+                            if let Some((start_row, end_row, end_col)) =
+                                self.find_paragraph_boundaries(current_pos.1)
+                            {
+                                self.selection_anchor = Some((selectable_area.x, start_row));
+                                self.selection_focus = Some((end_col, end_row));
+                            } else {
+                                self.selection_anchor = Some((selectable_area.x, current_pos.1));
+                                self.selection_focus = Some((
+                                    selectable_area
+                                        .x
+                                        .saturating_add(selectable_area.width)
+                                        .saturating_sub(1),
+                                    current_pos.1,
+                                ));
+                            }
                             self.click_count = 0; // Reset for next click sequence
                         } else {
                             // Double-click: select word
@@ -4920,6 +6250,19 @@ impl App {
                 // Clear if no actual drag (single click = no selection)
                 if self.selection_anchor == self.selection_focus {
                     self.clear_selection();
+                } else if self.settings_screen.auto_copy_enabled {
+                    // Auto-copy finalized selection to clipboard.
+                    let sel_text = self.selection_text.borrow().clone();
+                    if !sel_text.is_empty() {
+                        let copied = crate::image_paste::write_clipboard_text(&sel_text);
+                        if copied {
+                            self.push_notification(
+                                NotificationKind::Info,
+                                "Copied to clipboard".to_string(),
+                                Some(1),
+                            );
+                        }
+                    }
                 }
             }
             _ => {}
@@ -4940,6 +6283,14 @@ impl App {
 
     /// Process a query event from the agentic loop.
     pub fn handle_query_event(&mut self, event: QueryEvent) {
+        // Auto-dismiss error modal when assistant responds
+        match &event {
+            QueryEvent::Stream(_) | QueryEvent::TurnComplete { .. } => {
+                self.dismiss_error_notifications();
+            }
+            _ => {}
+        }
+
         match event {
             QueryEvent::Stream(stream_evt) => {
                 if !self.is_streaming {
@@ -5087,7 +6438,7 @@ impl App {
                 self.invalidate_transcript();
                 let err_msg = format!("Error: {}", msg);
                 self.push_assistant_message(err_msg.clone());
-                self.status_message = Some(err_msg);
+                self.push_notification(NotificationKind::Error, err_msg, None);
             }
             QueryEvent::TokenWarning { state, pct_used } => {
                 // Push a notification for context window warnings (notification + threshold tracking).
@@ -5101,7 +6452,7 @@ impl App {
                     }
                     TokenWarningState::Warning if self.token_warning_threshold_shown < 80 => {
                         self.token_warning_threshold_shown = 80;
-                        self.notifications.push(
+                        self.push_notification(
                             NotificationKind::Warning,
                             format!("Context window {:.0}% full. Consider /compact.", pct_used * 100.0),
                             Some(30),
@@ -5109,7 +6460,7 @@ impl App {
                     }
                     TokenWarningState::Critical if self.token_warning_threshold_shown < 95 => {
                         self.token_warning_threshold_shown = 95;
-                        self.notifications.push(
+                        self.push_notification(
                             NotificationKind::Error,
                             format!("Context window {:.0}% full! Run /compact now.", pct_used * 100.0),
                             None,
@@ -5186,6 +6537,44 @@ impl App {
                 });
             }
 
+            // Drain background recent-sessions results into the welcome screen.
+            if let Some(ref mut rx) = self.recent_sessions_rx {
+                match rx.try_recv() {
+                    Ok(sessions) => {
+                        self.recent_sessions = sessions;
+                        self.recent_sessions_rx = None;
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        self.recent_sessions_rx = None;
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+                }
+            }
+
+            // Spawn the one-shot recent-sessions load when requested (startup).
+            if self.recent_sessions_pending {
+                self.recent_sessions_pending = false;
+                let root = self.project_root();
+                let (tx, rx) = tokio::sync::mpsc::channel(1);
+                self.recent_sessions_rx = Some(rx);
+                tokio::spawn(async move {
+                    // Show at most a handful; list_sessions is already newest-first.
+                    const MAX_RECENT: usize = 5;
+                    let summaries = claurst_core::session_storage::list_sessions(&root)
+                        .await
+                        .unwrap_or_default();
+                    let recent: Vec<RecentSession> = summaries
+                        .into_iter()
+                        .take(MAX_RECENT)
+                        .map(|s| RecentSession {
+                            label: recent_session_label(s.title, s.last_prompt),
+                            mtime: s.mtime,
+                        })
+                        .collect();
+                    let _ = tx.send(recent).await;
+                });
+            }
+
             // Drain voice transcription events (non-blocking).
             // When the background recording/transcription task emits a
             // TranscriptReady event we insert the text directly into the
@@ -5203,7 +6592,7 @@ impl App {
                         VoiceEvent::RecordingStarted => {
                             self.voice_recording = true;
                             self.status_message =
-                                Some("Recording\u{2026} press V again or Enter to stop".to_string());
+                                Some("Recording\u{2026} (Alt+V or Esc to stop)".to_string());
                         }
                         VoiceEvent::RecordingStopped => {
                             self.voice_recording = false;
@@ -5231,7 +6620,7 @@ impl App {
                         VoiceEvent::Error(msg) => {
                             self.voice_recording = false;
                             self.voice_event_rx = None;
-                            self.notifications.push(
+                            self.push_notification(
                                 NotificationKind::Warning,
                                 format!("Voice: {}", msg),
                                 Some(8),
@@ -5241,12 +6630,40 @@ impl App {
                 }
             }
 
-            // Draw the frame
-            terminal.draw(|f| render::render_app(f, self))?;
+            // Draw the frame, and immediately scan the *just-rendered*
+            // buffer for URL runs. ratatui swaps its two buffers at the
+            // end of draw(), so by the time draw() returns,
+            // `terminal.current_buffer_mut()` points at the empty next-frame
+            // slot. `CompletedFrame.buffer` is the one we actually want.
+            let osc8_hits = {
+                let completed = terminal.draw(|f| render::render_app(f, self))?;
+                crate::osc8::scan_buffer_for_urls(completed.buffer)
+            };
+
+            // Post-paint OSC 8 overlay: re-emit URL cells wrapped in
+            // hyperlink escapes so terminals that support OSC 8 (Windows
+            // Terminal, iTerm2, WezTerm, Kitty, Konsole, VS Code, …) make
+            // them Ctrl/Cmd-clickable. Failure is non-fatal — we never want
+            // an overlay glitch to kill the TUI.
+            if let Err(err) = crate::osc8::emit_hits(&osc8_hits) {
+                tracing::debug!(target: "osc8", "hyperlink overlay write failed: {err}");
+            }
+
+            // Replay a key that was saved by try_detect_paste_burst in a
+            // previous iteration (e.g. a modifier key that terminated a burst).
+            let pending = self.pending_key.take();
 
             // Poll for events with a short timeout so we can redraw for animation
-            if event::poll(std::time::Duration::from_millis(50))? {
-                match event::read()? {
+            let got_event = pending.is_some()
+                || event::poll(std::time::Duration::from_millis(50))?;
+
+            if got_event {
+                let event = if let Some(k) = pending {
+                    Event::Key(k)
+                } else {
+                    event::read()?
+                };
+                match event {
                     Event::Key(key) => {
                         // On Windows crossterm fires both Press and Release events.
                         // We normally skip non-press events, but when voice PTT mode
@@ -5264,24 +6681,48 @@ impl App {
                             }
                             continue;
                         }
+
+                        // ---- Paste-burst detection -----------------------------------------
+                        // On Windows Terminal, Ctrl+V causes the terminal to write clipboard
+                        // content as raw character events (not as Event::Paste).  Every `\n`
+                        // fires as Enter (submitting the prompt) and stray `v` chars trigger
+                        // voice PTT.  We detect this by draining the event queue with a
+                        // zero-timeout immediately after the first character arrives — a paste
+                        // dumps every character at once while normal typing rarely queues more
+                        // than one char in the same 50 ms window.
+                        if key.modifiers == KeyModifiers::NONE
+                            || key.modifiers == KeyModifiers::SHIFT
+                        {
+                            if let KeyCode::Char(c) = key.code {
+                                if self.prompt_is_accepting_text() {
+                                    if let Some(burst) = self.try_detect_paste_burst(c) {
+                                        self.handle_paste_data(burst);
+                                        self.refresh_prompt_input();
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                        // -------------------------------------------------------------------
+
                         let should_submit = self.handle_key_event(key);
                         // Honour `:q`/`:wq` from vim command-line mode
                         if self.prompt_input.vim_quit_requested {
                             self.prompt_input.vim_quit_requested = false;
-                            self.should_quit = true;
+                            self.should_exit = true;
                         }
-                        if self.should_quit {
+                        if self.should_exit {
                             return Ok(None);
                         }
                         if should_submit {
+                            // Dismiss any active error modal when the user sends a message
+                            self.dismiss_error_notifications();
                             // Check if this is a slash command that should open a UI screen
                             if crate::input::is_slash_command(&self.prompt_input.text) {
-                                let cmd = {
-                                    let (c, _) =
-                                        crate::input::parse_slash_command(&self.prompt_input.text);
-                                    c.to_string()
-                                };
-                                if self.intercept_slash_command(&cmd) {
+                                let slash_input = self.prompt_input.text.clone();
+                                let (cmd, args) =
+                                        crate::input::parse_slash_command(&slash_input);
+                                if self.intercept_slash_command_with_args(cmd, args) {
                                     self.clear_prompt();
                                     continue;
                                 }
@@ -5298,7 +6739,7 @@ impl App {
                             && !self.history_search_overlay.visible
                             && self.history_search.is_none() =>
                     {
-                        self.prompt_input.paste(&data);
+                        self.handle_paste_data(data);
                         self.refresh_prompt_input();
                     }
                     Event::Mouse(mouse_event) => {
@@ -5369,6 +6810,50 @@ impl App {
     }
 }
 
+// Helper function to open a file in the user's external editor
+fn open_file_externally(path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    // Try to open with the system's default application
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(path)
+            .spawn()?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(path)
+            .spawn()?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("cmd")
+            .args(&["/C", "start", ""])
+            .arg(path)
+            .spawn()?;
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        // Fallback for other systems: try common editors in order
+        for editor in &["nano", "vi", "vim", "emacs"] {
+            match std::process::Command::new(editor)
+                .arg(path)
+                .spawn()
+            {
+                Ok(_) => return Ok(()),
+                Err(_) => continue,
+            }
+        }
+        Err("No suitable editor found".into())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5389,6 +6874,450 @@ mod tests {
         }
     }
 
+    // ---- recent-activity label (issue #277) ----
+
+    #[test]
+    fn recent_session_label_prefers_title() {
+        let label = recent_session_label(
+            Some("My Title".to_string()),
+            Some("some prompt".to_string()),
+        );
+        assert_eq!(label, "My Title");
+    }
+
+    #[test]
+    fn recent_session_label_falls_back_to_first_prompt_line() {
+        let label = recent_session_label(
+            None,
+            Some("  fix the bug\nand more details".to_string()),
+        );
+        assert_eq!(label, "fix the bug");
+    }
+
+    #[test]
+    fn recent_session_label_skips_blank_title_and_untitled_default() {
+        // Blank/whitespace title is ignored in favour of the prompt.
+        assert_eq!(
+            recent_session_label(Some("   ".to_string()), Some("do it".to_string())),
+            "do it"
+        );
+        // Nothing usable → untitled.
+        assert_eq!(recent_session_label(None, None), "(untitled)");
+        assert_eq!(
+            recent_session_label(Some(String::new()), Some("\n\n".to_string())),
+            "(untitled)"
+        );
+    }
+
+    #[test]
+    fn recent_session_label_truncates_long_prompt() {
+        let long = "x".repeat(200);
+        let label = recent_session_label(None, Some(long));
+        assert_eq!(label.chars().count(), 80);
+    }
+
+    // ---- mouse capture gate (issue #104) ----
+
+    fn scroll_up_event() -> crossterm::event::MouseEvent {
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::ScrollUp,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn mouse_events_processed_when_capture_enabled() {
+        // Default config leaves mouse capture on, so a scroll wheel event
+        // should move the scroll offset — provided there is content to scroll
+        // over (a render must have established a non-zero max_scroll).
+        let mut app = make_app();
+        assert!(app.config.mouse_capture_enabled());
+        assert_eq!(app.scroll_offset, 0);
+        app.last_max_scroll.set(50);
+        app.handle_mouse_event(scroll_up_event());
+        assert!(app.scroll_offset > 0, "scroll should advance when capture is on");
+        assert!(app.scroll_offset <= 50, "scroll stays within max_scroll");
+    }
+
+    // ---- click-to-view paste placeholders ----
+
+    #[test]
+    fn prompt_click_on_placeholder_opens_viewer() {
+        let mut app = make_app();
+        // Bottom pane as rendered: 1 status row (height > 2), then the top
+        // separator at y=21, text rows from y=22. Prefix "❯ " is 2 cells.
+        app.last_input_area.set(ratatui::layout::Rect { x: 0, y: 20, width: 80, height: 8 });
+        for c in "hi ".chars() {
+            app.prompt_input.insert_char(c);
+        }
+        app.prompt_input.paste("l1\nl2\nl3");
+        assert!(app.prompt_input.text.contains("[Pasted text #1"));
+
+        // Click on the separator row: nothing opens.
+        app.handle_prompt_click(10, 21);
+        assert!(!app.paste_viewer.visible);
+
+        // Click inside the placeholder on the first text row: the viewer
+        // opens read-only — the placeholder stays in the buffer and the body
+        // stays stored so submit-time expansion is unaffected.
+        app.handle_prompt_click(2 + 5, 22);
+        assert!(app.paste_viewer.visible);
+        assert_eq!(app.paste_viewer.paste_id, 1);
+        assert_eq!(app.paste_viewer.line_count(), 3);
+        assert!(app.prompt_input.text.contains("[Pasted text #1"));
+        assert!(!app.prompt_input.paste_contents.is_empty());
+    }
+
+    #[test]
+    fn paste_viewer_alt_e_expands_into_prompt() {
+        let mut app = make_app();
+        app.last_input_area.set(ratatui::layout::Rect { x: 0, y: 20, width: 80, height: 8 });
+        for c in "hi ".chars() {
+            app.prompt_input.insert_char(c);
+        }
+        app.prompt_input.paste("l1\nl2\nl3");
+        app.handle_prompt_click(2 + 5, 22);
+        assert!(app.paste_viewer.visible);
+
+        let alt_e = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('e'),
+            KeyModifiers::ALT,
+        );
+        app.handle_paste_viewer_key(alt_e);
+        assert!(!app.paste_viewer.visible);
+        assert_eq!(app.prompt_input.text, "hi l1\nl2\nl3");
+        assert!(app.prompt_input.paste_contents.is_empty());
+    }
+
+    #[test]
+    fn prompt_click_off_placeholder_moves_cursor_only() {
+        let mut app = make_app();
+        app.last_input_area.set(ratatui::layout::Rect { x: 0, y: 20, width: 80, height: 8 });
+        for c in "hello ".chars() {
+            app.prompt_input.insert_char(c);
+        }
+        app.prompt_input.paste("l1\nl2\nl3");
+        let text_before = app.prompt_input.text.clone();
+
+        // Click on "hello " before the placeholder: cursor moves, no viewer.
+        app.handle_prompt_click(2 + 1, 22);
+        assert_eq!(app.prompt_input.text, text_before);
+        assert_eq!(app.prompt_input.cursor, 1);
+        assert!(!app.paste_viewer.visible);
+    }
+
+    // ---- scroll_offset clamping (issue #223) ----
+
+    #[test]
+    fn scroll_up_offset_clamped_to_max_scroll() {
+        let mut app = make_app();
+        // A render established that the transcript is 5 lines taller than the
+        // viewport, so scroll_offset can meaningfully range over 0..=5.
+        app.last_max_scroll.set(5);
+
+        // Scroll up far past the top, many times.
+        for _ in 0..50 {
+            app.scroll_up_by(10);
+        }
+
+        // Without the clamp scroll_offset would be 500; it must stay at
+        // max_scroll so the offset can't inflate unboundedly (#223).
+        assert_eq!(
+            app.scroll_offset, 5,
+            "scroll_offset must not inflate past max_scroll"
+        );
+        assert!(!app.auto_scroll, "scrolling up disables auto-follow");
+
+        // Because it was clamped, a single Down step moves the view
+        // immediately instead of burning through hundreds of wasted presses.
+        let before = app.scroll_offset;
+        app.scroll_offset = app.scroll_offset.saturating_sub(1);
+        assert!(
+            app.scroll_offset < before,
+            "a single Down moves the view once scroll_offset is clamped"
+        );
+    }
+
+    #[test]
+    fn scroll_up_no_op_when_nothing_to_scroll() {
+        // When content fits the viewport (max_scroll == 0) scrolling up is a
+        // no-op rather than silently inflating scroll_offset.
+        let mut app = make_app();
+        app.last_max_scroll.set(0);
+        for _ in 0..20 {
+            app.scroll_up_by(10);
+        }
+        assert_eq!(app.scroll_offset, 0, "no scroll room means no offset growth");
+    }
+
+    #[test]
+    fn mouse_events_ignored_when_capture_disabled() {
+        // With mouseCapture: false the app must not act on mouse events that
+        // still slip through, so the scroll offset stays put.
+        let mut app = make_app();
+        app.config.mouse_capture = Some(false);
+        assert!(!app.config.mouse_capture_enabled());
+        app.handle_mouse_event(scroll_up_event());
+        assert_eq!(app.scroll_offset, 0, "scroll must not move when capture is off");
+    }
+
+    // ---- normalize_char_with_shift tests ----
+
+    #[test]
+    fn test_normalize_char_no_shift_returns_unchanged() {
+        assert_eq!(normalize_char_with_shift('a', KeyModifiers::NONE), 'a');
+        assert_eq!(normalize_char_with_shift('1', KeyModifiers::NONE), '1');
+        assert_eq!(normalize_char_with_shift('!', KeyModifiers::NONE), '!');
+    }
+
+    #[test]
+    fn test_normalize_char_shift_uppercase_letters() {
+        assert_eq!(normalize_char_with_shift('a', KeyModifiers::SHIFT), 'A');
+        assert_eq!(normalize_char_with_shift('z', KeyModifiers::SHIFT), 'Z');
+        assert_eq!(normalize_char_with_shift('m', KeyModifiers::SHIFT), 'M');
+    }
+
+    #[test]
+    fn test_normalize_char_shift_numbers() {
+        assert_eq!(normalize_char_with_shift('1', KeyModifiers::SHIFT), '!');
+        assert_eq!(normalize_char_with_shift('2', KeyModifiers::SHIFT), '@');
+        assert_eq!(normalize_char_with_shift('3', KeyModifiers::SHIFT), '#');
+        assert_eq!(normalize_char_with_shift('4', KeyModifiers::SHIFT), '$');
+        assert_eq!(normalize_char_with_shift('5', KeyModifiers::SHIFT), '%');
+        assert_eq!(normalize_char_with_shift('6', KeyModifiers::SHIFT), '^');
+        assert_eq!(normalize_char_with_shift('7', KeyModifiers::SHIFT), '&');
+        assert_eq!(normalize_char_with_shift('8', KeyModifiers::SHIFT), '*');
+        assert_eq!(normalize_char_with_shift('9', KeyModifiers::SHIFT), '(');
+        assert_eq!(normalize_char_with_shift('0', KeyModifiers::SHIFT), ')');
+    }
+
+    #[test]
+    fn test_normalize_char_shift_symbols() {
+        assert_eq!(normalize_char_with_shift('-', KeyModifiers::SHIFT), '_');
+        assert_eq!(normalize_char_with_shift('=', KeyModifiers::SHIFT), '+');
+        assert_eq!(normalize_char_with_shift('[', KeyModifiers::SHIFT), '{');
+        assert_eq!(normalize_char_with_shift(']', KeyModifiers::SHIFT), '}');
+        assert_eq!(normalize_char_with_shift(';', KeyModifiers::SHIFT), ':');
+        assert_eq!(normalize_char_with_shift('\'', KeyModifiers::SHIFT), '"');
+        assert_eq!(normalize_char_with_shift(',', KeyModifiers::SHIFT), '<');
+        assert_eq!(normalize_char_with_shift('.', KeyModifiers::SHIFT), '>');
+        assert_eq!(normalize_char_with_shift('/', KeyModifiers::SHIFT), '?');
+        assert_eq!(normalize_char_with_shift('\\', KeyModifiers::SHIFT), '|');
+        assert_eq!(normalize_char_with_shift('`', KeyModifiers::SHIFT), '~');
+    }
+
+    #[test]
+    fn test_normalize_char_shift_already_shifted_chars_unchanged() {
+        // Characters that don't have shift equivalents remain unchanged
+        assert_eq!(normalize_char_with_shift('!', KeyModifiers::SHIFT), '!');
+        assert_eq!(normalize_char_with_shift('@', KeyModifiers::SHIFT), '@');
+        assert_eq!(normalize_char_with_shift('A', KeyModifiers::SHIFT), 'A');
+    }
+
+    #[test]
+    fn test_normalize_char_other_modifiers_ignored() {
+        // CTRL or ALT without SHIFT should not shift the character
+        assert_eq!(normalize_char_with_shift('a', KeyModifiers::CONTROL), 'a');
+        assert_eq!(normalize_char_with_shift('1', KeyModifiers::ALT), '1');
+        assert_eq!(normalize_char_with_shift('a', KeyModifiers::CONTROL | KeyModifiers::ALT), 'a');
+    }
+
+    #[test]
+    fn test_normalize_char_shift_with_other_modifiers() {
+        // SHIFT + CTRL should still apply shift transformation
+        assert_eq!(
+            normalize_char_with_shift('a', KeyModifiers::SHIFT | KeyModifiers::CONTROL),
+            'A'
+        );
+        assert_eq!(
+            normalize_char_with_shift('1', KeyModifiers::SHIFT | KeyModifiers::ALT),
+            '!'
+        );
+    }
+
+    // ---- issue #183: slash command input & execution on Windows / non-kitty terminals ----
+
+    #[test]
+    fn test_slash_inserts_literal_slash_when_shift_flagged_on_non_kitty_terminal() {
+        // On terminals that don't speak the kitty protocol (Windows conhost / CMD
+        // / legacy PowerShell, and non-US layouts where `/` is a shifted key) the
+        // slash key can arrive as Char('/') carrying a SHIFT flag, with the
+        // character already final. We must insert a literal `/`, not re-shift it
+        // into `?` (issue #183).
+        let mut app = make_app();
+        app.kitty_keyboard_active = false;
+        // Pre-fill so the empty-prompt `?`/`/` help shortcut is out of the picture.
+        app.prompt_input.text = "x".to_string();
+        app.prompt_input.cursor = app.prompt_input.text.len();
+        app.refresh_prompt_input();
+
+        app.handle_key_event(press_key(KeyCode::Char('/'), KeyModifiers::SHIFT));
+
+        assert_eq!(app.prompt_input.text, "x/");
+    }
+
+    #[test]
+    fn test_slash_with_shift_flag_starts_command_not_help_on_non_kitty_terminal() {
+        // Empty prompt: pressing `/` (reported as Char('/') + SHIFT on a non-kitty
+        // terminal) must insert a literal slash so the user can start a command,
+        // NOT toggle the help overlay (issue #183 — "Cannot run any slash commands").
+        let mut app = make_app();
+        app.kitty_keyboard_active = false;
+
+        app.handle_key_event(press_key(KeyCode::Char('/'), KeyModifiers::SHIFT));
+
+        assert!(
+            !app.help_overlay.visible,
+            "a literal slash must not open the help overlay"
+        );
+        assert!(!app.show_help);
+        assert_eq!(app.prompt_input.text, "/");
+    }
+
+    #[test]
+    fn test_shift_slash_still_normalizes_to_question_under_kitty_protocol() {
+        // With the kitty protocol active, Shift+/ arrives as the unshifted base
+        // key Char('/') + SHIFT, so we DO apply the US-QWERTY shift map → `?`.
+        let mut app = make_app();
+        app.kitty_keyboard_active = true;
+        app.prompt_input.text = "x".to_string();
+        app.prompt_input.cursor = app.prompt_input.text.len();
+        app.refresh_prompt_input();
+
+        app.handle_key_event(press_key(KeyCode::Char('/'), KeyModifiers::SHIFT));
+
+        assert_eq!(app.prompt_input.text, "x?");
+    }
+
+    #[test]
+    fn test_enter_runs_highlighted_slash_command_in_one_press() {
+        // Typing a slash command and pressing Enter should run it immediately
+        // rather than merely completing the text and waiting for a second Enter
+        // (issue #183 — "enter will not run the command").
+        let mut app = make_app();
+        for c in "/help".chars() {
+            app.handle_key_event(press_key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert!(
+            !app.prompt_input.suggestions.is_empty(),
+            "the slash-command popup should be open"
+        );
+
+        let should_submit = app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(should_submit, "Enter should submit/run the highlighted command");
+        assert_eq!(app.prompt_input.text, "/help");
+        assert!(
+            app.prompt_input.suggestions.is_empty(),
+            "the popup should be dismissed after running"
+        );
+    }
+
+    #[test]
+    fn test_enter_completes_slash_prefix_then_runs() {
+        // Even from a unique prefix, Enter completes to the highlighted command
+        // and runs it in a single press.
+        let mut app = make_app();
+        for c in "/the".chars() {
+            app.handle_key_event(press_key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+
+        let should_submit = app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(should_submit);
+        assert_eq!(app.prompt_input.text, "/theme");
+    }
+
+    // ---- Shift+Enter newline vs Enter submit (issue #224) ----
+
+    /// Feed some text then a modified Enter and return (submitted?, buffer).
+    fn type_then_modified_enter(mods: KeyModifiers) -> (bool, String) {
+        let mut app = make_app();
+        for c in "hi".chars() {
+            app.handle_key_event(press_key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let submitted = app.handle_key_event(press_key(KeyCode::Enter, mods));
+        (submitted, app.prompt_input.text.clone())
+    }
+
+    #[test]
+    fn shift_enter_inserts_newline_not_submit() {
+        // On kitty-capable terminals Shift+Enter arrives as Enter+SHIFT and must
+        // insert a literal newline, leaving the prompt multi-line and unsent.
+        let (submitted, text) = type_then_modified_enter(KeyModifiers::SHIFT);
+        assert!(!submitted, "Shift+Enter must not submit");
+        assert_eq!(text, "hi\n", "Shift+Enter should append a newline");
+        assert!(text.contains('\n'), "buffer should now be multi-line");
+    }
+
+    #[test]
+    fn alt_enter_inserts_newline_fallback() {
+        // Alt+Enter is a fallback for terminals that can't report Shift+Enter.
+        let (submitted, text) = type_then_modified_enter(KeyModifiers::ALT);
+        assert!(!submitted, "Alt+Enter must not submit");
+        assert_eq!(text, "hi\n");
+    }
+
+    #[test]
+    fn ctrl_enter_inserts_newline_fallback() {
+        // Ctrl+Enter is the Windows-Terminal-style fallback for newline.
+        let (submitted, text) = type_then_modified_enter(KeyModifiers::CONTROL);
+        assert!(!submitted, "Ctrl+Enter must not submit");
+        assert_eq!(text, "hi\n");
+    }
+
+    #[test]
+    fn ctrl_j_inserts_newline_fallback() {
+        // Ctrl+J (Char('j') + CONTROL) is the conventional legacy newline escape
+        // (pi binds insert-newline to shift+enter + ctrl+j). It must insert a
+        // newline, not the literal character 'j'.
+        let mut app = make_app();
+        for c in "hi".chars() {
+            app.handle_key_event(press_key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let submitted = app.handle_key_event(press_key(KeyCode::Char('j'), KeyModifiers::CONTROL));
+        assert!(!submitted, "Ctrl+J must not submit");
+        assert_eq!(app.prompt_input.text, "hi\n", "Ctrl+J should insert a newline, not 'j'");
+    }
+
+    #[test]
+    fn bare_enter_submits_without_newline() {
+        // A plain Enter (no modifiers) submits and leaves the buffer untouched.
+        let mut app = make_app();
+        for c in "hi".chars() {
+            app.handle_key_event(press_key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let submitted = app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(submitted, "bare Enter should submit");
+        assert_eq!(app.prompt_input.text, "hi", "bare Enter must not insert a newline");
+        assert!(!app.prompt_input.text.contains('\n'));
+    }
+
+    #[test]
+    fn shift_enter_newline_composes_multiline_prompt() {
+        // Compose two lines with Shift+Enter between them, then submit with a
+        // bare Enter; the buffer keeps both lines and only the bare Enter sends.
+        let mut app = make_app();
+        for c in "line1".chars() {
+            app.handle_key_event(press_key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert!(!app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::SHIFT)));
+        for c in "line2".chars() {
+            app.handle_key_event(press_key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert_eq!(app.prompt_input.text, "line1\nline2");
+        assert!(app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn test_mcp_subcommand_is_not_intercepted() {
+        let mut app = make_app();
+        assert!(!app.intercept_slash_command_with_args("mcp", "auth mcphub"));
+        assert!(!app.mcp_view.visible);
+    }
+
     #[test]
     fn test_clear_slash_command_clears_messages() {
         let mut app = make_app();
@@ -5402,9 +7331,9 @@ mod tests {
     #[test]
     fn test_exit_slash_command_sets_quit_flag() {
         let mut app = make_app();
-        assert!(!app.should_quit);
+        assert!(!app.should_exit);
         assert!(app.intercept_slash_command("exit"));
-        assert!(app.should_quit);
+        assert!(app.should_exit);
     }
 
     #[test]
@@ -5555,12 +7484,18 @@ mod tests {
     }
 
     #[test]
-    fn test_ctrl_a_shortcut_opens_model_picker() {
+    fn test_ctrl_shift_a_shortcut_opens_model_picker() {
         let mut app = make_app();
         app.has_credentials = true;
         app.config.provider = Some("anthropic".to_string());
 
-        app.handle_key_event(press_key(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        // The model-picker shortcut moved from Ctrl+A to Ctrl+Shift+A in
+        // commit 8da4a29 to resolve the Ctrl+A conflict (goLineStart in the
+        // prompt). The default bindings map ctrl+shift+a -> openModelPicker.
+        app.handle_key_event(press_key(
+            KeyCode::Char('a'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
 
         assert!(app.model_picker.visible);
     }
@@ -5598,7 +7533,7 @@ mod tests {
         let pr = PermissionRequest::bash(
             "tu-1".to_string(),
             "Bash".to_string(),
-            "wants to run".to_string(),
+            "This will execute a shell command.".to_string(),
             "git status".to_string(),
             Some("git".to_string()),
         );
@@ -5630,7 +7565,7 @@ mod tests {
         let mut pr = PermissionRequest::bash(
             "tu-2".to_string(),
             "Bash".to_string(),
-            "wants to run".to_string(),
+            "This will execute a shell command.".to_string(),
             "cargo build".to_string(),
             Some("cargo".to_string()),
         );
@@ -5661,7 +7596,7 @@ mod tests {
         let pr = PermissionRequest::bash(
             "tu-3".to_string(),
             "Bash".to_string(),
-            "wants to run".to_string(),
+            "This will execute a shell command.".to_string(),
             "npm install".to_string(),
             Some("npm".to_string()),
         );
@@ -5678,5 +7613,195 @@ mod tests {
 
         assert!(app.permission_request.is_none());
         assert!(!app.bash_command_allowed_by_prefix("npm test"));
+    }
+
+    // ---- issue #47: shortcuts on non-English (Cyrillic) keyboard layouts ----
+
+    #[test]
+    fn test_layout_to_latin_maps_cyrillic_shortcut_positions() {
+        // Letters used by core Ctrl/Alt shortcuts must resolve to the Latin key
+        // at the same physical QWERTY position on the Russian/Ukrainian JCUKEN
+        // layout. (left = Cyrillic glyph reported by the terminal, right = Latin)
+        assert_eq!(layout_to_latin('с'), "c"); // Ctrl+C  (interrupt / exit)
+        assert_eq!(layout_to_latin('в'), "d"); // Ctrl+D  (exit)
+        assert_eq!(layout_to_latin('к'), "r"); // Ctrl+R  (history search)
+        assert_eq!(layout_to_latin('и'), "b"); // Ctrl+B  (create branch)
+        assert_eq!(layout_to_latin('з'), "p"); // Ctrl+P  (global search)
+        assert_eq!(layout_to_latin('е'), "t"); // Ctrl+T  (tasks overlay)
+        assert_eq!(layout_to_latin('т'), "n"); // n
+        assert_eq!(layout_to_latin('о'), "j"); // Ctrl+J  (newline fallback)
+        assert_eq!(layout_to_latin('г'), "u"); // Ctrl+U  (kill to start)
+        assert_eq!(layout_to_latin('ц'), "w"); // Ctrl+W  (kill word)
+        assert_eq!(layout_to_latin('л'), "k"); // Ctrl+K  (command palette)
+        assert_eq!(layout_to_latin('а'), "f"); // Alt+F   (word forward)
+        assert_eq!(layout_to_latin('н'), "y"); // Ctrl+Y  (yank)
+    }
+
+    #[test]
+    fn test_layout_to_latin_covers_full_qwerty_letter_row() {
+        // Every Latin letter position should be reachable from some Cyrillic key,
+        // so every Ctrl/Alt+<letter> binding works regardless of layout.
+        let cyrillic = "йцукенгшщзфывапролдячсмить";
+        let mut latin: Vec<char> = cyrillic
+            .chars()
+            .filter_map(|c| layout_to_latin(c).chars().next())
+            .filter(|c| c.is_ascii_alphabetic())
+            .collect();
+        latin.sort_unstable();
+        latin.dedup();
+        assert_eq!(latin.len(), 26, "all 26 Latin letters must be covered");
+    }
+
+    #[test]
+    fn test_layout_to_latin_uppercase_cyrillic_folds_to_lowercase_latin() {
+        // Shift+Ctrl on a Cyrillic layout reports the uppercase glyph.
+        assert_eq!(layout_to_latin('С'), "c");
+        assert_eq!(layout_to_latin('В'), "d");
+    }
+
+    #[test]
+    fn test_layout_to_latin_passes_through_unknown_chars() {
+        // Plain ASCII and unmapped characters are returned unchanged (lowercased).
+        assert_eq!(layout_to_latin('c'), "c");
+        assert_eq!(layout_to_latin('A'), "a");
+    }
+
+    #[test]
+    fn test_key_event_to_keystroke_maps_ctrl_cyrillic_to_latin() {
+        // Ctrl+С (Cyrillic) on a non-Latin layout must resolve to the Latin "c".
+        let ks = key_event_to_keystroke(&press_key(
+            KeyCode::Char('с'),
+            KeyModifiers::CONTROL,
+        ))
+        .expect("keystroke");
+        assert_eq!(ks.key, "c");
+        assert!(ks.ctrl);
+
+        // Ctrl+О (Cyrillic, the physical J key) → "j" so Ctrl+J newline works.
+        let ks = key_event_to_keystroke(&press_key(
+            KeyCode::Char('о'),
+            KeyModifiers::CONTROL,
+        ))
+        .expect("keystroke");
+        assert_eq!(ks.key, "j");
+    }
+
+    #[test]
+    fn test_key_event_to_keystroke_keeps_plain_cyrillic_for_text_entry() {
+        // Without a modifier the character must NOT be Latinized — it is literal
+        // text the user is typing.
+        let ks = key_event_to_keystroke(&press_key(KeyCode::Char('с'), KeyModifiers::NONE))
+            .expect("keystroke");
+        assert_eq!(ks.key, "с");
+        assert!(!ks.ctrl && !ks.alt);
+    }
+
+    #[test]
+    fn test_normalize_layout_shortcut_key_rewrites_pure_ctrl() {
+        // Pure Ctrl + Cyrillic → Latin letter at the same physical position.
+        let out = normalize_layout_shortcut_key(press_key(
+            KeyCode::Char('с'),
+            KeyModifiers::CONTROL,
+        ));
+        assert_eq!(out.code, KeyCode::Char('c'));
+        assert!(out.modifiers.contains(KeyModifiers::CONTROL));
+    }
+
+    #[test]
+    fn test_normalize_layout_shortcut_key_leaves_plain_and_altgr_untouched() {
+        // No modifier: literal text entry — must stay Cyrillic.
+        let out = normalize_layout_shortcut_key(press_key(KeyCode::Char('с'), KeyModifiers::NONE));
+        assert_eq!(out.code, KeyCode::Char('с'));
+
+        // Ctrl+Alt (AltGr) can compose characters on some layouts — leave it.
+        let out = normalize_layout_shortcut_key(press_key(
+            KeyCode::Char('с'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ));
+        assert_eq!(out.code, KeyCode::Char('с'));
+
+        // Plain Alt is also left alone (avoid disturbing Option/meta composition).
+        let out = normalize_layout_shortcut_key(press_key(KeyCode::Char('с'), KeyModifiers::ALT));
+        assert_eq!(out.code, KeyCode::Char('с'));
+    }
+
+    #[test]
+    fn test_normalize_layout_shortcut_key_passes_ascii_through() {
+        // ASCII Ctrl combos (English layout) are unchanged — no regression.
+        let out = normalize_layout_shortcut_key(press_key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert_eq!(out.code, KeyCode::Char('c'));
+    }
+
+    #[test]
+    fn test_ctrl_cyrillic_o_inserts_newline_like_ctrl_j() {
+        // On a Cyrillic layout the physical Ctrl+J key reports Ctrl+О; it must
+        // still insert a newline so multi-line composing works (issue #47).
+        let mut app = make_app();
+        app.prompt_input.text = "ab".to_string();
+        app.prompt_input.cursor = app.prompt_input.text.len();
+        app.refresh_prompt_input();
+
+        app.handle_key_event(press_key(KeyCode::Char('о'), KeyModifiers::CONTROL));
+
+        assert_eq!(app.prompt_input.text, "ab\n");
+    }
+
+    #[test]
+    fn test_ctrl_j_inserts_newline_on_english_layout() {
+        // Regression guard: the English Ctrl+J path still inserts a newline.
+        let mut app = make_app();
+        app.prompt_input.text = "ab".to_string();
+        app.prompt_input.cursor = app.prompt_input.text.len();
+        app.refresh_prompt_input();
+
+        app.handle_key_event(press_key(KeyCode::Char('j'), KeyModifiers::CONTROL));
+
+        assert_eq!(app.prompt_input.text, "ab\n");
+    }
+
+    #[test]
+    fn test_raw_newline_char_inserts_newline() {
+        // A bare LF (0x0A) arriving as Char('\n') — e.g. Shift+Enter on a
+        // terminal without the kitty protocol — must add a newline, not be
+        // dropped.
+        let mut app = make_app();
+        app.prompt_input.text = "ab".to_string();
+        app.prompt_input.cursor = app.prompt_input.text.len();
+        app.refresh_prompt_input();
+
+        app.handle_key_event(press_key(KeyCode::Char('\n'), KeyModifiers::NONE));
+
+        assert_eq!(app.prompt_input.text, "ab\n");
+    }
+
+    #[test]
+    fn test_ctrl_cyrillic_c_triggers_exit_confirmation_on_cyrillic_layout() {
+        // Ctrl+С (Cyrillic) on an empty prompt must arm the two-press exit
+        // confirmation exactly like the English Ctrl+C (issue #47 — "Ctrl combos
+        // don't work").
+        let mut app = make_app();
+        assert!(app.prompt_input.is_empty());
+
+        app.handle_key_event(press_key(KeyCode::Char('с'), KeyModifiers::CONTROL));
+        assert!(
+            app.last_exit_key_warning.is_some(),
+            "first Ctrl+С should arm the exit confirmation"
+        );
+        assert!(!app.should_exit);
+
+        // Second press within the timeout exits.
+        app.handle_key_event(press_key(KeyCode::Char('с'), KeyModifiers::CONTROL));
+        assert!(app.should_exit, "second Ctrl+С should exit");
+    }
+
+    #[test]
+    fn test_ctrl_c_still_triggers_exit_confirmation_on_english_layout() {
+        // Regression guard: the English Ctrl+C exit confirmation is unchanged.
+        let mut app = make_app();
+        app.handle_key_event(press_key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.last_exit_key_warning.is_some());
+        assert!(!app.should_exit);
+        app.handle_key_event(press_key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.should_exit);
     }
 }

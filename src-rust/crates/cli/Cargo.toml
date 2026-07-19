@@ -7,8 +7,12 @@ edition.workspace = true
 name = "claurst"
 path = "src/main.rs"
 
+[features]
+default = ["voice"]
+voice = ["claurst-core/voice", "claurst-tui/voice"]
+
 [dependencies]
-claurst-core = { workspace = true, features = ["voice"] }
+claurst-core = { workspace = true }
 claurst-api = { workspace = true }
 claurst-acp = { workspace = true }
 claurst-tools = { workspace = true }
@@ -39,6 +43,7 @@ base64 = "0.22"
 sha2 = "0.10"
 open = "5"
 urlencoding = "2"
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
 
 [build-dependencies]
 chrono = { workspace = true }

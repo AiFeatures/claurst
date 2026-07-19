@@ -1,8 +1,14 @@
+<div align="center">
+
 # Claurst
+
+<img src="../public/Ship.png" alt="Rustle on the ship" width="350" />
 
 Claurst is a high-performance Rust reimplementation of Claude Code — a terminal-native AI coding agent with streaming responses, 40+ built-in tools, 15+ LLM provider integrations, a full ratatui TUI, and an extensible plugin system.
 
-> **Version:** 0.0.9 · **License:** GPL-3.0 · [GitHub](https://github.com/Kuberwastaken/claurst)
+**Version:** 0.1.7 (Beta) · **License:** GPL-3.0 · [GitHub](https://github.com/Kuberwastaken/claurst)
+
+</div>
 
 ---
 
@@ -38,26 +44,46 @@ Anthropic Claude (default), OpenAI, Google Gemini, AWS Bedrock, Azure OpenAI, Ol
 ### AMOLED terminal UI
 A ratatui-based TUI with real-time streaming, syntax-highlighted code blocks, diff viewer, permission dialogs, slash command autocomplete, session browser, and a full keybinding system.
 
+### Multi-account credentials
+Store multiple named Anthropic (Claude.ai / Console) and Codex (ChatGPT) accounts in one install and switch between them instantly with `/switch` or `claurst auth switch <id>`. Identity is detected from the OAuth JWT, so re-logging-in the same account is idempotent. See [Authentication](auth#multi-account-profiles).
+
+### @file injection
+Type `@path/to/file` anywhere in a prompt to inject the file's contents inline. Typeahead autocomplete suggests paths as you type, with size/binary safety checks before submit. See [@file Injection](keybindings#file-injection-with-typeahead).
+
 ### Plugin system
 Extend Claurst with TOML-manifest plugins that add custom slash commands, MCP servers, hooks, output styles, and tool overlays.
 
 ### Multi-agent orchestration
 Run named agents (`build`, `plan`, `explore`) or spawn parallel sub-agents in coordinator mode. Agents communicate via a shared task registry and message channels.
 
+### Goal system
+Set a durable objective with `/goal` and Claurst works autonomously across turns until the goal is verified complete — using the `GoalCompleteTool` for audited completion rather than just stopping.
+
+### Managed agents (preview)
+Configure a manager-executor architecture with `/managed-agents` where a manager model delegates subtasks to parallel executor agents with full budget split controls.
+
+### Speech modes
+Activate `/caveman` or `/rocky` to compress model responses by 40–85%, saving tokens in long sessions. Deactivate with `/normal`.
+
 ---
 
 ## Quick start
 
-**1. Download and install**
+**1. Install**
 
 ```bash
-# macOS (Apple Silicon)
-curl -Lo claurst.tar.gz \
-  https://github.com/Kuberwastaken/claurst/releases/latest/download/claurst-macos-aarch64.tar.gz
-tar xzf claurst.tar.gz && chmod +x claurst && sudo mv claurst /usr/local/bin/
+# Linux / macOS
+curl -fsSL https://github.com/Kuberwastaken/claurst/releases/latest/download/install.sh | bash
 ```
 
-See [Installation](installation) for all platforms.
+```powershell
+# Windows (PowerShell)
+irm https://github.com/Kuberwastaken/claurst/releases/latest/download/install.ps1 | iex
+```
+
+The installer auto-detects your platform/arch, drops `claurst` into
+`~/.claurst/bin/`, and adds it to your `PATH`. See
+[Installation](installation) for flags, manual download, and uninstall steps.
 
 **2. Set your API key**
 
@@ -108,7 +134,9 @@ claurst --provider ollama --model llama3.2
 OPENAI_API_KEY=sk-... claurst --provider openai --model gpt-4o
 ```
 
-See [Providers](providers) for setup instructions for every supported provider.
+See [Providers](providers) for setup instructions for every supported provider,
+or the [Local Models](local-models) guide for running against llama.cpp,
+LM Studio, Ollama, or any OpenAI-compatible server on your own machine.
 
 ---
 
@@ -132,10 +160,25 @@ Inside the interactive TUI, type `/` to see all available commands. Common ones:
 |---------|-------------|
 | `/help` | Show all commands |
 | `/model` | Switch model or provider |
+| `/login` | OAuth login (Anthropic; `--codex` for ChatGPT, `--label <name>` to name) |
+| `/accounts` | List stored Anthropic + Codex accounts |
+| `/switch <id>` | Switch active account (`--codex` for Codex) |
+| `/logout` | Clear credentials for the active account (`--all` to purge) |
+| `/goal <objective>` | Set an autonomous multi-turn goal |
+| `/managed-agents` | Configure manager-executor agents |
 | `/compact` | Compress conversation history |
 | `/cost` | Token usage and cost for this session |
+| `/insights` | Session statistics and tool usage report |
+| `/caveman` | Activate telegraphic speech mode (save tokens) |
+| `/rocky` | Activate Rocky (Project Hail Mary) speech mode |
+| `/normal` | Deactivate speech modes |
 | `/rewind` | Go back to a previous message |
+| `/copy` | Copy last response to clipboard |
 | `/export` | Save session transcript |
+| `/think-back` | View thinking traces from previous responses |
+| `/ultrareview` | Exhaustive multi-dimensional code review |
+| `/advisor <model>` | Set a secondary advisor model |
+| `/sandbox-toggle` | Toggle sandboxed shell execution |
 | `/update` | Check for and download updates |
 | `/exit` | Quit |
 
@@ -151,6 +194,7 @@ See [Slash Commands](commands) for the complete reference.
 - [Slash Commands](commands) — all 70+ commands
 - [Tools Reference](tools) — all 40+ tools and permission levels
 - [Providers](providers) — configuring each LLM provider
+- [Local Models](local-models) — llama.cpp, LM Studio, Ollama, and other OpenAI-compatible servers
 - [MCP Integration](mcp) — Model Context Protocol servers
 - [Plugins](plugins) — building and using plugins
 - [Agents](agents) — multi-agent orchestration
