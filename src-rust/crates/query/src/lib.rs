@@ -1611,8 +1611,10 @@ pub async fn run_query_loop(
                 }
                 // Pass a clone so the live conversation survives a failed
                 // compaction; `*messages` is only overwritten on success (#213).
+                let summariser = anthropic_summariser(client);
                 let outcome =
-                    compact::context_collapse(messages.clone(), client, config).await;
+                    compact::context_collapse(messages.clone(), &summariser, &effective_model)
+                        .await;
                 match apply_compact_result(messages, outcome) {
                     Ok(tokens_freed) => {
                         info!(tokens_freed, "Context-collapse complete");
@@ -1628,10 +1630,11 @@ pub async fn run_query_loop(
                 }
                 // Pass a clone so the live conversation survives a failed
                 // compaction; `*messages` is only overwritten on success (#213).
+                let summariser = anthropic_summariser(client);
                 let outcome = compact::reactive_compact(
                     messages.clone(),
-                    client,
-                    config,
+                    &summariser,
+                    &effective_model,
                     cancel_token.clone(),
                     &[],
                 )
@@ -1649,13 +1652,16 @@ pub async fn run_query_loop(
                     }
                 }
             }
-        } else if stop == "end_turn" || stop == "tool_use" {
+        } else if (stop == "end_turn" || stop == "tool_use")
+            && compact::should_auto_compact_for_window(context_tokens, context_window, &compact_state)
+        {
             // Proactive auto-compact (original path, used when reactive compact is off).
+            let summariser = anthropic_summariser(client);
             if let Some(new_msgs) = compact::auto_compact_if_needed(
-                client,
+                &summariser,
+                &effective_model,
                 messages,
                 context_tokens,
-                &config.model,
                 context_window,
                 &mut compact_state,
             )
@@ -2074,6 +2080,13 @@ pub async fn run_query_loop(
             }
         }
     }
+}
+
+/// Wrap the loop's Anthropic client as an [`claurst_api::LlmProvider`] so the
+/// raw-client branch summarises through the same provider-agnostic path as
+/// every other provider. Built only when a compaction is about to run.
+fn anthropic_summariser(client: &claurst_api::AnthropicClient) -> claurst_api::AnthropicProvider {
+    claurst_api::AnthropicProvider::new(Arc::new(client.clone()))
 }
 
 /// Stream handler that forwards events to an unbounded channel.
