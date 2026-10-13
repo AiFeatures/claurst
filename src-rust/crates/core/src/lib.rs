@@ -1121,6 +1121,12 @@ pub mod config {
         /// Keyboard scrolling (PageUp/PageDown, etc.) is unaffected either way.
         #[serde(default, rename = "mouseCapture", skip_serializing_if = "Option::is_none")]
         pub mouse_capture: Option<bool>,
+        /// Whether the max-steps graceful degradation summary turn is enabled.
+        /// `None` (default) or `Some(true)` means exceeding `max_turns` runs one
+        /// final tool-less turn asking the model to summarize progress. `Some(false)`
+        /// makes the loop return cold (last assistant message) immediately.
+        #[serde(default, rename = "degradationSummaryEnabled", skip_serializing_if = "Option::is_none")]
+        pub degradation_summary_enabled: Option<bool>,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -1411,6 +1417,12 @@ pub mod config {
         /// and copy/paste (issue #104).
         pub fn mouse_capture_enabled(&self) -> bool {
             self.mouse_capture.unwrap_or(true)
+        }
+
+        /// Whether the max-steps degradation summary turn runs when `max_turns`
+        /// is exceeded. Defaults to `true` (enabled) when the setting is unset.
+        pub fn degradation_summary_enabled_or_default(&self) -> bool {
+            self.degradation_summary_enabled.unwrap_or(true)
         }
 
         pub fn selected_provider_id(&self) -> &str {
@@ -1998,6 +2010,7 @@ pub mod config {
                 file_injection_enabled: over.config.file_injection_enabled || base.config.file_injection_enabled,
                 file_injection_max_size: if over.config.file_injection_max_size != 0 { over.config.file_injection_max_size } else { base.config.file_injection_max_size },
                 request_timeout_secs: over.config.request_timeout_secs.or(base.config.request_timeout_secs),
+                degradation_summary_enabled: over.config.degradation_summary_enabled.or(base.config.degradation_summary_enabled),
             };
             Self {
                 config: merged_config,
@@ -4763,6 +4776,42 @@ mod tests {
         let back: crate::config::Config = serde_json::from_str(&json).unwrap();
         assert_eq!(back.mouse_capture, Some(false));
         assert!(!back.mouse_capture_enabled());
+    }
+
+    #[test]
+    fn test_config_degradation_summary_defaults_on() {
+        // Unset (None) must read as enabled: a fresh install with no
+        // settings.json keeps the degradation summary turn.
+        let cfg = crate::config::Config::default();
+        assert_eq!(cfg.degradation_summary_enabled, None);
+        assert!(cfg.degradation_summary_enabled_or_default());
+    }
+
+    #[test]
+    fn test_config_degradation_summary_explicit_off_and_serde_roundtrip() {
+        let cfg = crate::config::Config {
+            degradation_summary_enabled: Some(false),
+            ..Default::default()
+        };
+        assert!(!cfg.degradation_summary_enabled_or_default());
+
+        // Unset round-trips as None and is omitted from serialized JSON so
+        // existing settings files stay unchanged.
+        let json = serde_json::to_string(&crate::config::Config::default()).unwrap();
+        assert!(!json.contains("degradationSummaryEnabled"));
+        let back: crate::config::Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.degradation_summary_enabled, None);
+
+        // Explicit off serializes the camelCase key and round-trips.
+        let cfg = crate::config::Config {
+            degradation_summary_enabled: Some(false),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains("\"degradationSummaryEnabled\":false"));
+        let back: crate::config::Config = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.degradation_summary_enabled, Some(false));
+        assert!(!back.degradation_summary_enabled_or_default());
     }
 
     #[test]
