@@ -12,6 +12,7 @@ pub(super) const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("advisor", "Set or unset the server-side advisor model"),
     ("agent", "List available agents or show agent details"),
     ("agents", "Browse agent definitions and active agents"),
+    ("cc-statusline", "Show the external status line configuration"),
     ("changes", "Inspect changes from the current session"),
     ("clear", "Clear the conversation transcript"),
     ("compact", "Compact the conversation context"),
@@ -77,7 +78,8 @@ pub(super) fn help_command_category(name: &str) -> &'static str {
         "yolo" => "Permissions",
         "changes" | "diff" | "review" | "rewind" | "export" | "copy" | "share" | "links" => "Review & History",
         "stats" | "cost" | "context" | "insights" | "heapdump" | "doctor" => "Diagnostics",
-        "config" | "settings" | "theme" | "keybindings" | "hooks" | "mcp" | "import-config" => {
+        "config" | "settings" | "theme" | "keybindings" | "hooks" | "mcp" | "import-config"
+        | "cc-statusline" => {
             "Workspace"
         }
         "agent" | "agents" | "memory" | "plugin" | "survey" | "turns" => "Tools",
@@ -308,6 +310,24 @@ impl App {
                 self.fast_mode = !self.fast_mode;
                 let status = if self.fast_mode { "enabled" } else { "disabled" };
                 self.status_message = Some(format!("Fast mode {}.", status));
+                true
+            }
+            "cc-statusline" | "cc-status-line" => {
+                match &self.config.status_line {
+                    Some(sl) => {
+                        let interval = sl.poll_interval_ms.unwrap_or(5000);
+                        let padding = sl.padding.unwrap_or(0);
+                        self.status_message = Some(format!(
+                            "External statusLine active · command: {} · interval: {}ms · padding: {}",
+                            sl.command, interval, padding,
+                        ));
+                    }
+                    None => {
+                        self.status_message = Some(
+                            "No external statusLine configured. Set \"statusLine\": { \"command\": \"...\" } in ~/.claurst/settings.json".to_string(),
+                        );
+                    }
+                }
                 true
             }
             "plan" => {

@@ -467,6 +467,13 @@ use super::types::{ContextMenuItem, ContextMenuState};
     }
 
     #[test]
+    fn test_cc_statusline_slash_command() {
+        let mut app = make_app();
+        assert!(app.intercept_slash_command("cc-statusline"));
+        assert!(app.status_message.as_deref().is_some_and(|m| m.contains("No external statusLine configured")));
+    }
+
+    #[test]
     fn test_yolo_on_shows_dialog_and_accept_activates() {
         let mut app = make_app();
         assert!(app.intercept_slash_command_with_args("yolo", "on"));

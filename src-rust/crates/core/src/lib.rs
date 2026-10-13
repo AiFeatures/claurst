@@ -1134,6 +1134,107 @@ pub mod config {
         /// makes the loop return cold (last assistant message) immediately.
         #[serde(default, rename = "degradationSummaryEnabled", skip_serializing_if = "Option::is_none")]
         pub degradation_summary_enabled: Option<bool>,
+        /// External status line command configuration. When set, the command is
+        /// polled periodically and its stdout is shown in a status bar row.
+        #[serde(default, rename = "statusLine", alias = "status_line", skip_serializing_if = "Option::is_none")]
+        pub status_line: Option<StatusLineConfig>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct StatusLineConfig {
+        /// Shell command to execute. Receives session JSON on stdin.
+        pub command: String,
+        /// Poll interval in milliseconds (default: 5000, clamped to 1000-300000 at use-site).
+        #[serde(
+            default,
+            rename = "pollIntervalMs",
+            alias = "poll_interval_ms",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub poll_interval_ms: Option<u64>,
+        /// Horizontal padding (in spaces) around the status text (default: 0).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub padding: Option<u16>,
+        /// Maximum number of lines the status output can occupy (default: 10).
+        #[serde(
+            default,
+            rename = "maxLines",
+            alias = "max_lines",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub max_lines: Option<u16>,
+    }
+
+    #[cfg(test)]
+    mod status_line_tests {
+        use super::*;
+        #[test]
+        fn deserialize_status_line_config() {
+            let json = r#"{"command": "date", "pollIntervalMs": 1000, "padding": 1}"#;
+            let sl: StatusLineConfig = serde_json::from_str(json).unwrap();
+            assert_eq!(sl.command, "date");
+            assert_eq!(sl.poll_interval_ms, Some(1000));
+            assert_eq!(sl.padding, Some(1));
+            assert_eq!(sl.max_lines, None);
+        }
+        #[test]
+        fn deserialize_status_line_config_with_max_lines() {
+            let json = r#"{"command": "date", "maxLines": 5}"#;
+            let sl: StatusLineConfig = serde_json::from_str(json).unwrap();
+            assert_eq!(sl.max_lines, Some(5));
+        }
+        #[test]
+        fn deserialize_status_line_in_settings() {
+            // `Config` has no blanket `#[serde(default)]`, so `statusLine` is
+            // added to an otherwise complete settings file, as written by `save()`.
+            let mut value = serde_json::to_value(Settings::default()).unwrap();
+            value["config"]["statusLine"] = serde_json::json!({
+                "command": "date '+%H:%M:%S'",
+                "pollIntervalMs": 1000,
+                "padding": 1
+            });
+            let settings: Settings = serde_json::from_value(value).unwrap();
+            let sl = settings.config.status_line.unwrap();
+            assert_eq!(sl.command, "date '+%H:%M:%S'");
+            assert_eq!(sl.poll_interval_ms, Some(1000));
+        }
+        #[test]
+        fn unset_status_line_is_not_serialized() {
+            let value = serde_json::to_value(Settings::default()).unwrap();
+            assert!(value["config"].get("statusLine").is_none());
+        }
+        #[test]
+        fn project_cannot_override_global_status_line() {
+            let global = Settings {
+                config: Config {
+                        status_line: Some(StatusLineConfig {
+                            command: "global-cmd".into(),
+                            poll_interval_ms: Some(5000),
+                            padding: Some(1),
+                            max_lines: None,
+                        }),
+                    ..Config::default()
+                },
+                ..Settings::default()
+            };
+            let project = Settings {
+                config: Config {
+                    status_line: Some(StatusLineConfig {
+                        command: "malicious-cmd".into(),
+                        poll_interval_ms: Some(1000),
+                        padding: None,
+                        max_lines: None,
+                    }),
+                    ..Config::default()
+                },
+                ..Settings::default()
+            };
+            let merged = Settings::merge(global.clone(), project);
+            let sl = merged.config.status_line.unwrap();
+            assert_eq!(sl.command, "global-cmd", "project must not override global status_line command");
+            assert_eq!(sl.poll_interval_ms, Some(5000));
+            assert_eq!(sl.padding, Some(1));
+        }
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -2025,6 +2126,11 @@ pub mod config {
                 file_injection_enabled: over.config.file_injection_enabled || base.config.file_injection_enabled,
                 file_injection_max_size: if over.config.file_injection_max_size != 0 { over.config.file_injection_max_size } else { base.config.file_injection_max_size },
                 request_timeout_secs: over.config.request_timeout_secs.or(base.config.request_timeout_secs),
+                // SECURITY: only the user's global settings may define a status_line
+                // command. A project's settings file must NOT be able to inject an
+                // arbitrary shell command — otherwise cloning a malicious repo would
+                // grant immediate RCE via sh -c execution.
+                status_line: base.config.status_line,
                 degradation_summary_enabled: over.config.degradation_summary_enabled.or(base.config.degradation_summary_enabled),
             };
             Self {

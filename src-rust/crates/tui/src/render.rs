@@ -590,6 +590,11 @@ pub fn render_app(frame: &mut Frame, app: &App) {
         input_height(&app.prompt_input, prompt_text_width) + 1 // +1 for model/mode status line
     };
 
+    // Already stripped and capped to `maxLines` by `App::set_status_line_output`.
+    let status_line_height: u16 = app
+        .status_line_override
+        .as_deref()
+        .map_or(0, |text| u16::try_from(text.lines().count().max(1)).unwrap_or(u16::MAX));
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -598,6 +603,7 @@ pub fn render_app(frame: &mut Frame, app: &App) {
             Constraint::Length(status_height),
             Constraint::Length(prompt_height),
             Constraint::Length(suggestions_height),
+            Constraint::Length(status_line_height),
             Constraint::Length(1),
         ])
         .split(size);
@@ -624,7 +630,10 @@ pub fn render_app(frame: &mut Frame, app: &App) {
     if suggestions_height > 0 {
         render_prompt_suggestions(frame, app, chunks[4]);
     }
-    render_footer(frame, app, chunks[5]);
+    if status_line_height > 0 {
+        render_status_line_override(frame, app, chunks[5]);
+    }
+    render_footer(frame, app, chunks[6]);
 
     // Overlays (rendered on top in Z-order)
 
@@ -2787,19 +2796,6 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             ));
         }
 
-        // External status line override
-        if let Some(ref override_text) = app.status_line_override {
-            if !parts.is_empty() {
-                parts.push(Span::raw("  "));
-            }
-            // Strip any ANSI escapes for terminal rendering (plain text)
-            let clean: String = override_text
-                .chars()
-                .filter(|c| c.is_ascii_graphic() || *c == ' ')
-                .collect();
-            parts.push(Span::styled(clean, Style::default().fg(Color::DarkGray)));
-        }
-
         // 8. Bridge badge
         if let Some(badge) = app.bridge_state.status_badge(app.frame_count) {
             if !parts.is_empty() {
@@ -2842,6 +2838,115 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         height: footer_area.height,
     };
     frame.render_widget(Paragraph::new(vec![Line::from(spans)]), padded_area);
+}
+
+/// Strip ANSI escape sequences, C0 controls (except \n) and C1 controls from
+/// text, turning tabs into spaces, returning clean plain text.
+pub(crate) fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    while i < len {
+        let c = bytes[i];
+        if c == 0x1b {
+            // Escape sequence
+            i += 1;
+            if i >= len {
+                break;
+            }
+            match bytes[i] {
+                b'[' => {
+                    // CSI: consume until final byte (0x40-0x7E)
+                    i += 1;
+                    while i < len {
+                        let b = bytes[i];
+                        i += 1;
+                        if b.is_ascii_uppercase() || b.is_ascii_lowercase() || b == b'~' {
+                            break;
+                        }
+                    }
+                }
+                b']' => {
+                    // OSC: consume until BEL (0x07) or ST (\x1b\\)
+                    i += 1;
+                    while i < len {
+                        let b = bytes[i];
+                        i += 1;
+                        if b == 0x07 {
+                            break;
+                        }
+                        if b == 0x1b && i < len && bytes[i] == b'\\' {
+                            i += 1;
+                            break;
+                        }
+                    }
+                }
+                _ => {
+                    // Unknown escape: consume until a letter
+                    while i < len {
+                        let b = bytes[i];
+                        i += 1;
+                        if b.is_ascii_uppercase() || b.is_ascii_lowercase() {
+                            break;
+                        }
+                    }
+                }
+            }
+        } else if c.is_ascii_control() && c != b'\n' && c != b'\t' {
+            i += 1;
+        } else if c == b'\t' {
+            // A raw tab would make the terminal jump to the next tab stop.
+            out.push(' ');
+            i += 1;
+        } else {
+            // Multi-byte UTF-8: copy the full character, dropping C1 controls
+            // (U+0080..U+009F), which terminals may interpret.
+            let char_len = utf8_char_len(c);
+            let ch = core::str::from_utf8(&bytes[i..i + char_len]).unwrap_or("�");
+            out.extend(ch.chars().filter(|ch| !('\u{80}'..='\u{9f}').contains(ch)));
+            i += char_len;
+        }
+    }
+    out
+}
+
+/// Length of a UTF-8 character in bytes given its leading byte.
+fn utf8_char_len(lead: u8) -> usize {
+    if lead & 0x80 == 0 {
+        1
+    } else if lead & 0xE0 == 0xC0 {
+        2
+    } else if lead & 0xF0 == 0xE0 {
+        3
+    } else {
+        4
+    }
+}
+
+fn render_status_line_override(frame: &mut Frame, app: &App, area: Rect) {
+    if area.height == 0 {
+        return;
+    }
+    let text = app.status_line_override.as_deref().unwrap_or("");
+    let padding = app.config.status_line.as_ref().and_then(|s| s.padding).unwrap_or(0);
+    let pad = padding.min(area.width.saturating_div(2));
+    let content_width = area.width.saturating_sub(pad.saturating_mul(2));
+    if content_width == 0 {
+        return;
+    }
+    let padded = Rect {
+        x: area.x.saturating_add(pad),
+        y: area.y,
+        width: content_width,
+        height: area.height,
+    };
+    let style = Style::default().fg(Color::DarkGray);
+    let lines: Vec<Line> = text
+        .lines()
+        .map(|l| Line::from(Span::styled(truncate_end(l, usize::from(content_width)), style)))
+        .collect();
+    frame.render_widget(Paragraph::new(lines), padded);
 }
 
 fn render_prompt_suggestions(frame: &mut Frame, app: &App, area: Rect) {
@@ -3909,5 +4014,106 @@ mod recent_activity_tests {
             .collect();
         assert!(screen.contains("Recent activity"), "header rendered: present");
         assert!(screen.contains("Sortable label"), "session label rendered");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// External status line (`statusLine` setting)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod status_line_tests {
+    use super::*;
+    use crate::app::App;
+    use claurst_core::config::{Config, StatusLineConfig};
+    use claurst_core::cost::CostTracker;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    fn app_with_status_line(padding: Option<u16>, max_lines: Option<u16>) -> App {
+        let config = Config {
+            status_line: Some(StatusLineConfig {
+                command: "true".into(),
+                poll_interval_ms: None,
+                padding,
+                max_lines,
+            }),
+            ..Config::default()
+        };
+        App::new(config, CostTracker::new())
+    }
+
+    fn rows(terminal: &Terminal<TestBackend>) -> Vec<String> {
+        let buf = terminal.backend().buffer();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol().to_string()))
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn status_line_truncation_is_display_width_aware() {
+        assert_eq!(truncate_end("abc", 3), "abc");
+        assert_eq!(truncate_end("abcdefghij", 8), "abcdefg\u{2026}");
+        // Wide (2-cell) CJK chars: the result never exceeds the width.
+        let out = truncate_end("\u{65e5}\u{672c}\u{8a9e}\u{30c6}\u{30ad}", 7);
+        assert_eq!(out, "\u{65e5}\u{672c}\u{8a9e}\u{2026}");
+        assert!(UnicodeWidthStr::width(out.as_str()) <= 7);
+    }
+
+    #[test]
+    fn strip_ansi_removes_escapes_and_controls() {
+        let raw = "\x1b[1;32mgreen\x1b[0m \x1b]8;;https://x\x07link\x1b]8;;\x1b\\\x08\nnext\ttab";
+        assert_eq!(strip_ansi(raw), "green link\nnext tab");
+    }
+
+    #[test]
+    fn strip_ansi_drops_c1_controls() {
+        assert_eq!(strip_ansi("a\u{85}b\u{9b}31mc\u{e9}"), "ab31mc\u{e9}");
+    }
+
+    #[test]
+    fn set_status_line_output_strips_and_caps_lines() {
+        let mut app = app_with_status_line(None, Some(2));
+        app.set_status_line_output("\x1b[31mone\x1b[0m\ntwo\nthree");
+        assert_eq!(app.status_line_override.as_deref(), Some("one\ntwo"));
+        app.set_status_line_output("\x1b[0m");
+        assert!(app.status_line_override.is_none());
+    }
+
+    #[test]
+    fn status_line_padding_and_truncation_render() {
+        let mut app = app_with_status_line(Some(3), None);
+        app.set_status_line_output("abcdefghijklmnopqrstuvwxyz");
+        let mut terminal = Terminal::new(TestBackend::new(20, 1)).unwrap();
+        terminal
+            .draw(|f| render_status_line_override(f, &app, f.area()))
+            .unwrap();
+        assert_eq!(rows(&terminal)[0], "   abcdefghijklm\u{2026}   ");
+    }
+
+    #[test]
+    fn status_line_padding_larger_than_terminal_does_not_panic() {
+        let mut app = app_with_status_line(Some(u16::MAX), None);
+        app.set_status_line_output("status");
+        for width in [1, 2, 7] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+            terminal
+                .draw(|f| render_status_line_override(f, &app, f.area()))
+                .unwrap();
+            // Padding is clamped to half the width: at most one cell remains.
+            assert!(rows(&terminal)[0].trim().chars().count() <= 1);
+        }
+    }
+
+    #[test]
+    fn status_line_renders_above_footer_in_full_layout() {
+        let mut app = app_with_status_line(None, None);
+        app.set_status_line_output("ext-status-ok");
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| render_app(f, &app)).unwrap();
+        assert!(rows(&terminal).iter().any(|r| r.contains("ext-status-ok")));
     }
 }
