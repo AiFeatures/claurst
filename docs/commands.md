@@ -290,6 +290,16 @@ Setting persists to `~/.claurst/ui-settings.json`.
 
 ---
 
+### /turns
+
+Set or disable the max turn limit for the current session. The override takes precedence over both the agent definition (e.g. the `plan` agent's built-in cap) and the `max_turns` config value. `/turns off` is not unlimited: it sets a ceiling of 1000 turns so a runaway loop still stops. `/turns 0` is rejected. Session-only: it is not persisted and resets on relaunch.
+
+```
+/turns         — show the current cap (override or config/agent default)
+/turns 25      — cap the loop at 25 turns
+/turns off     — lift the cap to a ceiling of 1000 turns
+```
+
 ### /yolo
 
 Toggle YOLO mode. In YOLO mode the effective permission mode is

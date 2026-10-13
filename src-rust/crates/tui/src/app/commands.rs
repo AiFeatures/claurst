@@ -62,6 +62,7 @@ pub(super) const PROMPT_SLASH_COMMANDS: &[(&str, &str)] = &[
     ("stats", "Open token and cost stats"),
     ("survey", "Open session feedback survey"),
     ("theme", "Open the theme picker"),
+    ("turns", "Set the max turn limit for this session, e.g. /turns 25, or /turns off for a 1000-turn ceiling"),
     ("ultrareview", "Run an exhaustive multi-dimensional code review"),
     ("update", "Check for updates and upgrade to the latest version"),
     ("upgrade", "Check for updates and upgrade to the latest version"),
@@ -79,7 +80,7 @@ pub(super) fn help_command_category(name: &str) -> &'static str {
         "config" | "settings" | "theme" | "keybindings" | "hooks" | "mcp" | "import-config" => {
             "Workspace"
         }
-        "agent" | "agents" | "memory" | "plugin" | "survey" => "Tools",
+        "agent" | "agents" | "memory" | "plugin" | "survey" | "turns" => "Tools",
         "session" | "resume" | "rename" | "fork" | "clear" | "new" | "move" | "compact"
         | "quit" | "exit" => "Session",
         _ => "Commands",
@@ -97,6 +98,10 @@ pub(super) fn help_overlay_entries() -> Vec<HelpEntry> {
         })
         .collect()
 }
+
+/// Turn cap applied by `/turns off`. Deliberately finite so a runaway loop
+/// still terminates (and still gets its degradation summary turn).
+const TURNS_OFF_CEILING: u32 = 1000;
 
 impl App {
     /// Handle `/yolo [on|off]`. Toggles YOLO mode (bypass all permission
@@ -147,6 +152,34 @@ impl App {
     /// Handle slash commands that should open UI screens rather than execute
     /// as normal commands. Returns `true` if the command was intercepted.
     pub fn intercept_slash_command_with_args(&mut self, cmd: &str, args: &str) -> bool {
+        if cmd == "turns" {
+            let args = args.trim();
+            if args.is_empty() {
+                let msg = match self.max_turns_override {
+                    Some(TURNS_OFF_CEILING) => format!(
+                        "Max turns: off (ceiling of {} turns) for this session.",
+                        TURNS_OFF_CEILING
+                    ),
+                    Some(n) => format!("Max turns: {} (session override).", n),
+                    None => "Max turns: using config/agent default.".to_string(),
+                };
+                self.status_message = Some(msg);
+            } else if args == "off" || args == "disable" {
+                self.max_turns_override = Some(TURNS_OFF_CEILING);
+                self.status_message = Some(format!(
+                    "Max turns off (ceiling of {} turns) for this session.",
+                    TURNS_OFF_CEILING
+                ));
+            } else if let Some(n) = args.parse::<u32>().ok().filter(|&n| n > 0) {
+                self.max_turns_override = Some(n);
+                self.status_message = Some(format!("Max turns set to {} for this session.", n));
+            } else {
+                self.status_message = Some(
+                    "Usage: /turns <positive number> | off | (blank to show current).".to_string(),
+                );
+            }
+            return true;
+        }
         if cmd == "yolo" {
             self.handle_yolo_command(args.trim());
             return true;

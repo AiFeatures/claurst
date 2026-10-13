@@ -3046,6 +3046,8 @@ async fn run_interactive(
                         let mut qcfg = base_query_config.clone();
                         qcfg.model = claurst_api::effective_model_for_config(&cmd_ctx.config, &model_registry);
                         qcfg.max_tokens = cmd_ctx.config.effective_max_tokens();
+                        // Session-local /turns override wins over agent and config caps.
+                        qcfg.max_turns_override = app.max_turns_override;
                         qcfg.append_system_prompt = cmd_ctx.config.append_system_prompt.clone();
                         qcfg.system_prompt = base_query_config.system_prompt.clone();
                         qcfg.output_style = cmd_ctx.config.effective_output_style();
@@ -3405,6 +3407,8 @@ async fn run_interactive(
                 let mut qcfg = base_query_config.clone();
                 qcfg.model = claurst_api::effective_model_for_config(&cmd_ctx.config, &model_registry);
                 qcfg.max_tokens = cmd_ctx.config.effective_max_tokens();
+                // Session-local /turns override wins over agent and config caps.
+                qcfg.max_turns_override = app.max_turns_override;
                 // Auto-compact is a maintenance turn, not a goal turn: never let
                 // it trigger in-loop goal continuation.
                 qcfg.continuation = claurst_query::ContinuationMode::Default;
@@ -3561,6 +3565,8 @@ async fn run_interactive(
                         let mut qcfg = base_query_config.clone();
                         qcfg.model = claurst_api::effective_model_for_config(&cmd_ctx.config, &model_registry);
                         qcfg.max_tokens = cmd_ctx.config.effective_max_tokens();
+                        // Session-local /turns override wins over agent and config caps.
+                        qcfg.max_turns_override = app.max_turns_override;
                         let tracker = cost_tracker.clone();
                         let tx = event_tx.clone();
                         let client_clone = client.clone();
@@ -3669,6 +3675,8 @@ async fn run_interactive(
                 let mut qcfg = base_query_config.clone();
                 qcfg.model = claurst_api::effective_model_for_config(&cmd_ctx.config, &model_registry);
                 qcfg.max_tokens = cmd_ctx.config.effective_max_tokens();
+                // Session-local /turns override wins over agent and config caps.
+                qcfg.max_turns_override = app.max_turns_override;
                 let tracker = cost_tracker.clone();
                 let tx = event_tx.clone();
                 let client_clone = client.clone();

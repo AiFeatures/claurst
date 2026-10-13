@@ -348,6 +348,9 @@ impl Tool for AgentTool {
             model,
             max_tokens: claurst_core::constants::DEFAULT_MAX_TOKENS,
             max_turns: resolved_max_turns,
+            // Sub-agents run under their own resolved cap, not the parent
+            // session's /turns override.
+            max_turns_override: None,
             system_prompt: Some(system_prompt),
             append_system_prompt: None,
             output_style: ctx.config.effective_output_style(),
