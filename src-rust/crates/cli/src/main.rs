@@ -1882,6 +1882,10 @@ async fn run_interactive(
 
     // Set up terminal
     let mut terminal = setup_terminal(live_config.mouse_capture_enabled())?;
+    // Restore the terminal on SIGINT / SIGTERM / SIGHUP / SIGQUIT. Raw mode,
+    // the kitty keyboard stack, bracketed paste and mouse capture are process
+    // state that would otherwise outlive a signalled exit and garble the shell.
+    claurst_tui::spawn_signal_restore_watchers();
     let mut app = App::new(live_config.clone(), cost_tracker.clone());
     if let Some(error) = settings_load_error {
         app.invalid_config_dialog =
