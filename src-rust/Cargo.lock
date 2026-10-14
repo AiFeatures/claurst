@@ -867,6 +867,7 @@ dependencies = [
  "cpal",
  "dashmap",
  "dirs",
+ "fslock",
  "futures",
  "getrandom 0.2.17",
  "glob",
