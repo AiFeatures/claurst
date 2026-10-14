@@ -68,6 +68,7 @@ impl AgentRuntime {
             api_key: api_key.clone(),
             api_base: config.resolve_anthropic_api_base(),
             use_bearer_auth,
+            retry: claurst_api::RetryConfig::with_max_retries(config.max_retries),
             ..Default::default()
         };
         let api_client = Arc::new(claurst_api::AnthropicClient::new(client_config.clone())?);

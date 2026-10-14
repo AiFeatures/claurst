@@ -45,7 +45,7 @@ pub(crate) fn claude_error_is_overflow(err: &ClaudeError) -> bool {
     match err {
         ClaudeError::ContextWindowExceeded => true,
         ClaudeError::RateLimit => false,
-        _ if err.is_retryable() => false,
+        _ if claurst_api::retry::classify_claude_error(err).is_retry() => false,
         _ => claurst_api::is_context_overflow(&err.to_string()),
     }
 }

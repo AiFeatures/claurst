@@ -121,7 +121,12 @@ pub mod error {
         Api(String),
 
         #[error("API error {status}: {message}")]
-        ApiStatus { status: u16, message: String },
+        ApiStatus {
+            status: u16,
+            message: String,
+            /// Server-requested wait (`retry-after-ms` / `Retry-After`), if any.
+            retry_after: Option<std::time::Duration>,
+        },
 
         #[error("Authentication error: {0}")]
         Auth(String),
@@ -167,16 +172,6 @@ pub mod error {
     pub type Result<T> = std::result::Result<T, ClaudeError>;
 
     impl ClaudeError {
-        /// Return `true` when the caller should retry the request.
-        pub fn is_retryable(&self) -> bool {
-            matches!(
-                self,
-                ClaudeError::RateLimit
-                    | ClaudeError::ApiStatus { status: 429, .. }
-                    | ClaudeError::ApiStatus { status: 529, .. }
-            )
-        }
-
         /// Return `true` for errors that mean the conversation cannot continue
         /// without intervention (e.g. compaction or context-window reset).
         pub fn is_context_limit(&self) -> bool {
@@ -1120,6 +1115,16 @@ pub mod config {
             skip_serializing_if = "Option::is_none"
         )]
         pub request_timeout_secs: Option<u64>,
+        /// Retries allowed after a model request fails transiently (HTTP
+        /// 408/409/425/429/5xx, dropped connections, truncated streams).
+        /// `None` uses the default of 5; `0` disables retrying.
+        #[serde(
+            default,
+            rename = "maxRetries",
+            alias = "max_retries",
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub max_retries: Option<u32>,
         /// Whether app-level mouse capture is enabled. `None` (default) or
         /// `Some(true)` means claurst captures the mouse for scroll / right-click
         /// context menu / middle-click paste / drag text-selection. Set
@@ -2156,6 +2161,7 @@ pub mod config {
                 file_injection_enabled: over.config.file_injection_enabled || base.config.file_injection_enabled,
                 file_injection_max_size: if over.config.file_injection_max_size != 0 { over.config.file_injection_max_size } else { base.config.file_injection_max_size },
                 request_timeout_secs: over.config.request_timeout_secs.or(base.config.request_timeout_secs),
+                max_retries: over.config.max_retries.or(base.config.max_retries),
                 // SECURITY: only the user's global settings may define a status_line
                 // command. A project's settings file must NOT be able to inject an
                 // arbitrary shell command — otherwise cloning a malicious repo would
@@ -5292,17 +5298,6 @@ mod tests {
         assert_eq!(tracker.input_tokens(), 1000);
         assert_eq!(tracker.output_tokens(), 500);
         assert!(tracker.total_cost_usd() > 0.0);
-    }
-
-    #[test]
-    fn test_error_retryable() {
-        assert!(ClaudeError::RateLimit.is_retryable());
-        assert!(ClaudeError::ApiStatus {
-            status: 429,
-            message: "rate limited".into()
-        }
-        .is_retryable());
-        assert!(!ClaudeError::Auth("bad key".into()).is_retryable());
     }
 
     // ---- Config tests -------------------------------------------------------
