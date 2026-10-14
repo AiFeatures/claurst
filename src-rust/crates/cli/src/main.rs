@@ -192,7 +192,7 @@ struct Cli {
     #[arg(long = "disable-slash-commands", action = ArgAction::SetTrue)]
     disable_slash_commands: bool,
 
-    /// Run in bare mode (no hooks, no plugins, no AGENTS.md)
+    /// Run in bare mode (no hooks, no plugins, no AGENTS.md, no project skills)
     #[arg(long = "bare", action = ArgAction::SetTrue)]
     bare: bool,
 
@@ -480,6 +480,9 @@ async fn main() -> anyhow::Result<()> {
         // Bare mode runs no event hooks. Drop any hooks resolved from
         // settings so no `run_hooks` call site has anything to execute.
         config.hooks.clear();
+        // Nor does it list or run skills from the repository's own skill
+        // directories (global and bundled skills stay).
+        config.skills.skip_project_dirs = true;
     }
     if let Some(sp) = cli.system_prompt.clone() {
         config.custom_system_prompt = Some(sp);
@@ -529,11 +532,19 @@ async fn main() -> anyhow::Result<()> {
             .api_base = Some(base.clone());
     }
 
+    // AGENTS.md / CLAUDE.md instruction files, loaded once per session and
+    // sent in the cached system block.
+    let instruction_files = if config.disable_claude_mds {
+        Vec::new()
+    } else {
+        claurst_core::claudemd::load_instruction_files(
+            &cwd,
+            &claurst_core::claudemd::default_global_dirs(),
+        )
+    };
+
     // Build context
-    let ctx_builder = ContextBuilder::new(cwd.clone())
-        .disable_claude_mds(config.disable_claude_mds);
-    let system_ctx = ctx_builder.build_system_context().await;
-    let user_ctx = ctx_builder.build_user_context().await;
+    let system_ctx = ContextBuilder::new(cwd.clone()).build_system_context().await;
 
     // Session-stable additions to the default prompt, which
     // `claurst_core::system_prompt::build_system_prompt` assembles on its own
@@ -541,7 +552,7 @@ async fn main() -> anyhow::Result<()> {
     // (it lands in the cached system block); `system_ctx` (git status, IDE
     // context) is passed separately as `session_context` and sent in the
     // dynamic block.
-    let system_prompt = [config.custom_system_prompt.clone(), Some(user_ctx), config.append_system_prompt.clone()]
+    let system_prompt = [config.custom_system_prompt.clone(), config.append_system_prompt.clone()]
         .into_iter()
         .flatten()
         .filter(|part| !part.is_empty())
@@ -569,6 +580,7 @@ async fn main() -> anyhow::Result<()> {
                     .collect(),
             ),
             permission_mode: Some(config.permission_mode.clone()),
+            instruction_files,
             ..Default::default()
         };
         let prompt = claurst_core::system_prompt::build_system_prompt(&opts);
@@ -816,6 +828,24 @@ async fn main() -> anyhow::Result<()> {
     query_config.append_system_prompt = None;
     query_config.session_context = Some(system_ctx);
     query_config.working_directory = Some(cwd.display().to_string());
+    query_config.instruction_files = instruction_files;
+    // Skills are discovered once per session: the listing goes into the
+    // cached system block, so it must not change between turns. Discovery
+    // walks the filesystem and may `git clone` skills.urls, so it runs on the
+    // blocking pool. Headless runs wait for it here; the TUI starts at once
+    // and installs the result when it arrives (see `run_interactive`).
+    let skill_discovery = {
+        let cwd = cwd.clone();
+        let skills_config = config.skills.clone();
+        tokio::task::spawn_blocking(move || claurst_core::SkillRegistry::discover(&cwd, &skills_config))
+    };
+    let skill_discovery = if is_headless {
+        let registry = skill_discovery.await.context("Skill discovery failed")?;
+        query_config.available_skills = registry.listings();
+        None
+    } else {
+        Some(skill_discovery)
+    };
     if let Some(tokens) = cli.thinking {
         query_config.thinking_budget = Some(tokens);
     }
@@ -904,6 +934,7 @@ async fn main() -> anyhow::Result<()> {
             user_question_rx,
             pending_project_mcp,
             mcp_project_root,
+            skill_discovery,
         )
         .await
     };
@@ -1847,6 +1878,17 @@ async fn run_status_line_command(
     }
 }
 
+/// The session's skill listing, once startup discovery has published it.
+/// Returns at once after the first turn. Empty if discovery never reports.
+async fn session_skill_listings(
+    mut listings: tokio::sync::watch::Receiver<Option<Vec<claurst_core::system_prompt::SkillListing>>>,
+) -> Vec<claurst_core::system_prompt::SkillListing> {
+    match listings.wait_for(Option::is_some).await {
+        Ok(published) => published.clone().unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
 async fn run_interactive(
     config: Config,
     settings: claurst_core::config::Settings,
@@ -1863,6 +1905,7 @@ async fn run_interactive(
     user_question_rx: Option<tokio::sync::mpsc::UnboundedReceiver<claurst_tools::UserQuestionEvent>>,
     pending_project_mcp: Vec<claurst_core::config::McpServerConfig>,
     mcp_project_root: Option<PathBuf>,
+    skill_discovery: Option<tokio::task::JoinHandle<claurst_core::SkillRegistry>>,
 ) -> anyhow::Result<()> {
     use claurst_commands::{execute_command, CommandContext, CommandResult};
     use claurst_bridge::{BridgeOutbound, TuiBridgeEvent};
@@ -1975,20 +2018,28 @@ async fn run_interactive(
     claurst_tui::spawn_signal_restore_watchers();
     let mut app = App::new(live_config.clone(), cost_tracker.clone());
     app.command_queue = Some(command_queue.clone());
-    // Discover skill slash commands once at startup so they appear in
-    // autocomplete without re-running discovery per keystroke. Discovery walks
-    // the filesystem and may `git clone` skill URLs, so it runs on the blocking
-    // pool and the main loop installs the result when it arrives.
+    // Startup skill discovery runs on the blocking pool so a cold
+    // `skills.urls` clone never holds the terminal. When it finishes, the
+    // main loop installs the slash commands for autocomplete and every query
+    // task (which waits on `skill_listings` before its first request) gets
+    // the `<available_skills>` listing.
     let (skill_cmds_tx, mut skill_cmds_rx) = mpsc::channel::<Vec<(String, String)>>(1);
+    let (skill_listings_tx, skill_listings) =
+        tokio::sync::watch::channel::<Option<Vec<claurst_core::system_prompt::SkillListing>>>(None);
     {
-        let cwd = tool_ctx.working_dir.clone();
-        let skills_config = live_config.skills.clone();
-        tokio::task::spawn_blocking(move || {
-            let commands = claurst_commands::commands_from_discovered_skills(&cwd, &skills_config)
-                .iter()
-                .map(|c| (c.name().to_string(), c.description().to_string()))
-                .collect();
-            let _ = skill_cmds_tx.blocking_send(commands);
+        let discovery = skill_discovery;
+        tokio::spawn(async move {
+            let registry = match discovery {
+                Some(handle) => handle.await.unwrap_or_else(|e| {
+                    warn!(error = %e, "Skill discovery failed");
+                    claurst_core::SkillRegistry::default()
+                }),
+                None => claurst_core::SkillRegistry::default(),
+            };
+            let _ = skill_cmds_tx
+                .send(claurst_commands::skill_command_entries(&registry))
+                .await;
+            let _ = skill_listings_tx.send(Some(registry.listings()));
         });
     }
     if let Some(error) = settings_load_error {
@@ -3190,7 +3241,9 @@ async fn run_interactive(
                         let tx = event_tx.clone();
                         let client_clone = client.clone();
 
+                        let skill_listings = skill_listings.clone();
                         let handle = tokio::spawn(async move {
+                            qcfg.available_skills = session_skill_listings(skill_listings).await;
                             let mut msgs = msgs_arc_clone.lock().await.clone();
                             let outcome = claurst_query::run_query_loop(
                                 client_clone.as_ref(),
@@ -3637,7 +3690,9 @@ async fn run_interactive(
                         let tracker = cost_tracker.clone();
                         let tx = event_tx.clone();
                         let client_clone = client.clone();
+                        let skill_listings = skill_listings.clone();
                         let handle = tokio::spawn(async move {
+                            qcfg.available_skills = session_skill_listings(skill_listings).await;
                             let mut msgs = msgs_arc_clone.lock().await.clone();
                             let outcome = claurst_query::run_query_loop(
                                 client_clone.as_ref(),
@@ -3747,7 +3802,9 @@ async fn run_interactive(
                 let tracker = cost_tracker.clone();
                 let tx = event_tx.clone();
                 let client_clone = client.clone();
+                let skill_listings = skill_listings.clone();
                 let handle = tokio::spawn(async move {
+                    qcfg.available_skills = session_skill_listings(skill_listings).await;
                     let mut msgs = msgs_arc_clone.lock().await.clone();
                     let outcome = claurst_query::run_query_loop(
                         client_clone.as_ref(),
@@ -4011,7 +4068,7 @@ async fn run_interactive(
             app.tasks_overlay.refresh_tasks(&claurst_tools::TASK_STORE);
         }
 
-        // Install skill slash commands once background discovery finishes.
+        // Install skill slash commands once startup discovery finishes.
         if let Ok(commands) = skill_cmds_rx.try_recv() {
             app.set_discovered_slash_commands(commands);
         }
