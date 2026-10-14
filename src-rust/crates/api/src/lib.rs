@@ -61,6 +61,9 @@ pub mod error_handling;
 // Unified retry policy: classification, back-off, Retry-After (#439).
 pub mod retry;
 
+// Repair-then-reject parsing of streamed tool-call arguments (#439).
+pub mod tool_json;
+
 // Message transform layer — concrete transformers (Phase 4).
 pub mod transformers;
 
@@ -1411,6 +1414,9 @@ pub struct StreamAccumulator {
     partials: std::collections::HashMap<usize, PartialBlock>,
     stop_reason: Option<String>,
     usage: UsageInfo,
+    /// Tool-use ids whose argument JSON could not be parsed or repaired,
+    /// with the parse error. These calls must not be executed (#439).
+    invalid_tool_inputs: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug)]
@@ -1442,6 +1448,7 @@ impl StreamAccumulator {
             partials: Default::default(),
             stop_reason: None,
             usage: UsageInfo::default(),
+            invalid_tool_inputs: Default::default(),
         }
     }
 
@@ -1509,8 +1516,17 @@ impl StreamAccumulator {
                     let block = match partial {
                         PartialBlock::Text(text) => ContentBlock::Text { text },
                         PartialBlock::ToolUse { id, name, json_buf } => {
-                            let input = serde_json::from_str(&json_buf)
-                                .unwrap_or(Value::Object(Default::default()));
+                            // Repair-then-reject (#439): an unparseable call keeps
+                            // a `{}` placeholder so the history stays well-formed,
+                            // but is recorded so the caller never executes it.
+                            let input = match tool_json::parse_tool_input(&json_buf) {
+                                Ok(input) => input,
+                                Err(e) => {
+                                    warn!(tool = %name, tool_id = %id, error = %e, "Invalid tool-call JSON");
+                                    self.invalid_tool_inputs.insert(id.clone(), e.to_string());
+                                    Value::Object(Default::default())
+                                }
+                            };
                             ContentBlock::ToolUse { id, name, input, thought_signature: None }
                         }
                         PartialBlock::Thinking {
@@ -1540,6 +1556,12 @@ impl StreamAccumulator {
             AnthropicStreamEvent::Ping => {}
             AnthropicStreamEvent::Error { .. } => {}
         }
+    }
+
+    /// Tool-use ids (with the parse error) whose arguments were invalid JSON.
+    /// Callers must answer these with an error instead of running the tool.
+    pub fn take_invalid_tool_inputs(&mut self) -> std::collections::HashMap<String, String> {
+        std::mem::take(&mut self.invalid_tool_inputs)
     }
 
     /// Finalize and produce the accumulated `Message`.

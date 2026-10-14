@@ -1279,11 +1279,11 @@ pub async fn run_query_loop(
                     // matching tool_result), but we must NOT execute the tool
                     // with empty/garbage input — instead we surface a tool
                     // error to the model so it can retry (issue #215).
-                    let mut malformed_tool_calls: std::collections::HashSet<String> =
-                        std::collections::HashSet::new();
+                    let mut malformed_tool_calls: std::collections::HashMap<String, String> =
+                        std::collections::HashMap::new();
                     for idx in tc_indices {
                         if let Some((id, name, json_str, thought_signature)) = tool_call_blocks.remove(&idx) {
-                            let input = match parse_tool_args(&json_str) {
+                            let input = match claurst_api::tool_json::parse_tool_input(&json_str) {
                                 Ok(v) => v,
                                 Err(e) => {
                                     warn!(
@@ -1293,7 +1293,7 @@ pub async fn run_query_loop(
                                         error = %e,
                                         "Tool-call arguments failed to parse (truncated/malformed JSON); surfacing a tool error instead of executing with empty args"
                                     );
-                                    malformed_tool_calls.insert(id.clone());
+                                    malformed_tool_calls.insert(id.clone(), e.to_string());
                                     // Placeholder input — this call is never executed.
                                     serde_json::json!({})
                                 }
@@ -1344,14 +1344,11 @@ pub async fn run_query_loop(
                                     input_json: tool_input.to_string(),
                                 });
                             }
-                            let result = if malformed_tool_calls.contains(&tool_id) {
+                            let result = if let Some(err) = malformed_tool_calls.get(&tool_id) {
                                 // Never execute a tool whose arguments could not
                                 // be parsed — return an error the model can see
-                                // and recover from (issue #215).
-                                ToolResult::error(format!(
-                                    "Tool call '{}' was not executed: its arguments were malformed or truncated JSON. Retry the tool call with complete, valid JSON arguments.",
-                                    tool_name
-                                ))
+                                // and recover from (issues #215, #439).
+                                invalid_tool_input_result(&tool_name, err)
                             } else {
                                 execute_tool(&tool_name, &tool_input, tools, tool_ctx).await
                             };
@@ -1584,6 +1581,7 @@ pub async fn run_query_loop(
         }
         retry_attempt = 0;
 
+        let invalid_tool_inputs = accumulator.take_invalid_tool_inputs();
         let (mut assistant_msg, usage, stop_reason) = accumulator.finish();
 
         // Track costs
@@ -2015,6 +2013,14 @@ pub async fn run_query_loop(
                             });
                         }
 
+                        // Invalid argument JSON (#439): answer with a tool
+                        // error, never run the tool or its hooks with `{}`.
+                        if let Some(err) = invalid_tool_inputs.get(&id) {
+                            let blocked_result = Some(invalid_tool_input_result(&name, err));
+                            prepared.push(PreparedTool { id, name, input, blocked_result });
+                            continue;
+                        }
+
                         let hooks = &tool_ctx.config.hooks;
                         let hook_ctx = claurst_core::hooks::HookContext {
                             event: "PreToolUse".to_string(),
@@ -2302,15 +2308,15 @@ mod tests {
         }
     }
 
-    // ---- parse_tool_args tests (issue #215) ---------------------------------
+    // ---- tool-argument parsing tests (issues #215, #439) ---------------------------------
 
     #[test]
     fn test_parse_tool_args_valid_object() {
         // A complete JSON object parses to the same value.
-        let v = parse_tool_args("{\"a\":1}").expect("valid JSON should parse");
+        let v = claurst_api::tool_json::parse_tool_input("{\"a\":1}").expect("valid JSON should parse");
         assert_eq!(v, serde_json::json!({ "a": 1 }));
 
-        let v = parse_tool_args("{\"path\": \"/tmp/x\", \"content\": \"hi\"}")
+        let v = claurst_api::tool_json::parse_tool_input("{\"path\": \"/tmp/x\", \"content\": \"hi\"}")
             .expect("valid JSON should parse");
         assert_eq!(v["path"], "/tmp/x");
         assert_eq!(v["content"], "hi");
@@ -2320,9 +2326,9 @@ mod tests {
     fn test_parse_tool_args_empty_is_empty_object() {
         // No-argument tool calls arrive as an empty (or whitespace-only)
         // buffer and must map to `{}` so the happy path still works.
-        assert_eq!(parse_tool_args("").unwrap(), serde_json::json!({}));
-        assert_eq!(parse_tool_args("   ").unwrap(), serde_json::json!({}));
-        assert_eq!(parse_tool_args("\n\t ").unwrap(), serde_json::json!({}));
+        assert_eq!(claurst_api::tool_json::parse_tool_input("").unwrap(), serde_json::json!({}));
+        assert_eq!(claurst_api::tool_json::parse_tool_input("   ").unwrap(), serde_json::json!({}));
+        assert_eq!(claurst_api::tool_json::parse_tool_input("\n\t ").unwrap(), serde_json::json!({}));
     }
 
     #[test]
@@ -2331,25 +2337,25 @@ mod tests {
         // an error, NOT silently become `{}` (which would run Edit/Write with
         // empty arguments).
         assert!(
-            parse_tool_args("{\"a\":").is_err(),
+            claurst_api::tool_json::parse_tool_input("{\"a\":").is_err(),
             "truncated JSON must be an error"
         );
         assert!(
-            parse_tool_args("{\"path\": \"/etc/passwd").is_err(),
+            claurst_api::tool_json::parse_tool_input("{\"path\": \"/etc/passwd").is_err(),
             "truncated string value must be an error"
         );
         assert!(
-            parse_tool_args("{not json}").is_err(),
+            claurst_api::tool_json::parse_tool_input("{not json}").is_err(),
             "invalid JSON must be an error"
         );
 
         // Regression guard: the failing cases must never resolve to `{}`.
         for bad in ["{\"a\":", "{\"path\": \"/etc/passwd", "{not json}"] {
-            let resolved = parse_tool_args(bad).unwrap_or(serde_json::json!({}));
+            let resolved = claurst_api::tool_json::parse_tool_input(bad).unwrap_or(serde_json::json!({}));
             // The OLD buggy behavior turned these into `{}`; assert we now
             // *detect* the error rather than relying on that fallback.
             assert!(
-                parse_tool_args(bad).is_err(),
+                claurst_api::tool_json::parse_tool_input(bad).is_err(),
                 "expected error for {:?}, but got {}",
                 bad,
                 resolved
@@ -3820,6 +3826,96 @@ mod tests {
         assert!(
             matches!(run.outcome, QueryOutcome::Error(_)),
             "a truncated stream must end the turn with a visible error"
+        );
+    }
+
+    /// A tool-use turn whose argument JSON is `args`, then `end_turn`.
+    fn tool_call_turn(args: &str) -> Vec<Result<claurst_api::StreamEvent, claurst_api::ProviderError>> {
+        use claurst_api::provider_types::StopReason;
+        use claurst_api::StreamEvent;
+        vec![
+            Ok(StreamEvent::MessageStart {
+                id: uuid::Uuid::new_v4().to_string(),
+                model: "mock-model".to_string(),
+                usage: UsageInfo::default(),
+            }),
+            Ok(StreamEvent::ContentBlockStart {
+                index: 1,
+                content_block: ContentBlock::ToolUse {
+                    id: "call-1".to_string(),
+                    name: "noop_tool".to_string(),
+                    input: serde_json::json!({}),
+                    thought_signature: None,
+                },
+            }),
+            Ok(StreamEvent::InputJsonDelta { index: 1, partial_json: args.to_string() }),
+            Ok(StreamEvent::ContentBlockStop { index: 1 }),
+            Ok(StreamEvent::MessageDelta {
+                stop_reason: Some(StopReason::ToolUse),
+                usage: Some(UsageInfo::default()),
+            }),
+            Ok(StreamEvent::MessageStop),
+        ]
+    }
+
+    fn recording_tool() -> (Vec<Box<dyn Tool>>, Arc<AtomicBool>) {
+        let ran = Arc::new(AtomicBool::new(false));
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockTool {
+            name: "noop_tool",
+            level: PermissionLevel::ReadOnly,
+            self_gates: false,
+            ran: ran.clone(),
+        })];
+        (tools, ran)
+    }
+
+    fn tool_result_for(messages: &[Message], id: &str) -> Option<(String, bool)> {
+        messages.iter().find_map(|m| match &m.content {
+            claurst_core::types::MessageContent::Blocks(blocks) => blocks.iter().find_map(|b| match b {
+                ContentBlock::ToolResult { tool_use_id, content, is_error } if tool_use_id == id => {
+                    let text = match content {
+                        ToolResultContent::Text(t) => t.clone(),
+                        other => format!("{other:?}"),
+                    };
+                    Some((text, is_error.unwrap_or(false)))
+                }
+                _ => None,
+            }),
+            _ => None,
+        })
+    }
+
+    #[tokio::test]
+    async fn malformed_tool_json_is_repaired_and_the_tool_runs() {
+        let (tools, ran) = recording_tool();
+        let run = drive_scripted(
+            vec![ScriptStep::Stream(tool_call_turn("{\"note\": \"a\nb\",}"))],
+            0,
+            tools,
+        )
+        .await;
+        assert!(matches!(run.outcome, QueryOutcome::EndTurn { .. }));
+        assert!(ran.load(AtomicOrdering::SeqCst), "repaired arguments must run the tool");
+        let (_, is_error) = tool_result_for(&run.messages, "call-1").expect("tool result");
+        assert!(!is_error);
+    }
+
+    #[tokio::test]
+    async fn unrepairable_tool_json_is_rejected_without_running_the_tool() {
+        let (tools, ran) = recording_tool();
+        let run = drive_scripted(
+            vec![ScriptStep::Stream(tool_call_turn("{\"path\": \"/etc/pas"))],
+            0,
+            tools,
+        )
+        .await;
+        assert!(matches!(run.outcome, QueryOutcome::EndTurn { .. }));
+        assert!(!ran.load(AtomicOrdering::SeqCst), "the tool must not run with `{{}}`");
+        let (text, is_error) = tool_result_for(&run.messages, "call-1").expect("tool result");
+        assert!(is_error);
+        assert!(
+            text.contains("invalid JSON input for tool noop_tool"),
+            "the model must see why: {text}"
         );
     }
 }
