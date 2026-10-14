@@ -1801,7 +1801,10 @@ impl StreamAccumulator {
 
     /// Finalize and produce the accumulated `Message`.
     pub fn finish(self) -> (Message, UsageInfo, Option<String>) {
-        let msg = Message::assistant_blocks(self.content_blocks);
+        // Keep the API message id so consumers (headless stream-json) can
+        // report it; uuid users only compare ids.
+        let mut msg = Message::assistant_blocks(self.content_blocks);
+        msg.uuid = self.id;
         (msg, self.usage, self.stop_reason)
     }
 
@@ -1969,6 +1972,7 @@ mod tests {
         let (msg, _usage, stop) = acc.finish();
         assert_eq!(msg.get_text(), Some("Hello world!"));
         assert_eq!(stop.as_deref(), Some("end_turn"));
+        assert_eq!(msg.uuid.as_deref(), Some("m1"), "the API message id is kept");
     }
 
     // -----------------------------------------------------------------------
