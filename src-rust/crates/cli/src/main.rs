@@ -1642,6 +1642,12 @@ async fn run_headless(
     tool_ctx.session_id = session.id.clone();
     let mut history = std::mem::take(&mut session.messages);
     history.extend(messages);
+    // A resumed session keeps its model unless --model overrides it, as in
+    // the TUI. (A new session already records the configured model.)
+    let mut query_config = query_config;
+    if cli.model.is_none() && !session.model.is_empty() {
+        query_config.model.clone_from(&session.model);
+    }
     let model = query_config.model.clone();
 
     let mut sink = headless::HeadlessSink::new(

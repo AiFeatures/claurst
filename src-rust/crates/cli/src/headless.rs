@@ -3,9 +3,9 @@
 // `--output-format stream-json` writes one JSON object per line, shaped like
 // Claude Code's stream-json:
 //
-//   {"type":"system","subtype":"init","session_id","model","cwd","tools","permission_mode"}
-//   {"type":"assistant","message":{"id","role","content":[...]},"session_id"}
-//   {"type":"user","message":{"role","content":[tool_result...]},"session_id"}
+//   {"type":"system","subtype":"init","session_id","model","cwd","tools","permissionMode"}
+//   {"type":"assistant","message":{"id","role","content":[...]},"parent_tool_use_id":null,"session_id"}
+//   {"type":"user","message":{"role","content":[tool_result...]},"parent_tool_use_id":null,"session_id"}
 //   {"type":"retry","attempt","max_attempts","delay_ms","reason","session_id"}
 //   {"type":"compacted","trigger","messages_before",...,"session_id"}
 //   {"type":"result","subtype",...}
@@ -37,7 +37,7 @@ pub(crate) enum ResultSubtype {
     /// The turn cap (`--max-turns` / agent `max_turns`) was reached.
     ErrorMaxTurns,
     /// `--max-budget-usd` was reached.
-    ErrorBudget,
+    ErrorMaxBudgetUsd,
     /// The response hit the output-token limit after recovery attempts.
     ErrorMaxTokens,
     /// The run was interrupted (Ctrl-C).
@@ -53,7 +53,7 @@ impl ResultSubtype {
         match self {
             Self::Success => 0,
             Self::ErrorDuringExecution => 1,
-            Self::ErrorMaxTurns | Self::ErrorBudget | Self::ErrorMaxTokens => 2,
+            Self::ErrorMaxTurns | Self::ErrorMaxBudgetUsd | Self::ErrorMaxTokens => 2,
             Self::Cancelled => 130,
         }
     }
@@ -119,14 +119,21 @@ pub(crate) enum HeadlessEvent<'a> {
         model: &'a str,
         cwd: &'a str,
         tools: Vec<&'a str>,
+        /// Claude Code's SDKSystemMessage spells this field in camelCase.
+        #[serde(rename = "permissionMode")]
         permission_mode: &'a claurst_core::config::PermissionMode,
     },
+    /// `parent_tool_use_id` is always null: sub-agent messages are not
+    /// streamed. Kept (serialized as null) because Claude Code consumers
+    /// filter top-level messages on `parent_tool_use_id === null`.
     Assistant {
         message: EventMessage<'a>,
+        parent_tool_use_id: Option<&'a str>,
         session_id: &'a str,
     },
     User {
         message: EventMessage<'a>,
+        parent_tool_use_id: Option<&'a str>,
         session_id: &'a str,
     },
     Retry {
@@ -273,8 +280,16 @@ impl<W: Write, E: Write> HeadlessSink<W, E> {
         let event_message = EventMessage::new(message);
         let session_id = self.session_id.as_str();
         let event = match message.role {
-            Role::Assistant => HeadlessEvent::Assistant { message: event_message, session_id },
-            Role::User => HeadlessEvent::User { message: event_message, session_id },
+            Role::Assistant => HeadlessEvent::Assistant {
+                message: event_message,
+                parent_tool_use_id: None,
+                session_id,
+            },
+            Role::User => HeadlessEvent::User {
+                message: event_message,
+                parent_tool_use_id: None,
+                session_id,
+            },
         };
         write_event(&mut self.out, &event)
     }
@@ -384,7 +399,7 @@ fn classify(outcome: &QueryOutcome, max_turns: Option<u32>) -> (ResultSubtype, &
             Some("the response hit the output-token limit".to_string()),
         ),
         QueryOutcome::BudgetExceeded { cost_usd, limit_usd } => (
-            ResultSubtype::ErrorBudget,
+            ResultSubtype::ErrorMaxBudgetUsd,
             "budget",
             Some(format!("budget limit ${:.4} reached (spent ${:.4})", limit_usd, cost_usd)),
         ),
@@ -856,7 +871,7 @@ mod tests {
         assert_eq!(init["model"], "mock-model");
         assert_eq!(init["cwd"], "/workspace");
         assert_eq!(init["tools"], serde_json::json!(["ping"]));
-        assert_eq!(init["permission_mode"], "default");
+        assert_eq!(init["permissionMode"], "default");
 
         let tool_use = &events[1]["message"];
         assert_eq!(tool_use["role"], "assistant");
@@ -883,6 +898,13 @@ mod tests {
             assert!(result.get(key).is_some(), "result lacks {key}: {result}");
         }
         assert!(events.iter().all(|e| e["session_id"] == "headless-test"), "{}", run.stdout);
+        for message_event in &events[1..4] {
+            assert_eq!(
+                message_event.get("parent_tool_use_id"),
+                Some(&serde_json::Value::Null),
+                "parent_tool_use_id is present and null: {message_event}"
+            );
+        }
         assert!(run.stderr.is_empty(), "stream-json keeps narration off stderr: {}", run.stderr);
     }
 
@@ -989,7 +1011,7 @@ mod tests {
     fn budget_and_max_tokens_exit_2_with_a_reason() {
         let budget = QueryOutcome::BudgetExceeded { cost_usd: 1.5, limit_usd: 1.0 };
         let (subtype, stop_reason, error) = classify(&budget, None);
-        assert_eq!((subtype, stop_reason), (ResultSubtype::ErrorBudget, "budget"));
+        assert_eq!((subtype, stop_reason), (ResultSubtype::ErrorMaxBudgetUsd, "budget"));
         assert!(error.unwrap().contains("$1.0000"));
         assert_eq!(subtype.exit_code(), 2);
 

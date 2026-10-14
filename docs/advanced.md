@@ -386,12 +386,12 @@ Text is printed per completed message rather than per streamed token, so output 
 The events follow Claude Code's `stream-json` shape. Every event carries `session_id`.
 
 ```jsonl
-{"type":"system","subtype":"init","session_id":"3f0c...","model":"claude-sonnet-4-6","cwd":"/repo","tools":["Bash","Read","Edit"],"permission_mode":"default"}
-{"type":"assistant","message":{"id":"msg_01...","role":"assistant","content":[{"type":"text","text":"Running the tests."},{"type":"tool_use","id":"toolu_01...","name":"Bash","input":{"command":"cargo test"}}]},"session_id":"3f0c..."}
-{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01...","content":"test result: ok. 12 passed"}]},"session_id":"3f0c..."}
-{"type":"retry","attempt":1,"max_attempts":10,"delay_ms":2000,"reason":"HTTP 529 overloaded","session_id":"3f0c..."}
+{"type":"system","subtype":"init","session_id":"3f0c...","model":"claude-sonnet-4-6","cwd":"/repo","tools":["Bash","Read","Edit"],"permissionMode":"default"}
+{"type":"assistant","message":{"id":"msg_01...","role":"assistant","content":[{"type":"text","text":"Running the tests."},{"type":"tool_use","id":"toolu_01...","name":"Bash","input":{"command":"cargo test"}}]},"parent_tool_use_id":null,"session_id":"3f0c..."}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01...","content":"test result: ok. 12 passed"}]},"parent_tool_use_id":null,"session_id":"3f0c..."}
+{"type":"retry","attempt":1,"max_attempts":5,"delay_ms":2000,"reason":"HTTP 529 overloaded","session_id":"3f0c..."}
 {"type":"compacted","at":"2026-10-14T10:00:00Z","trigger":"threshold","summary_uuid":"...","messages_before":80,"messages_after":12,"tokens_before":180000,"tokens_after":24000,"summarised":true,"session_id":"3f0c..."}
-{"type":"assistant","message":{"id":"msg_02...","role":"assistant","content":[{"type":"text","text":"All 12 tests pass."}]},"session_id":"3f0c..."}
+{"type":"assistant","message":{"id":"msg_02...","role":"assistant","content":[{"type":"text","text":"All 12 tests pass."}]},"parent_tool_use_id":null,"session_id":"3f0c..."}
 {"type":"result","subtype":"success","is_error":false,"result":"All 12 tests pass.","stop_reason":"end_turn","session_id":"3f0c...","num_turns":2,"duration_ms":18340,"total_cost_usd":0.0412,"usage":{"input_tokens":20510,"output_tokens":388,"cache_creation_input_tokens":0,"cache_read_input_tokens":11264}}
 ```
 
@@ -415,11 +415,15 @@ This replaces the earlier `text_delta` / `tool_start` / `result` stream.
 | 0 | `success` | `end_turn` | The model finished. |
 | 1 | `error_during_execution` | `error` | An error ended the run (`error` has the message). |
 | 2 | `error_max_turns` | `max_turns` | The turn cap was reached (after one tool-less summary turn). |
-| 2 | `error_budget` | `budget` | `--max-budget-usd` was reached. |
+| 2 | `error_max_budget_usd` | `budget` | `--max-budget-usd` was reached. |
 | 2 | `error_max_tokens` | `max_tokens` | The response hit the output-token limit after recovery attempts. |
 | 130 | `cancelled` | `cancelled` | Interrupted with Ctrl-C. |
 
 Every case writes a `result` (`json` / `stream-json`) or the reason on stderr (`text`). A bad flag, an unreadable `--json-schema` or a missing session exits 1 before the run starts.
+
+The subtypes `success`, `error_max_turns`, `error_max_budget_usd` and `error_during_execution` match Claude Code; `error_max_tokens` and `cancelled` are claurst additions.
+
+On non-Anthropic providers, `--max-budget-usd` is not enforced and a response that stops at the output-token limit ends the run as `success` (exit 0): both checks exist only on the Anthropic request path so far.
 
 ### Sessions
 
@@ -431,7 +435,7 @@ Headless runs are saved like interactive ones (`~/.claurst/sessions/<id>.json`),
 | `--resume <id>` | Continue session `<id>`; exits 1 if it does not exist. `--resume` without an id is `-c`. |
 | `--session-id <id>` | Continue session `<id>` if it exists, otherwise create it with that id. Cannot be combined with `-c` / `--resume`. |
 
-The new prompt is appended to the saved history. Session ids may contain letters, digits, `-`, `_` and `.`.
+The new prompt is appended to the saved history, and a continued session keeps its saved model unless `--model` is given. Session ids may contain letters, digits, `-`, `_` and `.`.
 
 ### Permissions
 
@@ -459,7 +463,7 @@ claurst -p --max-turns 30 "..."          # stop after 30 model turns (default 10
 claurst -p --max-tokens 8000 "..."       # cap each response at 8,000 output tokens
 ```
 
-`--max-turns` defaults to 100. When the cap is reached, the model gets one final turn without tools to summarise what it did and where it stopped; the run then ends with `error_max_turns` and exit code 2. `--max-budget-usd` ends the run with `error_budget` and exit code 2. See [Exit codes](#exit-codes).
+`--max-turns` defaults to 100. When the cap is reached, the model gets one final turn without tools to summarise what it did and where it stopped; the run then ends with `error_max_turns` and exit code 2. `--max-budget-usd` ends the run with `error_max_budget_usd` and exit code 2. See [Exit codes](#exit-codes).
 
 ---
 
