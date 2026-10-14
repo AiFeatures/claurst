@@ -153,7 +153,7 @@ struct Cli {
     #[arg(long = "input-format", value_enum, default_value_t = CliInputFormat::Text)]
     input_format: CliInputFormat,
 
-    /// Session ID to tag this headless run (for tracking in logs/hooks)
+    /// Session ID for this run: continues that session if it exists, else creates it
     #[arg(long = "session-id")]
     session_id_flag: Option<String>,
 
@@ -169,7 +169,7 @@ struct Cli {
     #[arg(long = "thinking", value_name = "TOKENS")]
     thinking: Option<u32>,
 
-    /// Continue the most recent conversation
+    /// Continue the most recent session (same as --resume without an id)
     #[arg(short = 'c', long = "continue", action = ArgAction::SetTrue)]
     continue_session: bool,
 
@@ -890,7 +890,9 @@ async fn main() -> anyhow::Result<()> {
             tool_ctx,
             query_config,
             cost_tracker,
-            cli.resume,
+            // -c is `--resume` without an id: the most recent session.
+            cli.resume
+                .or_else(|| cli.continue_session.then(|| "__last__".to_string())),
             bridge_config,
             has_credentials,
             model_registry,
@@ -1545,9 +1547,34 @@ async fn run_headless(
 
     let started = std::time::Instant::now();
     let cwd = tool_ctx.working_dir.display().to_string();
+
+    // -c / --resume [id] / --session-id pick the session; the new prompt is
+    // appended to its history and the run is saved like an interactive one.
+    let opened = match headless::session_target(
+        cli.resume.as_deref(),
+        cli.continue_session,
+        cli.session_id_flag.as_deref(),
+        &tool_ctx.session_id,
+    ) {
+        Ok(target) => headless::open_session(target, &query_config.model, &cwd).await,
+        Err(e) => Err(e),
+    };
+    let mut session = match opened {
+        Ok(session) => session,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            return Ok(1);
+        }
+    };
+    let mut tool_ctx = tool_ctx;
+    tool_ctx.session_id = session.id.clone();
+    let mut history = std::mem::take(&mut session.messages);
+    history.extend(messages);
+    let model = query_config.model.clone();
+
     let mut sink = headless::HeadlessSink::new(
         cli.output_format,
-        tool_ctx.session_id.clone(),
+        session.id.clone(),
         std::io::stdout(),
         std::io::stderr(),
     );
@@ -1567,13 +1594,13 @@ async fn run_headless(
             interrupt.cancel();
         }
     });
-    let (outcome, _messages) = headless::drive(
+    let (outcome, messages) = headless::drive(
         client,
         tools,
         tool_ctx,
         query_config,
         cost_tracker.clone(),
-        messages,
+        history,
         cancel,
         &mut sink,
     )
@@ -1582,6 +1609,11 @@ async fn run_headless(
 
     let result = sink.result(&outcome, &cost_tracker, started.elapsed());
     sink.finish(&result)?;
+    // An empty history means the loop task panicked; keep the saved session.
+    if !messages.is_empty() {
+        let compactions = sink.take_compactions();
+        headless::save_session(&mut session, messages, compactions, &model, &cost_tracker).await;
+    }
     if cli.verbose {
         eprintln!(
             "Tokens: {} in / {} out | Cost: ${:.4}",

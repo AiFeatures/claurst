@@ -356,6 +356,113 @@ fn classify(outcome: &QueryOutcome, max_turns: Option<u32>) -> (ResultSubtype, &
     }
 }
 
+/// Which saved session a headless run continues.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SessionTarget<'a> {
+    /// A new session with this id.
+    Fresh(&'a str),
+    /// The most recently updated session (`-c` / `--resume` without an id).
+    Latest,
+    /// This existing session (`--resume <id>`).
+    Resume(&'a str),
+    /// This session if it exists, else a new one with that id (`--session-id`).
+    Named(&'a str),
+}
+
+/// Session ids name files under the sessions directory: no separators or
+/// leading dots.
+fn valid_session_id(id: &str) -> bool {
+    !id.is_empty()
+        && !id.starts_with('.')
+        && id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// Pick the session from `--resume [id]`, `-c` and `--session-id`.
+/// `fresh_id` names the session when none of them is given.
+pub(crate) fn session_target<'a>(
+    resume: Option<&'a str>,
+    continue_session: bool,
+    session_id: Option<&'a str>,
+    fresh_id: &'a str,
+) -> anyhow::Result<SessionTarget<'a>> {
+    let target = match (resume, continue_session, session_id) {
+        (Some(_), _, Some(_)) | (None, true, Some(_)) => {
+            anyhow::bail!("--session-id cannot be combined with --resume or --continue")
+        }
+        (Some("__last__"), _, None) | (None, true, None) => SessionTarget::Latest,
+        (Some(id), _, None) => SessionTarget::Resume(id),
+        (None, false, Some(id)) => SessionTarget::Named(id),
+        (None, false, None) => SessionTarget::Fresh(fresh_id),
+    };
+    if let SessionTarget::Resume(id) | SessionTarget::Named(id) = target {
+        if !valid_session_id(id) {
+            anyhow::bail!("invalid session id {:?}: use letters, digits, '-', '_' or '.'", id);
+        }
+    }
+    Ok(target)
+}
+
+/// Load or create the session for `target`. A new session records `model`
+/// and `cwd`. With `Latest` and no saved session, a new one is started and a
+/// notice goes to stderr.
+pub(crate) async fn open_session(
+    target: SessionTarget<'_>,
+    model: &str,
+    cwd: &str,
+) -> anyhow::Result<claurst_core::history::ConversationSession> {
+    use claurst_core::history;
+
+    let fresh = |id: &str| {
+        let mut session = history::ConversationSession::new(model.to_string());
+        session.id = id.to_string();
+        session.working_dir = Some(cwd.to_string());
+        session
+    };
+    match target {
+        SessionTarget::Fresh(id) => Ok(fresh(id)),
+        SessionTarget::Latest => match history::list_sessions().await.into_iter().next() {
+            Some(session) => Ok(session),
+            None => {
+                eprintln!("No previous session found; starting a new session.");
+                Ok(fresh(&uuid::Uuid::new_v4().to_string()))
+            }
+        },
+        SessionTarget::Resume(id) => history::load_session(id)
+            .await
+            .map_err(|e| anyhow::anyhow!("could not load session {}: {}", id, e)),
+        SessionTarget::Named(id) => match history::load_session(id).await {
+            Ok(session) => Ok(session),
+            Err(e)
+                if e.downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                Ok(fresh(id))
+            }
+            Err(e) => Err(anyhow::anyhow!("could not load session {}: {}", id, e)),
+        },
+    }
+}
+
+/// Copy the finished run into `session` and save it with the same API the
+/// interactive REPL uses. A failed save is reported on stderr.
+pub(crate) async fn save_session(
+    session: &mut claurst_core::history::ConversationSession,
+    messages: Vec<Message>,
+    compactions: Vec<CompactionRecord>,
+    model: &str,
+    cost_tracker: &claurst_core::cost::CostTracker,
+) {
+    session.messages = messages;
+    session.compactions.extend(compactions);
+    session.model = model.to_string();
+    session.updated_at = chrono::Utc::now();
+    session.total_cost += cost_tracker.total_cost_usd();
+    session.total_tokens += cost_tracker.total_tokens();
+    if let Err(e) = claurst_core::history::save_session(session).await {
+        eprintln!("Warning: could not save session {}: {}", session.id, e);
+    }
+}
+
 /// Run the query loop to completion, feeding every event to `sink`.
 /// Returns the outcome and the final history.
 pub(crate) async fn drive<W: Write, E: Write>(
@@ -853,5 +960,88 @@ mod tests {
         drop(sink);
         assert!(out.is_empty());
         assert!(String::from_utf8(err).unwrap().contains("budget limit $1.0000 reached"));
+    }
+
+    #[test]
+    fn session_flags_pick_the_target() {
+        fn t<'a>(
+            resume: Option<&'a str>,
+            cont: bool,
+            id: Option<&'a str>,
+        ) -> anyhow::Result<SessionTarget<'a>> {
+            session_target(resume, cont, id, "fresh")
+        }
+        assert_eq!(t(None, false, None).unwrap(), SessionTarget::Fresh("fresh"));
+        assert_eq!(t(None, true, None).unwrap(), SessionTarget::Latest);
+        assert_eq!(t(Some("__last__"), false, None).unwrap(), SessionTarget::Latest);
+        assert_eq!(t(Some("abc-1"), false, None).unwrap(), SessionTarget::Resume("abc-1"));
+        assert_eq!(t(None, false, Some("abc-1")).unwrap(), SessionTarget::Named("abc-1"));
+        assert!(t(Some("abc"), false, Some("abc")).is_err(), "--resume with --session-id");
+        assert!(t(None, true, Some("abc")).is_err(), "-c with --session-id");
+        assert!(t(Some("../escape"), false, None).is_err(), "path separators are refused");
+        assert!(t(None, false, Some(".hidden")).is_err());
+    }
+
+    /// Append `prompt` to the session's history, run it and save the session.
+    async fn run_and_save(
+        session: &mut claurst_core::history::ConversationSession,
+        prompt: &str,
+        reply: &str,
+    ) -> Run {
+        let mut history = std::mem::take(&mut session.messages);
+        history.push(Message::user(prompt));
+        let mut ctx = context(std::path::PathBuf::from("/workspace"), allow_all());
+        ctx.session_id = session.id.clone();
+        let run = run_with(
+            CliOutputFormat::Json,
+            scripted_config(vec![Step::Stream(text_turn(reply))]),
+            Vec::new(),
+            ctx,
+            history,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+        let tracker = claurst_core::cost::CostTracker::new();
+        save_session(session, run.messages.clone(), Vec::new(), "mock-model", &tracker).await;
+        run
+    }
+
+    #[tokio::test]
+    async fn resume_round_trip_continues_the_saved_history() {
+        let home = std::env::temp_dir().join(format!("claurst-headless-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&home).unwrap();
+        let previous = std::env::var_os("CLAURST_HOME");
+        std::env::set_var("CLAURST_HOME", &home);
+
+        // --session-id creates the session when it does not exist yet.
+        let target = session_target(None, false, Some("rt-1"), "unused").unwrap();
+        let mut session = open_session(target, "mock-model", "/workspace").await.unwrap();
+        assert_eq!(session.id, "rt-1");
+        assert!(session.messages.is_empty());
+        let first = run_and_save(&mut session, "first prompt", "one").await;
+        assert_eq!(first.result.session_id, "rt-1");
+
+        // --resume <id> continues it.
+        let target = session_target(Some("rt-1"), false, None, "unused").unwrap();
+        let mut session = open_session(target, "mock-model", "/workspace").await.unwrap();
+        assert_eq!(session.messages.len(), 2, "the first run was saved");
+        let second = run_and_save(&mut session, "second prompt", "two").await;
+        assert_eq!(second.result.result, "two");
+        let texts: Vec<String> = second.messages.iter().map(Message::get_all_text).collect();
+        assert_eq!(texts, ["first prompt", "one", "second prompt", "two"]);
+
+        // -c picks the most recent session; a missing --resume id is an error.
+        let target = session_target(None, true, None, "unused").unwrap();
+        let latest = open_session(target, "mock-model", "/workspace").await.unwrap();
+        assert_eq!(latest.id, "rt-1");
+        assert_eq!(latest.messages.len(), 4);
+        let missing = session_target(Some("no-such-session"), false, None, "unused").unwrap();
+        assert!(open_session(missing, "mock-model", "/workspace").await.is_err());
+
+        match previous {
+            Some(value) => std::env::set_var("CLAURST_HOME", value),
+            None => std::env::remove_var("CLAURST_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
     }
 }
