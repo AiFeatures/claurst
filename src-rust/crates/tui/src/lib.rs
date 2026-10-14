@@ -1670,11 +1670,8 @@ mod tests {
             "Bash".to_string(),
             "Run a shell command".to_string(),
         );
-        assert_eq!(pr.options.len(), 4);
-        assert_eq!(pr.options[0].key, 'y');
-        assert_eq!(pr.options[1].key, 'Y');
-        assert_eq!(pr.options[2].key, 'p');
-        assert_eq!(pr.options[3].key, 'n');
+        let keys: Vec<char> = pr.options.iter().map(|o| o.key).collect();
+        assert_eq!(keys, vec!['y', 'Y', 'p', 'a', 'n']);
     }
 }
 
