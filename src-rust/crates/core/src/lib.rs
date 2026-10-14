@@ -3488,12 +3488,41 @@ pub mod permissions {
             action: PermissionAction::Allow,
             scope: PermissionScope::Persistent,
         });
-        settings
+        let mut upgraded = 0usize;
+        let rules = settings
             .permission_rules
             .iter()
-            .map(PermissionRule::from)
+            .map(|saved| {
+                let mut rule = PermissionRule::from(saved);
+                if let Some(pattern) = legacy_shell_pattern(&rule) {
+                    rule.path_pattern = Some(pattern);
+                    upgraded += 1;
+                }
+                rule
+            })
             .chain(prefix_rules)
-            .collect()
+            .collect();
+        if upgraded > 0 {
+            tracing::warn!(
+                count = upgraded,
+                "Read legacy Bash permission rules `<command>*` as per-command rules `<command> *`"
+            );
+        }
+        rules
+    }
+
+    /// The per-command form of a Bash rule saved by the old dialog as
+    /// `<command>*` (a raw prefix glob of the whole line): `<command> *`.
+    /// `None` for any other rule.
+    fn legacy_shell_pattern(rule: &PermissionRule) -> Option<String> {
+        if !rule.tool_name.as_deref().is_some_and(is_shell_tool) {
+            return None;
+        }
+        let prefix = rule.path_pattern.as_deref()?.strip_suffix('*')?;
+        let legacy = !prefix.trim().is_empty()
+            && !prefix.ends_with(char::is_whitespace)
+            && !prefix.ends_with(['\'', '"', '\\']);
+        legacy.then(|| format!("{} *", prefix.trim_end()))
     }
 
     /// Pending permission request waiting for resolution (e.g. from a bridge
@@ -4589,6 +4618,32 @@ pub mod permissions {
             assert_eq!(bash(&m, "git {push,-f}"), PermissionDecision::Deny);
             assert_eq!(bash(&m, "X=push; git $X -f"), PermissionDecision::Deny);
             assert_eq!(bash(&guarded, "git status"), PermissionDecision::Allow);
+        }
+
+        /// Rules saved by the old dialog as `<command>*` keep working as
+        /// per-command rules.
+        #[test]
+        fn legacy_saved_bash_rules_are_upgraded() {
+            let settings = Settings {
+                permission_rules: vec![
+                    SerializedPermissionRule {
+                        tool_name: Some("Bash".to_string()),
+                        path_pattern: Some("git status --short*".to_string()),
+                        action: PermissionAction::Allow,
+                    },
+                    SerializedPermissionRule {
+                        tool_name: Some("Write".to_string()),
+                        path_pattern: Some("/repo/src*".to_string()),
+                        action: PermissionAction::Allow,
+                    },
+                ],
+                ..Settings::default()
+            };
+            let m = PermissionManager::new(PermissionMode::Default, &settings);
+            assert_eq!(m.persistent_rules[0].path_pattern.as_deref(), Some("git status --short *"));
+            assert_eq!(m.persistent_rules[1].path_pattern.as_deref(), Some("/repo/src*"));
+            assert_eq!(bash(&m, "git status --short"), PermissionDecision::Allow);
+            assert!(is_ask(bash(&m, "git status --short && rm -rf ~")));
         }
 
         #[test]
