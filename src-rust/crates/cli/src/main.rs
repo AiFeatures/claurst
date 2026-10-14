@@ -237,11 +237,13 @@ struct Cli {
     #[arg(long = "system-prompt-file")]
     system_prompt_file: Option<PathBuf>,
 
-    /// Tools to allow (comma-separated, default: all)
+    /// Allow without prompting, for this session (comma- or space-separated
+    /// rules: Tool, Tool(pattern) or *; e.g. "Read,Bash(git status *)")
     #[arg(long = "allowed-tools", value_name = "TOOLS")]
     allowed_tools: Option<String>,
 
-    /// Tools to disallow (comma-separated)
+    /// Deny in every mode, for this session (same syntax as --allowed-tools;
+    /// a tool-wide entry also hides the tool from the model)
     #[arg(long = "disallowed-tools", value_name = "TOOLS")]
     disallowed_tools: Option<String>,
 

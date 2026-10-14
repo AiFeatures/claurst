@@ -362,15 +362,18 @@ See [keybindings.md](./keybindings.md) for the full keybindings reference.
 ### /permissions
 **Aliases:** `allowed-tools`
 
-View and manage tool permission rules. Permissions control which tools can run without prompting, which are blocked, and which always require confirmation.
+View and manage tool permission rules. Permissions control which tools can run without prompting, which are blocked, and which always require confirmation. `/permissions` (or `list`) shows the mode and every rule in effect: configured, saved for this project, saved everywhere, and this session's.
 
 ```
 /permissions
 /permissions list
-/permissions allow <tool-name>
-/permissions deny <tool-name>
+/permissions set <default|accept-edits|bypass-permissions|plan>
+/permissions allow <rule>
+/permissions deny <rule>
 /permissions reset
 ```
+
+A rule is `Tool`, `Tool(pattern)` or `*`, e.g. `Bash(git status *)` or `Edit(/repo/src/**)`. Bash patterns match each command of a compound line. Deny rules apply in every mode and a tool-wide deny hides the tool from the model. See [Permission Rules and Approvals](configuration.md#permission-rules-and-approvals).
 
 ---
 

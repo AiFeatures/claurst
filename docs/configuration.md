@@ -45,7 +45,7 @@ project file sets them:
 | `skills.urls` (top-level and `config.skills.urls`) | Clones the URL with git |
 | `providers` / `config.provider_configs` | Can point the API base URL, and your API key, at another host |
 | `workspace_paths`, `additional_dirs` | Widen the auto-allowed read set |
-| `permission_mode`, `permissionRules`, `allowedBashPrefixes`, `skipDangerousModePermissionPrompt` | Grant or pre-approve permissions |
+| `permission_mode`, `permissionRules`, `allowedBashPrefixes`, `allowed_tools`, `skipDangerousModePermissionPrompt` | Grant or pre-approve permissions |
 | `trustProjectMcpServers` | Bypasses the project MCP server approval prompt |
 | `enabledPlugins` | Enables plugins, which can ship hooks and servers |
 | `remoteControlAtStartup` | Exposes the session over the remote-control bridge |
@@ -166,12 +166,18 @@ See [Permission Modes](#permission-modes) for a full description of each value.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `allowed_tools` | array of strings | [] (all) | Restrict the tool set to this explicit list. An empty array means all tools are available. |
-| `disallowed_tools` | array of strings | [] | Always deny these tools, regardless of other settings. |
+| `allowed_tools` | array of rule specs | [] | Allow these without prompting. Global-only: ignored in a project settings file. |
+| `disallowed_tools` | array of rule specs | [] | Deny these in every permission mode, `bypassPermissions` included. A tool-wide entry (`Write`) also hides the tool from the model. A project settings file may add entries. |
 
-Tool names match the internal names: `Bash`, `Read`, `Write`, `Edit`, `Glob`,
-`Grep`, `WebSearch`, `WebFetch`, `TodoWrite`, `TodoRead`, and MCP tool names
-prefixed with their server name (`myserver_toolname`).
+Each entry is a rule spec: `Tool` (every use), `Tool(pattern)`, or `*` (every
+tool). For `Bash` the pattern is a shell rule matched per command
+(`Bash(git status *)`, `Bash(npm run test:*)`); for other tools it is a path
+glob (`Edit(/repo/src/**)`). Tool names match the internal names: `Bash`,
+`Read`, `Write`, `Edit`, `NotebookEdit`, `BatchEdit`, `ApplyPatch`, `Glob`,
+`Grep`, `WebSearch`, `WebFetch`, and MCP tool names prefixed with their server
+name (`myserver_toolname`). The `--allowed-tools` / `--disallowed-tools` flags
+and `/permissions allow|deny` use the same syntax. See
+[Permission Rules and Approvals](#permission-rules-and-approvals).
 
 ### Directory access
 
@@ -293,15 +299,19 @@ confirmation in the TUI, or are denied in headless mode.
 
 ### `acceptEdits`
 
-All tool calls — reads, writes, and shell commands — are automatically
-accepted without prompting. This is useful for trusted automation pipelines
-where you want maximum throughput.
+File edits and writes (`Edit`, `Write`, `NotebookEdit`, `BatchEdit`,
+`ApplyPatch`) whose targets lie inside the workspace (the working directory,
+`workspace_paths` and `--add-dir` directories) are accepted without
+prompting. A target outside the workspace, including one reached through a
+symlink, still asks. Shell commands and network access keep the `default`
+behaviour.
 
 ### `bypassPermissions`
 
-All permission checks are skipped entirely. Every tool call is allowed
-unconditionally. This mode cannot be used when running as root or via `sudo`
-on Unix systems (Claurst blocks it).
+Permission prompts are skipped and every tool call is allowed, except calls
+covered by a deny rule (`disallowed_tools`, `--disallowed-tools`,
+`/permissions deny`), which are refused in every mode. This mode cannot be
+used when running as root or via `sudo` on Unix systems (Claurst blocks it).
 
 Use with caution: the model can read and modify any file reachable from the
 current working directory without any user confirmation.
@@ -319,6 +329,95 @@ The permission mode can also be overridden per-session on the command line:
 claurst --permission-mode acceptEdits "refactor the auth module"
 claurst --dangerously-skip-permissions "..."  # equivalent to bypassPermissions
 ```
+
+---
+
+## Permission Rules and Approvals
+
+Rules refine the permission mode per tool. Each rule allows or denies a tool,
+optionally restricted to a pattern.
+
+### Evaluation order
+
+1. A matching **deny** rule refuses the call, in every mode.
+2. `bypassPermissions` allows everything else.
+3. A matching **allow** rule allows the call without prompting.
+4. Otherwise the mode decides (see [Permission Modes](#permission-modes)):
+   reads inside the workspace run, `acceptEdits` covers workspace edits,
+   `plan` refuses writes, and everything else asks (headless runs refuse
+   instead of asking).
+
+Rules come from four places, all evaluated together:
+
+| Source | Where it lives | Scope |
+|--------|----------------|-------|
+| `allowed_tools` / `disallowed_tools`, `--allowed-tools` / `--disallowed-tools`, `/permissions allow\|deny` | settings `config` block (flags: this session only) | configured |
+| "Always allow in this project" | `<claurst home>/projects/<encoded project root>/permissions.json` | the current project (repository root, or the working directory outside a repository) |
+| "Always allow everywhere" | `permissionRules` in the global settings file | every project |
+| "Allow this session" | memory | this session |
+
+Saved approvals never live inside the repository, so a repository cannot grant
+itself permissions. `allowed_tools`, `permissionRules` and `allowedBashPrefixes`
+are read only from the global settings file; a project settings file can add
+`disallowed_tools` entries. Each `allowedBashPrefixes` entry `git` acts as the
+rule `Bash(git *)`.
+
+### Shell commands
+
+Bash rules are matched per command, not against the raw command line.
+Claurst splits the line at `;`, `&&`, `||`, `|`, `|&`, `&` and newlines,
+removes quotes, and drops redirections. A line is auto-allowed only when
+**every** command in it is allowed, and denied when **any** command matches a
+deny rule (also after stripping leading `NAME=value` assignments and the
+command's directory, so `FOO=1 /bin/rm x` still matches `Bash(rm *)`).
+
+A Bash pattern is a command with an optional trailing ` *`:
+
+| Pattern | Matches | Does not match |
+|---------|---------|----------------|
+| `git status *` | `git status`, `git status --short` | `git push`, `git status && rm -rf ~` |
+| `npm run *` | `npm run build`, `npm run test -- --watch` | `npm install` |
+| `git diff` | `git diff` | `git diff HEAD` |
+
+Some lines cannot be judged from their text and always need an explicit
+approval; patterns never cover them (only a rule equal to the whole line, as
+recorded by "Allow this session", does):
+
+- command or process substitution: `$(...)`, backticks, `<(...)`, `>(...)`
+- heredocs (`<<`)
+- subshells, groups and compound commands: `( ... )`, `{ ...; }`, `if`, `for`, `while`, `case`, functions
+- commands that run other commands: `eval`, `exec`, `source`, `.`, `bash -c`,
+  `sh -c` (and other shells with `-c`), `xargs`, `sudo`, `doas`, `su`, `env`,
+  `command`, `builtin`, `nohup`, `nice`, `time`, `timeout`, `watch`,
+  `parallel`, `find -exec`, and a command name taken from a variable
+
+A tool-wide `Bash` allow covers these lines too, unless a Bash deny pattern
+exists. A command that redirects output to a file (`>`, `>>`, `&>`) is never
+covered by a pattern; redirection to `/dev/null` and `2>&1` are fine. Commands
+classified as Critical (`rm -rf /`, fork bombs, `dd if=...`, ...) are blocked
+in every mode, including when they appear later in a compound line.
+
+### The permission dialog
+
+| Key | Choice |
+|-----|--------|
+| `y` | Allow once |
+| `Y` | Allow this session (for Bash: exactly these commands) |
+| `p` | Always allow in this project |
+| `a` | Always allow everywhere |
+| `n` | Deny, with an optional reason |
+
+For Bash, `p` and `a` save one rule per command using its arity prefix
+(`git status *`, `npm run build *`, `cargo test *`); the option label shows
+the rules. A command shorter than its prefix (a bare `git`) or starting with
+an assignment is saved exactly. Opaque lines offer only `y`, `Y` and `n`. For
+file tools the saved rule covers the path (`<path>*`).
+
+After `n`, type a one-line reason and press Enter (or Esc to deny without
+one). The reason is returned to the model with the denial. A denial also
+rejects the rest of the model's current batch of tool calls: calls that have
+not started yet return an error instead of running, so the model stops and
+reads your reason.
 
 ---
 
