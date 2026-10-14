@@ -378,6 +378,8 @@ impl Tool for AgentTool {
             continuation: crate::continuation::ContinuationMode::Default,
             degradation_enabled: ctx.config.degradation_summary_enabled_or_default(),
             auto_compact: true,
+            // A sub-agent's history is not the parent session's.
+            session_journal: None,
         };
         // -----------------------------------------------------------------------
         // Background mode: spawn and return agent_id immediately.
