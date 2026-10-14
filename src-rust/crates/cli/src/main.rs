@@ -1776,6 +1776,15 @@ fn permission_request_from_core(
     let tool_use_id = pending.tool_use_id.clone();
 
     match (tool_name.as_str(), pending.request.path.clone()) {
+        (claurst_tools::sandbox::SANDBOX_ESCALATION_TOOL, Some(command)) => {
+            let prefix = claurst_tools::sandbox::unsandboxed_prefix(&command).map(str::to_owned);
+            claurst_tui::dialogs::PermissionRequest::sandbox_escalation(
+                tool_use_id,
+                reason,
+                command,
+                prefix.as_deref(),
+            )
+        }
         ("Bash", Some(command)) => {
             let suggested_rules = claurst_core::shell_scan::approval_rules(&command);
             claurst_tui::dialogs::PermissionRequest::bash(
@@ -3254,6 +3263,34 @@ async fn run_interactive(
                     }
                     if let Some(pr) = app.permission_request.as_mut() {
                         if claurst_tui::dialogs::handle_permission_key(pr, key) {
+                            // "Retry outside the sandbox?" (#470): record the chosen
+                            // scope and answer the waiting Bash call; it never touches
+                            // the permission rules or the Bash prefix allowlist.
+                            if let claurst_tui::dialogs::PermissionDialogKind::SandboxEscalation { command } = &pr.kind {
+                                use claurst_tools::sandbox::{record_escalation, EscalationScope};
+                                let scope = match pr.options.get(pr.selected_option).map(|o| o.key) {
+                                    Some('y') => Some(EscalationScope::Once),
+                                    Some('Y') => Some(EscalationScope::Session),
+                                    Some('P') => Some(EscalationScope::Prefix),
+                                    _ => None,
+                                };
+                                if let Some(scope) = scope {
+                                    record_escalation(scope, command);
+                                }
+                                let tool_use_id = pr.tool_use_id.clone();
+                                app.permission_request = None;
+                                if let Some(mut pending) = pending_permissions.lock().waiting.remove(&tool_use_id) {
+                                    let decision = if scope.is_some() {
+                                        claurst_core::permissions::PermissionDecision::Allow
+                                    } else {
+                                        claurst_core::permissions::PermissionDecision::Deny
+                                    };
+                                    if let Some(tx) = pending.decision_tx.take() {
+                                        let _ = tx.send(decision);
+                                    }
+                                }
+                                continue;
+                            }
                             let tool_use_id = pr.tool_use_id.clone();
                             let selected_key = pr.options.get(pr.selected_option).map(|o| o.key);
                             // The reason typed after choosing deny, if any,
@@ -3357,10 +3394,17 @@ async fn run_interactive(
                         }
                         tools_arc = tools_for_session(tool_ctx.mcp_manager.clone(), &base_query_config);
                     }
-                    if !app.is_streaming && app.messages.len() < messages.len() {
-                        messages = app.messages.clone();
-                        session.messages = messages.clone();
-                        session.updated_at = chrono::Utc::now();
+                    // Apply a confirmed /rewind. The model history is never
+                    // derived from the display list: that list omits tool
+                    // steps and harness notes (#484).
+                    if !app.is_streaming {
+                        if let Some(idx) = app.pending_rewind.take() {
+                            let cut = claurst_tui::app::rewind_cut_index(&messages, idx);
+                            messages.truncate(cut);
+                            app.replace_messages(messages.clone());
+                            session.messages = messages.clone();
+                            session.updated_at = chrono::Utc::now();
+                        }
                     }
                 }
                 Event::Paste(data) => {
@@ -3403,6 +3447,15 @@ async fn run_interactive(
                 let Some(mut pending) = next_pending else {
                     break;
                 };
+
+                // A sandbox escalation is always shown: no permission rule may
+                // answer "run outside the sandbox" (#470).
+                if pending.request.tool_name == claurst_tools::sandbox::SANDBOX_ESCALATION_TOOL {
+                    let tool_use_id = pending.tool_use_id.clone();
+                    app.permission_request = Some(permission_request_from_core(&pending));
+                    pending_permissions.lock().waiting.insert(tool_use_id, pending);
+                    break;
+                }
 
                 // Re-evaluate: an approval saved while this request waited
                 // in the queue may cover it now.

@@ -45,6 +45,15 @@ pub async fn forward_pending(
         return;
     };
 
+    // The OS sandbox's "rerun outside the sandbox?" offer (#470) is not put
+    // to the client: dropping the sender leaves it unanswered, so the Bash
+    // tool returns the denial with a sandbox note and the client decides.
+    if request.tool_name == claurst_tools::sandbox::SANDBOX_ESCALATION_TOOL {
+        debug!(tool_use_id, "ACP permission: sandbox escalation left to the client");
+        drop(decision_tx);
+        return;
+    }
+
     let title = if reason.is_empty() {
         format!("Approve {}", request.tool_name)
     } else {

@@ -288,6 +288,9 @@ pub struct SystemPromptOptions {
     /// AGENTS.md / CLAUDE.md instruction files, in load order. Rendered into
     /// the cached block, so callers load them once per session. Empty: no block.
     pub instruction_files: Vec<crate::claudemd::InstructionFile>,
+    /// Sandbox state from `claurst_core::sandbox::render_sandbox_state`
+    /// (#470), injected in the dynamic section; `None` when unsandboxed.
+    pub sandbox_state: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -390,6 +393,11 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
     //    over), so later turns reuse the cached message prefix.
     if !opts.skip_env_info {
         parts.push(build_environment_context(opts));
+    }
+
+    // 9b. Shell sandbox state (#470)
+    if let Some(sandbox) = &opts.sandbox_state {
+        parts.push(format!("\n{}", sandbox));
     }
 
     // 10b. Current permission mode (changes with /yolo and Shift+Tab)
@@ -760,7 +768,7 @@ Tool calls that change files, run commands or reach the network may need the use
 - Never request or rely on broad standing approvals (e.g. "always allow Bash"). Prefer narrow, categorical ones ("cargo test", "npm run dev"). Never ask for a standing approval for destructive commands.
 - Potentially destructive actions the user did not explicitly ask for (`rm`, `git reset`, `git checkout --`, dropping data) need a fresh, explicit confirmation from the user, even in a mode that does not prompt.
 - Bash commands rated critical risk (e.g. `rm -rf /`, `mkfs`, a download piped into a shell) are refused in every mode.
-- Commands run with the user's privileges; there is no OS-level sandbox.
+- Commands run with the user's privileges unless a Sandbox section below says they are sandboxed.
 - Do not modify the user's shell or tool configuration (.gitconfig, .bashrc, .zshrc, .mcp.json, .claude.json) unless asked, and never commit secrets, credentials, or API keys.
 "#;
 
@@ -976,6 +984,19 @@ mod tests {
         assert!(dynamic.contains("/home/user/project"));
         assert!(!stable.contains("/home/user/project"));
         assert_eq!(split_at_dynamic_boundary("no marker"), ("no marker", ""));
+    }
+
+    #[test]
+    fn sandbox_state_is_in_the_dynamic_section() {
+        let opts = SystemPromptOptions {
+            sandbox_state: Some("# Sandbox\nBash commands run in a sandbox.".to_string()),
+            ..default_opts()
+        };
+        let prompt = build_system_prompt(&opts);
+        let (stable, dynamic) = split_at_dynamic_boundary(&prompt);
+        assert!(!stable.contains("# Sandbox"));
+        assert!(dynamic.contains("# Sandbox\nBash commands run in a sandbox."));
+        assert!(!build_system_prompt(&default_opts()).contains("# Sandbox"));
     }
 
     #[test]

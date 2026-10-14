@@ -33,6 +33,9 @@ pub enum PermissionDialogKind {
     FileRead { path: String },
     /// File write.
     FileWrite { path: String },
+    /// A sandboxed Bash command was likely blocked by the OS sandbox (#470):
+    /// rerun it outside the sandbox once / for the session / for its prefix.
+    SandboxEscalation { command: String },
 }
 
 
@@ -162,6 +165,48 @@ impl PermissionRequest {
             selected_option: 0,
             feedback: None,
             options: Self::default_options(),
+        }
+    }
+
+    /// Build the "retry outside the sandbox?" dialog for a command the OS
+    /// sandbox likely blocked (#470). `prefix` is the first word a "for this
+    /// command prefix" approval would cover; `None` hides that option.
+    pub fn sandbox_escalation(
+        tool_use_id: String,
+        reason: String,
+        command: String,
+        prefix: Option<&str>,
+    ) -> Self {
+        let mut options = vec![
+            PermissionOption {
+                label: "Yes, rerun outside the sandbox once".to_string(),
+                key: 'y',
+            },
+            PermissionOption {
+                label: "Yes, run outside the sandbox for this session".to_string(),
+                key: 'Y',
+            },
+        ];
+        if let Some(prefix) = prefix {
+            options.push(PermissionOption {
+                label: format!("Yes, always run `{}` commands outside the sandbox", prefix),
+                key: 'P',
+            });
+        }
+        options.push(PermissionOption {
+            label: "No, keep the sandbox denial".to_string(),
+            key: 'n',
+        });
+        Self {
+            tool_use_id,
+            tool_name: "Bash (sandboxed)".to_string(),
+            description: String::new(),
+            danger_explanation: reason,
+            input_preview: Some(command.clone()),
+            kind: PermissionDialogKind::SandboxEscalation { command },
+            selected_option: 0,
+            feedback: None,
+            options,
         }
     }
 
@@ -429,7 +474,8 @@ pub fn render_permission_dialog(frame: &mut Frame, pr: &PermissionRequest, area:
     // without the prompt-arrow repeating on every row.
     let bash_command_lines: Option<Vec<Line>> = match &pr.kind {
         PermissionDialogKind::Bash { command, .. }
-        | PermissionDialogKind::PowerShell { command } => {
+        | PermissionDialogKind::PowerShell { command }
+        | PermissionDialogKind::SandboxEscalation { command } => {
             let cmd_indent = "    ";
             let wrap_width = text_width.saturating_sub(cmd_indent.len());
             let wrapped = word_wrap(command, wrap_width);
@@ -474,7 +520,9 @@ pub fn render_permission_dialog(frame: &mut Frame, pr: &PermissionRequest, area:
 
     // preview line count (used for non-Bash kinds; Bash uses its own block above)
     let preview_line_count: u16 = match &pr.kind {
-        PermissionDialogKind::Bash { .. } | PermissionDialogKind::PowerShell { .. } => 0,
+        PermissionDialogKind::Bash { .. }
+        | PermissionDialogKind::PowerShell { .. }
+        | PermissionDialogKind::SandboxEscalation { .. } => 0,
         _ => {
             if pr.input_preview.is_some() { 3 } else { 0 }
         }
@@ -539,7 +587,9 @@ pub fn render_permission_dialog(frame: &mut Frame, pr: &PermissionRequest, area:
     // ---- Input preview for non-Bash kinds -----------------------------------
     if !matches!(
         pr.kind,
-        PermissionDialogKind::Bash { .. } | PermissionDialogKind::PowerShell { .. }
+        PermissionDialogKind::Bash { .. }
+            | PermissionDialogKind::PowerShell { .. }
+            | PermissionDialogKind::SandboxEscalation { .. }
     ) {
         if let Some(ref preview) = pr.input_preview {
             lines.push(Line::from(vec![
@@ -627,6 +677,7 @@ pub fn render_permission_dialog(frame: &mut Frame, pr: &PermissionRequest, area:
         PermissionDialogKind::FileRead { .. } => (Color::Cyan, " File Read Permission "),
         PermissionDialogKind::FileWrite { .. } => (Color::Yellow, " File Write Permission "),
         PermissionDialogKind::Generic => (Color::Yellow, " Permission Required "),
+        PermissionDialogKind::SandboxEscalation { .. } => (Color::Red, " Sandbox Denied "),
     };
 
     let block = Block::default()
@@ -715,7 +766,11 @@ pub fn handle_permission_key(pr: &mut PermissionRequest, key: KeyEvent) -> bool 
         return false;
     };
     pr.selected_option = index;
-    if pr.options.get(index).is_some_and(|opt| opt.key == 'n') {
+    // The sandbox-escalation dialog's 'n' keeps the sandbox denial; there is
+    // no tool call to give a reason for.
+    if pr.options.get(index).is_some_and(|opt| opt.key == 'n')
+        && !matches!(pr.kind, PermissionDialogKind::SandboxEscalation { .. })
+    {
         pr.feedback = Some(String::new());
         return false;
     }
@@ -1497,6 +1552,32 @@ mod tests {
         });
         // input_preview is set to the command
         assert_eq!(pr.input_preview.as_deref(), Some("echo $(id)"));
+    }
+
+    #[test]
+    fn sandbox_escalation_offers_once_session_prefix_and_deny() {
+        let pr = PermissionRequest::sandbox_escalation(
+            "id".to_string(),
+            "The sandbox likely blocked this command.".to_string(),
+            "git commit -m x".to_string(),
+            Some("git"),
+        );
+        let keys: Vec<char> = pr.options.iter().map(|o| o.key).collect();
+        assert_eq!(keys, vec!['y', 'Y', 'P', 'n']);
+        assert!(pr.options[2].label.contains("`git`"));
+        assert_eq!(
+            pr.kind,
+            PermissionDialogKind::SandboxEscalation { command: "git commit -m x".to_string() }
+        );
+
+        let chained = PermissionRequest::sandbox_escalation(
+            "id".to_string(),
+            String::new(),
+            "git log; rm x".to_string(),
+            None,
+        );
+        let keys: Vec<char> = chained.options.iter().map(|o| o.key).collect();
+        assert_eq!(keys, vec!['y', 'Y', 'n']);
     }
 
     #[test]
