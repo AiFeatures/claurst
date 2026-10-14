@@ -467,6 +467,11 @@ pub fn approval_rules(command: &str) -> Vec<String> {
     let Scan::Commands(commands) = scan(command) else {
         return Vec::new();
     };
+    // A prefix rule never covers a command that writes to a file, so saving
+    // one would not approve this line.
+    if commands.iter().any(|c| c.writes_file) {
+        return Vec::new();
+    }
     let mut rules: Vec<String> = Vec::new();
     for rule in commands.iter().map(approval_rule) {
         if !rules.contains(&rule) {
@@ -749,6 +754,12 @@ mod tests {
         assert!(!pattern_denies("git push *", &w(&["git", "status"])));
         // Allow matching stays literal.
         assert!(!pattern_matches("git push *", &w(&["git", "$X"])));
+    }
+
+    #[test]
+    fn redirecting_lines_have_no_approval_rules() {
+        assert!(approval_rules("cargo build > build.log 2>&1").is_empty());
+        assert_eq!(approval_rules("cargo build 2>&1 > /dev/null"), vec!["cargo build *"]);
     }
 
     #[test]

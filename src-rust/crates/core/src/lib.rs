@@ -3716,10 +3716,14 @@ pub mod permissions {
             if deny.iter().any(|r| r.path_pattern.is_none()) {
                 return Some(PermissionDecision::Deny);
             }
+            // A rule equal to the whole line (what "allow this session"
+            // records for an opaque or file-writing line) matches it as one.
+            let exact = |r: &&PermissionRule| r.path_pattern.as_deref() == Some(command.trim());
+            if deny.iter().any(exact) {
+                return Some(PermissionDecision::Deny);
+            }
             let tool_wide_allow = allow.iter().any(|r| r.path_pattern.is_none());
-            let hit = |rule: &&PermissionRule, words: &[String]| {
-                rule.path_pattern.as_deref().is_some_and(|p| pattern_matches(p, words))
-            };
+            let exact_allow = allow.iter().any(exact);
             match scan(command) {
                 Scan::Commands(commands) => {
                     let denied = commands.iter().any(|c| {
@@ -3734,18 +3738,20 @@ pub mod permissions {
                         return Some(PermissionDecision::Deny);
                     }
                     let allowed = tool_wide_allow
+                        || exact_allow
                         || (!commands.is_empty()
                             && commands.iter().all(|c| {
-                                !c.writes_file && allow.iter().any(|r| hit(r, &c.words))
+                                !c.writes_file
+                                    && allow.iter().any(|r| {
+                                        r.path_pattern
+                                            .as_deref()
+                                            .is_some_and(|p| pattern_matches(p, &c.words))
+                                    })
                             }));
                     allowed.then_some(PermissionDecision::Allow)
                 }
                 Scan::Opaque(_) => {
-                    let exact = |r: &&PermissionRule| r.path_pattern.as_deref() == Some(command.trim());
-                    if deny.iter().any(exact) {
-                        return Some(PermissionDecision::Deny);
-                    }
-                    let allowed = allow.iter().any(exact) || (tool_wide_allow && deny.is_empty());
+                    let allowed = exact_allow || (tool_wide_allow && deny.is_empty());
                     allowed.then_some(PermissionDecision::Allow)
                 }
             }
@@ -3884,10 +3890,14 @@ pub mod permissions {
 
         /// Allow exactly the shell `command` for the rest of this session:
         /// one exact rule per simple command, or the whole line when it is
-        /// opaque.
+        /// opaque or writes to a file.
         pub fn add_session_allow_command(&mut self, tool_name: &str, command: &str) {
             let patterns: Vec<String> = match crate::shell_scan::scan(command) {
-                crate::shell_scan::Scan::Commands(commands) if !commands.is_empty() => {
+                // A line that writes to a file is only covered by a rule for
+                // the whole line (per-command rules never cover a redirect).
+                crate::shell_scan::Scan::Commands(commands)
+                    if !commands.is_empty() && commands.iter().all(|c| !c.writes_file) =>
+                {
                     commands.iter().map(crate::shell_scan::SimpleCommand::text).collect()
                 }
                 _ => vec![command.trim().to_string()],
@@ -4542,6 +4552,20 @@ pub mod permissions {
             // With a deny pattern present, the tool-wide allow does not cover
             // an opaque line that could hide the denied command.
             assert!(is_ask(bash(&m, "eval rm x")));
+        }
+
+        /// "Allow this session" on a line that redirects to a file records
+        /// the whole line, and that rule is honoured.
+        #[test]
+        fn session_approval_of_a_redirecting_line_is_honoured() {
+            let mut m = mgr(PermissionMode::Default);
+            let line = "cargo build > build.log 2>&1";
+            assert!(crate::shell_scan::approval_rules(line).is_empty());
+            m.add_session_allow_command("Bash", line);
+            assert_eq!(bash(&m, line), PermissionDecision::Allow);
+            assert_eq!(bash(&m, &format!("  {line}  ")), PermissionDecision::Allow);
+            assert!(is_ask(bash(&m, "cargo build > other.log")));
+            assert!(is_ask(bash(&m, "cargo build")));
         }
 
         /// #445 review: shell expansion cannot step around a deny rule.
