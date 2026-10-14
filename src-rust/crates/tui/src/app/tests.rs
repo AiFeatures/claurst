@@ -1293,6 +1293,7 @@ use super::types::{ContextMenuItem, ContextMenuState};
             tokens_before: 180_500,
             tokens_after: 12_000,
             summarised: true,
+            replaced: Vec::new(),
         }));
         assert_eq!(app.context_used_tokens, 12_000);
         assert_eq!(app.token_warning_threshold_shown, 0);
