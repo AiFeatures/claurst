@@ -49,7 +49,7 @@ pub use spinner::{SPINNER_VERBS, TURN_COMPLETION_VERBS, sample_spinner_verb, sam
 pub mod remote_session;
 pub mod cloud_session;
 
-// AGENTS.md hierarchical memory loading (T4-1).
+// AGENTS.md / CLAUDE.md instruction files for the system prompt.
 pub mod claudemd;
 
 // Message manipulation utilities (T4-2).
@@ -94,7 +94,10 @@ pub use import_config::{ClaudeMdPreview, ImportExecutionResult, ImportPaths, Imp
 
 // Skill discovery: filesystem and git URL skill loading.
 pub mod skill_discovery;
-pub use skill_discovery::{DiscoveredSkill, discover_skills, parse_skill_file};
+pub use skill_discovery::{DiscoveredSkill, RegisteredSkill, SkillRegistry, discover_skills, parse_skill_file};
+
+// Skills compiled into the binary; one source of the skill registry.
+pub mod bundled_skills;
 pub use cost::CostTracker;
 pub use history::ConversationSession;
 pub use feature_flags::FeatureFlagManager;
@@ -1343,6 +1346,11 @@ pub mod config {
         /// Git repository URLs to fetch skills from (cloned once, then cached).
         #[serde(default)]
         pub urls: Vec<String>,
+        /// Skip the project skill directories (`.claurst/skills`,
+        /// `.agents/skills`, `.claude/skills` from cwd to the git root).
+        /// Set at runtime by `--bare`; never read from settings files.
+        #[serde(skip)]
+        pub skip_project_dirs: bool,
     }
 
     // ---- Settings --------------------------------------------------------
@@ -2169,7 +2177,7 @@ pub mod config {
                 skills: {
                     let mut paths = base.config.skills.paths;
                     for p in over.config.skills.paths { if !paths.contains(&p) { paths.push(p); } }
-                    SkillsConfig { paths, urls: base.config.skills.urls }
+                    SkillsConfig { paths, urls: base.config.skills.urls, ..Default::default() }
                 },
                 managed_agents: over.config.managed_agents.or(base.config.managed_agents),
                 auto_commits: over.config.auto_commits.or(base.config.auto_commits),
@@ -2228,7 +2236,7 @@ pub mod config {
                 skills: {
                     let mut paths = base.skills.paths;
                     for p in over.skills.paths { if !paths.contains(&p) { paths.push(p); } }
-                    SkillsConfig { paths, urls: base.skills.urls }
+                    SkillsConfig { paths, urls: base.skills.urls, ..Default::default() }
                 },
                 managed_agents: over.managed_agents.or(base.managed_agents),
                 auto_copy_on_highlight: over.auto_copy_on_highlight || base.auto_copy_on_highlight,
@@ -2740,7 +2748,6 @@ pub mod constants {
          effort-2025-11-24";
 
     // File system
-    pub const CLAUDE_MD_FILENAME: &str = "AGENTS.md";
     pub const SETTINGS_FILENAME: &str = "settings.json";
     pub const HISTORY_FILENAME: &str = "conversations";
     pub const CONFIG_DIR_NAME: &str = ".claurst";
@@ -2794,20 +2801,11 @@ pub mod context {
     /// every conversation with the model.
     pub struct ContextBuilder {
         cwd: PathBuf,
-        disable_claude_mds: bool,
     }
 
     impl ContextBuilder {
         pub fn new(cwd: PathBuf) -> Self {
-            Self {
-                cwd,
-                disable_claude_mds: false,
-            }
-        }
-
-        pub fn disable_claude_mds(mut self, val: bool) -> Self {
-            self.disable_claude_mds = val;
-            self
+            Self { cwd }
         }
 
         /// System context (git status, IDE). Changes between sessions, so it
@@ -2827,15 +2825,6 @@ pub mod context {
             }
 
             parts.join("\n\n")
-        }
-
-        /// User context (AGENTS.md memories). Stable within a project, so it
-        /// belongs in the cached system block.
-        pub async fn build_user_context(&self) -> String {
-            if self.disable_claude_mds {
-                return String::new();
-            }
-            self.find_and_read_claude_md().await.unwrap_or_default()
         }
 
         /// Gather short git status + recent log.
@@ -2868,52 +2857,6 @@ pub mod context {
             }
 
             Some(result)
-        }
-
-        /// Walk up from cwd looking for AGENTS.md files and the global one.
-        async fn find_and_read_claude_md(&self) -> Option<String> {
-            let mut claude_mds = vec![];
-
-            // Global <claurst home>/AGENTS.md
-            {
-                let global_claude_md = crate::config::Settings::config_dir()
-                    .join(crate::constants::CLAUDE_MD_FILENAME);
-                if global_claude_md.exists() {
-                    if let Ok(content) = tokio::fs::read_to_string(&global_claude_md).await {
-                        claude_mds.push(format!(
-                            "# Memory (from {})\n{}",
-                            global_claude_md.display(),
-                            content
-                        ));
-                    }
-                }
-            }
-
-            // Walk from cwd up to filesystem root, collecting AGENTS.md
-            let mut dir = Some(self.cwd.as_path());
-            let mut project_mds: Vec<String> = vec![];
-            while let Some(d) = dir {
-                let candidate = d.join(crate::constants::CLAUDE_MD_FILENAME);
-                if candidate.exists() {
-                    if let Ok(content) = tokio::fs::read_to_string(&candidate).await {
-                        project_mds.push(format!(
-                            "# Project Memory (from {})\n{}",
-                            candidate.display(),
-                            content
-                        ));
-                    }
-                }
-                dir = d.parent();
-            }
-            // Reverse so outermost directory comes first
-            project_mds.reverse();
-            claude_mds.extend(project_mds);
-
-            if claude_mds.is_empty() {
-                None
-            } else {
-                Some(claude_mds.join("\n\n"))
-            }
         }
     }
 }
