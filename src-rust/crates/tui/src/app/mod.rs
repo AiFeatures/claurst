@@ -7,12 +7,14 @@ mod mouse;
 mod prompt;
 mod providers;
 mod run;
+mod steering;
 #[cfg(test)]
 mod tests;
 mod turns;
 mod types;
 mod views;
 
+pub use steering::PendingKind;
 pub use types::{
     ContextMenuKind, DisplayMessage, FocusTarget, HistorySearch,
     RecentSession, SystemAnnotation, SystemMessageStyle, ToolStatus,
@@ -414,9 +416,15 @@ pub struct App {
     pub recent_sessions_rx: Option<tokio::sync::mpsc::Receiver<Vec<RecentSession>>>,
     /// Credential store for provider API keys and OAuth tokens.
     pub auth_store: claurst_core::AuthStore,
-    /// Messages typed by the user while a query was streaming. They will be
+    /// Messages queued with Tab while a query was streaming. They are
     /// auto-submitted in order once the current turn completes (issue #149).
     pub queued_messages: std::collections::VecDeque<String>,
+    /// Queue the query loop drains at each step boundary (#444). Enter during
+    /// a turn pushes steers here; background tasks push completion notices.
+    pub command_queue: Option<claurst_query::CommandQueue>,
+    /// Steers pushed to `command_queue` and not yet delivered, oldest first:
+    /// `(queue id, text)`. Shown in the queued-prompt dock.
+    pub pending_steers: Vec<(u64, String)>,
     /// When `true`, the main loop will inject a synthetic Enter event on the
     /// next iteration to dequeue and submit the next queued message.
     pub pending_auto_submit: bool,
@@ -448,6 +456,18 @@ pub struct App {
     /// `(attempt, max)` while a model request is being retried (#439);
     /// drives the "Reconnecting n/max" footer pill.
     pub retry_status: Option<(u32, u32)>,
+    /// A query task is running (set by the interactive loop each frame).
+    /// Unlike `is_streaming` it stays true between model requests while
+    /// tools run and during retry back-off.
+    pub query_in_flight: bool,
+    /// When the current model request produced its first output delta;
+    /// `None` between requests. Drives the footer's tok/s (#444).
+    pub request_output_started: Option<std::time::Instant>,
+    /// Bytes of text and thinking streamed by the current request.
+    pub request_output_bytes: usize,
+    /// Set when the user interrupts the turn (Esc / Ctrl+C); the interactive
+    /// loop takes it and cancels the turn's token (#444).
+    pub cancel_requested: bool,
     /// Background task status text shown in footer pill.
     pub background_task_status: Option<String>,
     /// External status line output (`statusLine` / CLAUDE_STATUS_COMMAND),
@@ -480,6 +500,11 @@ pub struct App {
     /// How the last finished turn ended, reported as OSC 7501 `done` / `error`
     /// until the user starts typing the next prompt. `None` = report `idle`.
     pub last_turn_outcome: Option<crate::program_status::TurnOutcome>,
+    /// Whether the terminal window has focus, from crossterm focus events.
+    /// Starts `true` so terminals without focus reporting never alert.
+    pub terminal_focused: bool,
+    /// Program status seen by the last [`App::attention_alert`] call.
+    pub attention_status: crate::program_status::ProgramStatus,
 
     // ---- Context window & rate limit info ----------------------------------
 
@@ -741,6 +766,8 @@ impl App {
             recent_sessions_rx: None,
             auth_store: claurst_core::AuthStore::load(),
             queued_messages: std::collections::VecDeque::new(),
+            command_queue: None,
+            pending_steers: Vec::new(),
             pending_auto_submit: false,
             connect_dialog: DialogSelectState::new("Connect a provider", provider_picker_items()),
             import_config_picker: DialogSelectState::new("Import config", import_config_picker_items()),
@@ -771,6 +798,10 @@ impl App {
             ).map(|repo_root| claurst_core::git_utils::get_current_branch(&repo_root)),
             background_task_count: 0,
             retry_status: None,
+            query_in_flight: false,
+            request_output_started: None,
+            request_output_bytes: 0,
+            cancel_requested: false,
             background_task_status: None,
             status_line_override: None,
             voice_recorder: {
@@ -806,6 +837,8 @@ impl App {
             user_question_rx: None,
             ask_user_dialog: crate::ask_user_dialog::AskUserDialogState::new(),
             last_turn_outcome: None,
+            terminal_focused: true,
+            attention_status: crate::program_status::ProgramStatus::Idle,
             context_window_size: 0,
             context_used_tokens: 0,
             rate_limit_5h_pct: None,

@@ -206,8 +206,10 @@ impl Tool for AgentTool {
                 "run_in_background": {
                     "type": "boolean",
                     "description": "If true, the agent starts immediately and this call returns an \
-                                    agent_id without waiting for completion. Use the monitor tool \
-                                    with action=status/output and task_id=agent_id. Default: false."
+                                    agent_id without waiting for completion. Its result is sent to \
+                                    you when it finishes (unless completion wake-ups are turned \
+                                    off, in which case use the monitor tool with \
+                                    action=status/output and task_id=agent_id). Default: false."
                 }
             },
             "required": ["description", "prompt"]
@@ -422,6 +424,13 @@ impl Tool for AgentTool {
             let description_bg = params.description.clone();
             let prompt_bg = params.prompt.clone();
             let agent_id_bg = agent_id.clone();
+            // Completion wake-up (#444): tell the session when this finishes.
+            let notifier = if ctx.config.subagent_completion_wakeups() {
+                ctx.completion_notifier.clone()
+            } else {
+                None
+            };
+            let notify = notifier.is_some();
 
             tokio::spawn(async move {
                 let mut messages = vec![Message::user(prompt_bg)];
@@ -451,18 +460,35 @@ impl Tool for AgentTool {
                     Some(claurst_core::tasks::TaskStatus::Cancelled)
                 );
 
+                // A loop cancelled with its parent turn (Esc / Ctrl+C) was
+                // stopped on purpose, like a monitor cancel: no wake-up.
+                let stopped = matches!(outcome, QueryOutcome::Cancelled);
                 let result_text = format_outcome(outcome);
                 claurst_core::tasks::global_registry().append_output(&agent_id_bg, &result_text);
 
                 if !cancelled {
-                    let status = if result_text.starts_with("[Agent error:")
+                    let status = if stopped {
+                        claurst_core::tasks::TaskStatus::Cancelled
+                    } else if result_text.starts_with("[Agent error:")
                         || result_text.starts_with("[Agent stopped:")
                     {
                         claurst_core::tasks::TaskStatus::Failed(result_text.clone())
                     } else {
                         claurst_core::tasks::TaskStatus::Completed
                     };
+                    let state = status.to_string();
                     claurst_core::tasks::global_registry().update_status(&agent_id_bg, status);
+                    if let Some(notifier) = notifier.filter(|_| !stopped) {
+                        notifier.notify(claurst_tools::completion_notice(
+                            "subagent",
+                            &[
+                                ("id", &agent_id_bg),
+                                ("state", &state),
+                                ("description", &description_bg),
+                            ],
+                            &result_text,
+                        ));
+                    }
                 }
 
                 debug!(
@@ -476,10 +502,17 @@ impl Tool for AgentTool {
                 serde_json::json!({
                     "agent_id": agent_id,
                     "status": "running",
-                    "message": format!(
-                        "Agent '{}' started in background. Use monitor with action=status/output and task_id='{}'.",
-                        params.description, agent_id
-                    )
+                    "message": if notify {
+                        format!(
+                            "Agent '{}' started in background. Its result will be sent to you automatically when it finishes; do not poll for it. Continue with independent work or end your turn.",
+                            params.description
+                        )
+                    } else {
+                        format!(
+                            "Agent '{}' started in background. Use monitor with action=status/output and task_id='{}'.",
+                            params.description, agent_id
+                        )
+                    }
                 })
                 .to_string(),
             );

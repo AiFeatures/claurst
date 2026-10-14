@@ -52,6 +52,22 @@ Commands support aliases — for example `/h`, `/?`, and `/help` all invoke the 
 
 Arguments are passed as a single string after the command name. Most commands that accept arguments are documented with an `argumentHint` shown in the command palette.
 
+### Typing while a turn runs
+
+The prompt stays editable while the model works.
+
+| Key | Effect |
+|-----|--------|
+| `Enter` | Steer: the message is added to the running turn and the model sees it before its next request (after the current tool calls finish). If the turn ends first, it starts the next turn. |
+| `Tab` | Queue: the message is sent as a new turn after this one ends. |
+| `Alt+Up` | Pull the last pending message back into the (empty) prompt to edit it. |
+| `Alt+X` | Drop the last pending message. |
+| `Esc` / `Ctrl+C` | Cancel the turn: the model request and running tools stop, the output so far stays on screen, and steers not yet delivered and Tab-queued messages return to the prompt (nothing is sent automatically). Completion notices from background tasks are still delivered afterwards. |
+
+Pending messages are listed above the prompt until delivered. Slash commands typed during a turn always wait for the turn to end. All keys can be rebound (`editQueued`, `removeQueued`, `cancelTurn`; see [keybindings.md](./keybindings.md)).
+
+When a background sub-agent or a background Bash command started with `notify: true` finishes, its result is delivered the same way as a steer: at the next step of a running turn, or as a new turn when the session is idle. See `completionWakeups` in [configuration.md](./configuration.md).
+
 ---
 
 ## Session & Navigation

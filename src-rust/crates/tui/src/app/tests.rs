@@ -1236,6 +1236,72 @@ use super::types::{ContextMenuItem, ContextMenuState};
         assert_eq!(app.messages.len(), 1);
     }
 
+    // ---- context meter (#444) ----
+
+    fn request_done(input: u64, output: u64, cache_write: u64, cache_read: u64) -> claurst_query::QueryEvent {
+        claurst_query::QueryEvent::TurnComplete {
+            turn: 1,
+            stop_reason: "tool_use".to_string(),
+            usage: Some(claurst_core::types::UsageInfo {
+                input_tokens: input,
+                output_tokens: output,
+                cache_creation_input_tokens: cache_write,
+                cache_read_input_tokens: cache_read,
+            }),
+        }
+    }
+
+    #[test]
+    fn context_meter_shows_the_last_request_prompt_not_a_running_sum() {
+        let mut app = make_app();
+        // A ten-request tool turn at ~50k context: each request resends the
+        // whole history, so the meter must stay near 50k, not reach 500k.
+        for step in 0..10u64 {
+            app.handle_query_event(request_done(1_000 + step, 300, 2_000, 47_000 + step * 100));
+        }
+        assert_eq!(app.context_used_tokens, 1_009 + 2_000 + 47_900);
+
+        // Output tokens are not part of the prompt that was sent.
+        app.handle_query_event(request_done(10, 9_999, 0, 0));
+        assert_eq!(app.context_used_tokens, 10);
+
+        // A provider that reports no input usage keeps the last reading.
+        app.handle_query_event(request_done(0, 50, 0, 0));
+        assert_eq!(app.context_used_tokens, 10);
+        app.handle_query_event(claurst_query::QueryEvent::TurnComplete {
+            turn: 2,
+            stop_reason: "end_turn".to_string(),
+            usage: None,
+        });
+        assert_eq!(app.context_used_tokens, 10);
+    }
+
+    #[test]
+    fn compaction_resets_the_meter_baseline() {
+        use claurst_core::history::{CompactionRecord, CompactionTrigger};
+        let mut app = make_app();
+        app.handle_query_event(request_done(500, 100, 10_000, 170_000));
+        assert_eq!(app.context_used_tokens, 180_500);
+        app.token_warning_threshold_shown = 95;
+
+        app.handle_query_event(claurst_query::QueryEvent::Compacted(CompactionRecord {
+            at: chrono::Utc::now(),
+            trigger: CompactionTrigger::Threshold,
+            summary_uuid: "s".to_string(),
+            messages_before: 40,
+            messages_after: 3,
+            tokens_before: 180_500,
+            tokens_after: 12_000,
+            summarised: true,
+        }));
+        assert_eq!(app.context_used_tokens, 12_000);
+        assert_eq!(app.token_warning_threshold_shown, 0);
+
+        // The next request's real prompt size replaces the estimate.
+        app.handle_query_event(request_done(800, 40, 11_000, 0));
+        assert_eq!(app.context_used_tokens, 11_800);
+    }
+
     // ---- explicit rewind instead of display-list history sync (issue #484) ----
 
     fn tool_use_msg(id: &str) -> Message {
