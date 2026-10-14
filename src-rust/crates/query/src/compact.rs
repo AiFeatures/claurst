@@ -331,184 +331,97 @@ const NO_TOOLS_TRAILER: &str = "\n\nREMINDER: Do NOT call any tools. Respond wit
 an <analysis> block followed by a <summary> block. \
 Tool calls will be rejected and you will fail the task.";
 
-/// The base compaction prompt (mirrors BASE_COMPACT_PROMPT from TypeScript prompt.ts).
-const BASE_COMPACT_PROMPT: &str = "Your task is to create a detailed summary of the conversation \
-so far, paying close attention to the user's explicit requests and your previous actions.\n\
-This summary should be thorough in capturing technical details, code patterns, and architectural \
-decisions that would be essential for continuing development work without losing context.\n\
-\n\
-Before providing your final summary, wrap your analysis in <analysis> tags to organize your \
-thoughts and ensure you've covered all necessary points. In your analysis process:\n\
-\n\
-1. Chronologically analyze each message and section of the conversation. For each section \
-thoroughly identify:\n\
-   - The user's explicit requests and intents\n\
-   - Your approach to addressing the user's requests\n\
-   - Key decisions, technical concepts and code patterns\n\
-   - Specific details like:\n\
-     - file names\n\
-     - full code snippets\n\
-     - function signatures\n\
-     - file edits\n\
-   - Errors that you ran into and how you fixed them\n\
-   - Pay special attention to specific user feedback that you received, especially if the user \
-told you to do something differently.\n\
-2. Double-check for technical accuracy and completeness, addressing each required element \
-thoroughly.\n\
-\n\
-Your summary should include the following sections:\n\
-\n\
-1. Primary Request and Intent: Capture all of the user's explicit requests and intents in detail\n\
-2. Key Technical Concepts: List all important technical concepts, technologies, and frameworks \
-discussed.\n\
-3. Files and Code Sections: Enumerate specific files and code sections examined, modified, or \
-created. Pay special attention to the most recent messages and include full code snippets where \
-applicable and include a summary of why this file read or edit is important.\n\
-4. Errors and fixes: List all errors that you ran into, and how you fixed them. Pay special \
-attention to specific user feedback that you received, especially if the user told you to do \
-something differently.\n\
-5. Problem Solving: Document problems solved and any ongoing troubleshooting efforts.\n\
-6. All user messages: List ALL user messages that are not tool results. These are critical for \
-understanding the users' feedback and changing intent.\n\
-7. Pending Tasks: Outline any pending tasks that you have explicitly been asked to work on.\n\
-8. Current Work: Describe in detail precisely what was being worked on immediately before this \
-summary request, paying special attention to the most recent messages from both user and \
-assistant. Include file names and code snippets where applicable.\n\
-9. Optional Next Step: List the next step that you will take that is related to the most recent \
-work you were doing. IMPORTANT: ensure that this step is DIRECTLY in line with the user's most \
-recent explicit requests, and the task you were working on immediately before this summary \
-request. If your last task was concluded, then only list next steps if they are explicitly in \
-line with the users request. Do not start on tangential requests or really old requests that \
-were already completed without confirming with the user first.\n\
-                       If there is a next step, include direct quotes from the most recent \
-conversation showing exactly what task you were working on and where you left off. This should \
-be verbatim to ensure there's no drift in task interpretation.\n\
-\n\
-Format your output as:\n\
-\n\
-<analysis>\n\
-[Your thought process, ensuring all points are covered thoroughly and accurately]\n\
-</analysis>\n\
-\n\
-<summary>\n\
-1. Primary Request and Intent:\n\
-   [Detailed description]\n\
-\n\
-2. Key Technical Concepts:\n\
-   - [Concept 1]\n\
-   - [Concept 2]\n\
-\n\
-3. Files and Code Sections:\n\
-   - [File Name 1]\n\
-      - [Summary of why this file is important]\n\
-      - [Summary of the changes made to this file, if any]\n\
-      - [Important Code Snippet]\n\
-\n\
-4. Errors and fixes:\n\
-    - [Detailed description of error 1]:\n\
-      - [How you fixed the error]\n\
-\n\
-5. Problem Solving:\n\
-   [Description of solved problems and ongoing troubleshooting]\n\
-\n\
-6. All user messages:\n\
-    - [Detailed non tool use user message]\n\
-\n\
-7. Pending Tasks:\n\
-   - [Task 1]\n\
-\n\
-8. Current Work:\n\
-   [Precise description of current work]\n\
-\n\
-9. Optional Next Step:\n\
-   [Optional Next step to take]\n\
-</summary>\n\
-\n\
-Please provide your summary based on the conversation so far, following this structure and \
-ensuring precision and thoroughness in your response.";
+/// Opening of a from-scratch compaction prompt.
+const BASE_COMPACT_INTRO: &str = "Your task is to summarize the conversation in the \
+<conversation_to_summarize> block into a structured summary that will be given to another agent \
+to resume the work.";
 
-/// The iterative UPDATE compaction prompt (mirrors UPDATE_SUMMARIZATION_PROMPT
-/// from the TypeScript reference). Used when a prior `<compact-summary>` already
-/// exists in the history: instead of re-summarising everything from scratch, the
-/// model folds the NEW activity into the PREVIOUS summary (provided in
-/// `<previous-summary>` tags), preserving the exact same structured sections.
-const UPDATE_COMPACT_PROMPT: &str = "Your task is to UPDATE an existing conversation summary by folding in \
-the new activity since it was written. The previous summary is provided in <previous-summary> tags; the new \
+/// Opening of an iterative UPDATE compaction prompt, used when a prior
+/// `<compact-summary>` already exists in the history: the model folds the new
+/// activity into the previous summary instead of re-summarising from scratch.
+/// Mirrors opencode's update prompt (packages/core/src/session/compaction.ts).
+const UPDATE_COMPACT_INTRO: &str = "Your task is to UPDATE an existing conversation summary into one \
+consolidated summary. The previous summary is provided in <previous-summary> tags; the newer \
 messages to incorporate are in the <conversation_to_summarize> block.\n\
 \n\
-Do NOT re-summarise from scratch. Instead:\n\
-- PRESERVE all still-relevant information from the previous summary verbatim (file names, code snippets, \
-function signatures, decisions, user messages, error fixes).\n\
-- ADD new progress, decisions, files, errors, and user messages from the new activity.\n\
-- UPDATE the state: move finished items out of Pending Tasks / Current Work; refresh Optional Next Step to \
-reflect what is happening NOW.\n\
-- You may drop something only if it is clearly no longer relevant.\n\
-- Preserve exact file paths, function names, and error messages.\n\
+Newer history always takes precedence over the existing summary. Preserve previous information \
+unless newer history clearly contradicts, supersedes, resolves, or makes it stale. If something is \
+no longer relevant to continuing the work, you may remove it.\n\
 \n\
-Before providing your final summary, wrap your reasoning in <analysis> tags: reconcile the previous summary \
-with the new messages, note what changed, what completed, and what is now pending.\n\
+Incorporate newer requirements, decisions, progress, and context. Reconcile Work State and Next \
+Move: move completed work out of Active, remove resolved blockers and answered questions, and \
+preserve unresolved or pending work.";
+
+/// What the summary covers (opencode's scope sentence: without it summaries
+/// restated conventions and grew on every update).
+const SUMMARY_SCOPE: &str = "Summarize only what the user and the assistant said and did. Leave out \
+instructions and setup the assistant was given rather than told by the user: repository \
+conventions, instruction files such as AGENTS.md, and environment details like the session ID. The \
+next agent receives current versions of all of these separately.";
+
+/// The terse summary template (opencode's SUMMARY_TEMPLATE).
+const SUMMARY_TEMPLATE: &str = "Use this format for the summary (you may omit sections that aren't \
+applicable):\n\
 \n\
-Your summary MUST use the SAME sections as before:\n\
+## Objective\n\
+- [one or two brief sentences describing what the user is trying to accomplish]\n\
 \n\
-1. Primary Request and Intent: Preserve existing intent; add new requests if the task expanded.\n\
-2. Key Technical Concepts: Preserve existing; add newly-introduced concepts.\n\
-3. Files and Code Sections: Preserve existing entries; add newly examined/modified/created files with full \
-code snippets where applicable and why each matters.\n\
-4. Errors and fixes: Preserve existing; add new errors and how they were fixed, plus any user feedback.\n\
-5. Problem Solving: Update with newly-solved problems and ongoing troubleshooting.\n\
-6. All user messages: Preserve the existing list AND append every new non-tool-result user message.\n\
-7. Pending Tasks: Update — remove completed tasks, add newly-requested ones.\n\
-8. Current Work: Replace with a precise description of what was being worked on immediately before this \
-summary request.\n\
-9. Optional Next Step: Update to the next step directly in line with the user's most recent explicit request. \
-Include verbatim quotes from the most recent conversation where applicable.\n\
+## Requirements\n\
+- [constraints, preferences, requirements, and scope boundaries stated by the user, or \"(none)\"]\n\
 \n\
-Format your output as:\n\
+## Decisions\n\
+- [decisions already made and why, or \"(none)\"]\n\
 \n\
-<analysis>\n\
-[Reconciliation of the previous summary with the new activity]\n\
-</analysis>\n\
+## Work State\n\
+Break the objective into smaller goals and report which are completed, which are being worked on, \
+and which are blocked.\n\
+### Completed\n\
+- [goals that have been completed; otherwise \"(none)\"]\n\
 \n\
-<summary>\n\
-1. Primary Request and Intent:\n\
-   [Detailed description]\n\
+### Active\n\
+- [goals currently being worked on; otherwise \"(none)\"]\n\
 \n\
-2. Key Technical Concepts:\n\
-   - [Concept 1]\n\
+### Blocked\n\
+- [anything blocking progress, and why; otherwise \"(none)\"]\n\
 \n\
-3. Files and Code Sections:\n\
-   - [File Name 1]\n\
-      - [Why important]\n\
-      - [Changes made, if any]\n\
-      - [Important Code Snippet]\n\
+## Next Move\n\
+1. [ordered list of next actions, or \"(none)\"]\n\
 \n\
-4. Errors and fixes:\n\
-    - [Error]: [How fixed]\n\
+## Relevant Files\n\
+List the files and directories, other than the current working directory, that another agent would \
+need to open to continue this work. Include at most 15, most important first. Do not list every \
+file that was read or changed. If none, write \"(none)\".\n\
+- `[file or directory path]`: [brief reason it matters]\n\
 \n\
-5. Problem Solving:\n\
-   [Solved problems and ongoing troubleshooting]\n\
-\n\
-6. All user messages:\n\
-    - [Non-tool-use user message]\n\
-\n\
-7. Pending Tasks:\n\
-   - [Task 1]\n\
-\n\
-8. Current Work:\n\
-   [Precise description of current work]\n\
-\n\
-9. Optional Next Step:\n\
-   [Optional next step]\n\
-</summary>\n\
-\n\
-Please provide the UPDATED summary now, following this structure and preserving the previous summary's content.";
+## Important Context\n\
+- [facts the next agent cannot continue without and cannot easily find on its own; or \"(none)\"]";
+
+/// Rules for the summary body (opencode's SUMMARY_RULES).
+const SUMMARY_RULES: &str = "Rules:\n\
+- Keep each section concise. Use terse, single-line bullets, not prose paragraphs or nested lists.\n\
+- Prefer short references over detailed restatement. It is fine to leave out information the next \
+agent can recover from the code or the files listed above.\n\
+- Preserve exact file paths, symbols, commands, error strings, URLs, and identifiers.\n\
+- Carry forward only user questions or requests that remain unanswered or require further action. \
+Do not repeat ones that newer history has answered or resolved. Preserve exact wording when \
+carrying one forward.\n\
+- Preserve consequential workflow state, including whether changes are uncommitted, committed, \
+pushed, under review, or merged.\n\
+- Do not mention the summary process or that context was compacted.";
+
+/// Output framing: the <analysis> scratchpad is stripped by
+/// [`format_compact_summary`]; the summary itself goes in <summary> tags.
+const SUMMARY_OUTPUT_FORMAT: &str = "First think briefly inside <analysis> tags (this part is \
+discarded). Then return only the structured summary inside <summary> tags, with no preamble or \
+commentary. Do not continue the task.";
 
 /// Build the compaction prompt, optionally with custom instructions appended.
 ///
 /// When `previous_summary` is a non-empty prior summary, the iterative
-/// [`UPDATE_COMPACT_PROMPT`] variant is selected so the model folds the previous
-/// summary forward rather than re-summarising from scratch. Otherwise the
-/// from-scratch [`BASE_COMPACT_PROMPT`] is used.
+/// [`UPDATE_COMPACT_INTRO`] variant is selected so the model folds the
+/// previous summary forward rather than re-summarising from scratch.
+/// Otherwise the from-scratch [`BASE_COMPACT_INTRO`] is used. Both share the
+/// terse template, rules and scope sentence ported from opencode.
 pub fn get_compact_prompt(
     custom_instructions: Option<&str>,
     previous_summary: Option<&str>,
@@ -516,12 +429,15 @@ pub fn get_compact_prompt(
     let is_update = previous_summary
         .map(|s| !s.trim().is_empty())
         .unwrap_or(false);
-    let base = if is_update {
-        UPDATE_COMPACT_PROMPT
+    let intro = if is_update {
+        UPDATE_COMPACT_INTRO
     } else {
-        BASE_COMPACT_PROMPT
+        BASE_COMPACT_INTRO
     };
-    let mut prompt = format!("{}{}", NO_TOOLS_PREAMBLE, base);
+    let mut prompt = format!(
+        "{}{}\n\n{}\n\n{}\n\n{}\n\n{}",
+        NO_TOOLS_PREAMBLE, intro, SUMMARY_SCOPE, SUMMARY_TEMPLATE, SUMMARY_RULES, SUMMARY_OUTPUT_FORMAT
+    );
 
     if let Some(instructions) = custom_instructions {
         let trimmed = instructions.trim();
@@ -2113,12 +2029,22 @@ mod tests {
     #[test]
     fn test_compact_prompt_contains_sections() {
         let prompt = get_compact_prompt(None, None);
-        assert!(prompt.contains("Primary Request and Intent"));
-        assert!(prompt.contains("Key Technical Concepts"));
-        assert!(prompt.contains("Files and Code Sections"));
-        assert!(prompt.contains("Errors and fixes"));
-        assert!(prompt.contains("Pending Tasks"));
-        assert!(prompt.contains("Current Work"));
+        for section in [
+            "## Objective",
+            "## Requirements",
+            "## Decisions",
+            "## Work State",
+            "## Next Move",
+            "## Relevant Files",
+            "## Important Context",
+        ] {
+            assert!(prompt.contains(section), "missing {section}");
+        }
+        assert!(prompt.contains("Include at most 15"));
+        assert!(prompt.contains("Leave out instructions and setup the assistant was given"));
+        assert!(prompt.contains("<analysis>") && prompt.contains("<summary>"));
+        // The long "full code snippets" template is gone.
+        assert!(!prompt.contains("full code snippets"));
     }
 
     #[test]
@@ -2400,12 +2326,15 @@ mod tests {
         let blank = get_compact_prompt(None, Some("   "));
         assert_eq!(blank, base);
 
-        // Both variants preserve the structured sections.
+        // Newer history wins over the previous summary.
+        assert!(update.contains("Newer history always takes precedence"));
+
+        // Both variants share the terse template.
         for p in [&base, &update] {
-            assert!(p.contains("Primary Request and Intent"));
-            assert!(p.contains("Files and Code Sections"));
-            assert!(p.contains("Pending Tasks"));
-            assert!(p.contains("Optional Next Step"));
+            assert!(p.contains("## Objective"));
+            assert!(p.contains("## Work State"));
+            assert!(p.contains("## Next Move"));
+            assert!(p.contains("## Relevant Files"));
         }
     }
 
