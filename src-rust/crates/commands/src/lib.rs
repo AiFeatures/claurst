@@ -660,6 +660,19 @@ impl SlashCommand for CompactCommand {
             ctx.config.effective_model(),
         );
         let instructions = Some(args.trim()).filter(|a| !a.is_empty());
+        // PreCompact hooks (#447). Informational: the decision is ignored.
+        claurst_core::hooks::run_hooks(
+            &ctx.config.hooks,
+            &claurst_core::hooks::HookPayload::new(
+                &ctx.session_id,
+                &ctx.working_dir,
+                claurst_core::hooks::HookEventData::PreCompact {
+                    trigger: claurst_core::hooks::CompactTrigger::Manual,
+                    custom_instructions: instructions.unwrap_or_default(),
+                },
+            ),
+        )
+        .await;
         compact_now(
             provider.as_ref(),
             model,

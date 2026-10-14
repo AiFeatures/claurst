@@ -1,124 +1,205 @@
-// Post-sampling / stop hooks fired around each model turn.
-//
-// Extracted from lib.rs (issue #232). Behavior-preserving move.
+// Hook call sites for run_query_loop (#447): PreToolUse / PostToolUse around
+// each tool call, PostModelTurn after sampling, Stop / SubagentStop once per
+// finished turn, and PreCompact before automatic compaction. The engine
+// itself lives in `claurst_core::hooks`.
 
-/// Result returned by `fire_post_sampling_hooks`.
-#[derive(Debug, Default)]
-pub struct PostSamplingHookResult {
-    /// Error messages produced by hooks with non-zero exit codes.
-    /// These are injected into the conversation as user messages before the
-    /// next model turn so the model can react to them.
-    pub blocking_errors: Vec<claurst_core::types::Message>,
-    /// When `true` the query loop must not continue and should surface the
-    /// error messages to the caller.  Set when any hook exits with code > 1.
-    pub prevent_continuation: bool,
+use crate::*;
+use claurst_core::config::HookEvent;
+use claurst_core::hooks::{
+    has_hooks, run_hooks, CompactTrigger, HookDecision, HookEventData, HookPayload, HookResult, ToolResponse,
+};
+use claurst_core::permissions::{PermissionDecision, PermissionHandler, PermissionRequest};
+
+fn payload<'a>(tool_ctx: &'a ToolContext, data: HookEventData<'a>) -> HookPayload<'a> {
+    HookPayload::new(&tool_ctx.session_id, &tool_ctx.working_dir, data)
 }
 
-/// Execute all `PostModelTurn` hooks defined in `config.hooks`.
-///
-/// Each hook is run synchronously (blocking via `std::process::Command`).
-/// On a non-zero exit code, the hook's stderr (falling back to stdout) is
-/// wrapped in a user `Message` and appended to `blocking_errors`.
-/// If the exit code is **strictly greater than 1** `prevent_continuation` is
-/// set so the query loop can return early.
-pub fn fire_post_sampling_hooks(
-    _turn_result: &claurst_core::types::Message,
-    config: &claurst_core::config::Config,
-) -> PostSamplingHookResult {
-    use claurst_core::config::HookEvent;
-    use claurst_core::types::Message;
+/// What the PreToolUse hooks decided for one tool call.
+pub(crate) enum PreToolUse {
+    /// Run the tool with `input` (the hooks' `updatedInput` when one was
+    /// returned). `ctx` is set when a hook allowed the call, or the user
+    /// approved a hook's `ask`: it skips this call's permission prompts.
+    Run { input: Value, ctx: Option<Box<ToolContext>> },
+    /// Do not run the tool; answer the call with this result.
+    Blocked(ToolResult),
+}
 
-    let mut result = PostSamplingHookResult::default();
-
-    let entries = match config.hooks.get(&HookEvent::PostModelTurn) {
-        Some(e) => e,
-        None => return result,
-    };
-
-    for entry in entries {
-        let sh = if cfg!(windows) { "cmd" } else { "sh" };
-        let flag = if cfg!(windows) { "/C" } else { "-c" };
-
-        let output = match std::process::Command::new(sh)
-            .args([flag, &entry.command])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output()
-        {
-            Ok(o) => o,
-            Err(e) => {
-                tracing::warn!(command = %entry.command, error = %e, "PostModelTurn hook spawn failed");
-                continue;
+/// Run the PreToolUse hooks for one call and apply their decision: `deny`
+/// blocks the call, `ask` prompts the user even where policy would allow it,
+/// `allow` skips the prompts, and `updatedInput` replaces the input. An
+/// explicit denial by the permission policy is never overridden.
+pub(crate) async fn pre_tool_use(name: &str, input: Value, tool_ctx: &ToolContext) -> PreToolUse {
+    let mut result = run_hooks(
+        &tool_ctx.config.hooks,
+        &payload(tool_ctx, HookEventData::PreToolUse { tool_name: name, tool_input: &input }),
+    )
+    .await;
+    let input = result.updated_input.take().unwrap_or(input);
+    match result.decision {
+        None => PreToolUse::Run { input, ctx: None },
+        Some(HookDecision::Deny) => {
+            warn!(tool = name, reason = result.reason_or_default(), "PreToolUse hook denied the call");
+            PreToolUse::Blocked(ToolResult::error(format!(
+                "Blocked by PreToolUse hook: {}",
+                result.reason_or_default()
+            )))
+        }
+        Some(HookDecision::Allow) => PreToolUse::Run { input, ctx: Some(hook_allowed_ctx(tool_ctx)) },
+        Some(HookDecision::Ask) => {
+            let mut ask_ctx = tool_ctx.clone();
+            ask_ctx.permission_handler = Arc::new(HookAskPermissions {
+                inner: tool_ctx.permission_handler.clone(),
+                reason: format!("PreToolUse hook: {}", result.reason_or_default()),
+            });
+            let description = synthesize_permission_description(name, &input);
+            match ask_ctx.check_permission(name, &description, false) {
+                Ok(()) => PreToolUse::Run { input, ctx: Some(hook_allowed_ctx(tool_ctx)) },
+                Err(e) => PreToolUse::Blocked(ToolResult::error(e.to_string())),
             }
-        };
-
-        if output.status.success() {
-            continue;
-        }
-
-        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-        let body = if !stderr.trim().is_empty() { stderr } else { stdout };
-
-        tracing::warn!(
-            command = %entry.command,
-            exit_code = ?output.status.code(),
-            "PostModelTurn hook returned non-zero exit"
-        );
-
-        result.blocking_errors.push(Message::user(format!(
-            "[Hook '{}' error]:\n{}",
-            entry.command,
-            body.trim()
-        )));
-
-        // Exit code > 1 → hard veto of continuation.
-        if output.status.code().unwrap_or(1) > 1 {
-            result.prevent_continuation = true;
         }
     }
-
-    result
 }
 
-/// Spawn all `Stop` hooks in fire-and-forget background tasks.
-///
-/// Stop hooks are non-blocking by design: the caller does not wait for them.
-/// Returns an empty `Vec` immediately; results (if any) are lost.
-pub fn stop_hooks_with_full_behavior(
-    turn_result: &claurst_core::types::Message,
-    config: &claurst_core::config::Config,
-    working_dir: std::path::PathBuf,
-) -> Vec<claurst_core::types::Message> {
-    use claurst_core::config::HookEvent;
+fn hook_allowed_ctx(tool_ctx: &ToolContext) -> Box<ToolContext> {
+    let mut ctx = Box::new(tool_ctx.clone());
+    ctx.permission_handler = Arc::new(HookAllowedPermissions(tool_ctx.permission_handler.clone()));
+    ctx
+}
 
-    let entries = match config.hooks.get(&HookEvent::Stop) {
-        Some(e) if !e.is_empty() => e.clone(),
-        _ => return Vec::new(),
-    };
+/// Permissions for a call a PreToolUse hook allowed: what would have
+/// prompted is allowed; denials stand.
+struct HookAllowedPermissions(Arc<dyn PermissionHandler>);
 
-    let output_text = turn_result.get_all_text();
+impl HookAllowedPermissions {
+    fn resolve(decision: PermissionDecision) -> PermissionDecision {
+        match decision {
+            PermissionDecision::Ask { .. } => PermissionDecision::Allow,
+            other => other,
+        }
+    }
+}
 
-    for entry in entries {
-        let cmd = entry.command.clone();
-        let dir = working_dir.clone();
-        let text = output_text.clone();
-
-        tokio::task::spawn_blocking(move || {
-            let sh = if cfg!(windows) { "cmd" } else { "sh" };
-            let flag = if cfg!(windows) { "/C" } else { "-c" };
-
-            let _ = std::process::Command::new(sh)
-                .args([flag, &cmd])
-                .current_dir(&dir)
-                .env("CLAUDE_HOOK_OUTPUT", &text)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn();
-        });
+impl PermissionHandler for HookAllowedPermissions {
+    fn check_permission(&self, request: &PermissionRequest) -> PermissionDecision {
+        Self::resolve(self.0.check_permission(request))
     }
 
-    Vec::new()
+    fn request_permission(&self, request: &PermissionRequest) -> PermissionDecision {
+        Self::resolve(self.0.request_permission(request))
+    }
+}
+
+/// Permissions for a PreToolUse hook's `ask`: anything not denied prompts
+/// the user, with the hook's reason.
+struct HookAskPermissions {
+    inner: Arc<dyn PermissionHandler>,
+    reason: String,
+}
+
+impl HookAskPermissions {
+    fn resolve(&self, decision: PermissionDecision) -> PermissionDecision {
+        match decision {
+            PermissionDecision::Deny | PermissionDecision::DenyPermanently => decision,
+            _ => PermissionDecision::Ask { reason: self.reason.clone() },
+        }
+    }
+}
+
+impl PermissionHandler for HookAskPermissions {
+    fn check_permission(&self, request: &PermissionRequest) -> PermissionDecision {
+        self.resolve(self.inner.check_permission(request))
+    }
+
+    fn request_permission(&self, request: &PermissionRequest) -> PermissionDecision {
+        self.resolve(self.inner.request_permission(request))
+    }
+}
+
+/// Run the PostToolUse hooks for a finished call. Their `additionalContext`,
+/// and the reason of a `deny`/`block`, are appended to the tool result the
+/// model sees.
+pub(crate) async fn post_tool_use(name: &str, input: &Value, result: &mut ToolResult, tool_ctx: &ToolContext) {
+    let hook = run_hooks(
+        &tool_ctx.config.hooks,
+        &payload(
+            tool_ctx,
+            HookEventData::PostToolUse {
+                tool_name: name,
+                tool_input: input,
+                tool_response: ToolResponse { content: &result.content, is_error: result.is_error },
+            },
+        ),
+    )
+    .await;
+    if hook.is_deny() {
+        result.content.push_str(&format!("\n\nPostToolUse hook feedback: {}", hook.reason_or_default()));
+    }
+    if let Some(context) = hook.additional_context {
+        result.content.push_str(&format!("\n\nPostToolUse hook context:\n{context}"));
+    }
+}
+
+/// One tool call end to end: PreToolUse hooks, the tool, PostToolUse hooks.
+pub(crate) async fn run_tool_with_hooks(
+    name: &str,
+    input: Value,
+    tools: &[Box<dyn Tool>],
+    tool_ctx: &ToolContext,
+) -> ToolResult {
+    match pre_tool_use(name, input, tool_ctx).await {
+        PreToolUse::Blocked(result) => result,
+        PreToolUse::Run { input, ctx } => {
+            let mut result = execute_tool(name, &input, tools, ctx.as_deref().unwrap_or(tool_ctx)).await;
+            post_tool_use(name, &input, &mut result, tool_ctx).await;
+            result
+        }
+    }
+}
+
+/// Run the PostModelTurn hooks after the model sampled `assistant_msg`. A
+/// `deny` (or exit 2) vetoes continuing the loop; `additionalContext` is
+/// sent with this turn's tool results.
+pub(crate) async fn post_model_turn(assistant_msg: &Message, tool_ctx: &ToolContext) -> HookResult {
+    if !has_hooks(&tool_ctx.config.hooks, HookEvent::PostModelTurn) {
+        return HookResult::default();
+    }
+    let text = assistant_msg.get_all_text();
+    run_hooks(
+        &tool_ctx.config.hooks,
+        &payload(tool_ctx, HookEventData::PostModelTurn { last_assistant_message: &text }),
+    )
+    .await
+}
+
+/// Fire Stop (SubagentStop in a sub-agent loop) for a finished turn. Returns
+/// the reason when a hook blocked the stop; the loop then sends it to the
+/// model and continues.
+pub(crate) async fn stop_hooks(
+    assistant_msg: &Message,
+    stop_hook_active: bool,
+    is_subagent: bool,
+    tool_ctx: &ToolContext,
+) -> Option<String> {
+    let event = if is_subagent { HookEvent::SubagentStop } else { HookEvent::Stop };
+    if !has_hooks(&tool_ctx.config.hooks, event) {
+        return None;
+    }
+    let text = assistant_msg.get_all_text();
+    let data = if is_subagent {
+        HookEventData::SubagentStop { stop_hook_active, last_assistant_message: &text }
+    } else {
+        HookEventData::Stop { stop_hook_active, last_assistant_message: &text }
+    };
+    let result = run_hooks(&tool_ctx.config.hooks, &payload(tool_ctx, data)).await;
+    result.is_deny().then(|| result.reason_or_default().to_string())
+}
+
+/// Fire PreCompact before an automatic compaction. Informational: the
+/// decision is ignored.
+pub(crate) async fn pre_compact(tool_ctx: &ToolContext) {
+    run_hooks(
+        &tool_ctx.config.hooks,
+        &payload(tool_ctx, HookEventData::PreCompact { trigger: CompactTrigger::Auto, custom_instructions: "" }),
+    )
+    .await;
 }
