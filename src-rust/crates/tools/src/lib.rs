@@ -130,6 +130,10 @@ pub struct ToolResult {
     pub is_error: bool,
     /// Optional structured metadata (for the TUI to render diffs, etc.).
     pub metadata: Option<Value>,
+    /// Image blocks sent to the model after `content`. Providers that cannot
+    /// carry images in tool results drop them, so `content` must describe
+    /// each image on its own.
+    pub images: Vec<claurst_core::types::ContentBlock>,
 }
 
 impl ToolResult {
@@ -138,6 +142,7 @@ impl ToolResult {
             content: content.into(),
             is_error: false,
             metadata: None,
+            images: Vec::new(),
         }
     }
 
@@ -146,11 +151,17 @@ impl ToolResult {
             content: content.into(),
             is_error: true,
             metadata: None,
+            images: Vec::new(),
         }
     }
 
     pub fn with_metadata(mut self, meta: Value) -> Self {
         self.metadata = Some(meta);
+        self
+    }
+
+    pub fn with_images(mut self, images: Vec<claurst_core::types::ContentBlock>) -> Self {
+        self.images = images;
         self
     }
 }
