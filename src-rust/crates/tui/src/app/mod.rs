@@ -445,8 +445,6 @@ pub struct App {
     pub auto_compact_enabled: bool,
     /// Context threshold (0-100) at which to auto-compact.
     pub auto_compact_threshold: u8,
-    /// Guard to prevent re-triggering auto-compact while one is in flight.
-    pub auto_compact_running: bool,
 
     // ---- Voice hold-to-talk ------------------------------------------------
 
@@ -766,7 +764,6 @@ impl App {
             status_line_override: None,
             auto_compact_enabled: false,
             auto_compact_threshold: 95,
-            auto_compact_running: false,
             voice_recorder: {
                 // Check whether voice input has been enabled via the /voice command
                 // (stored in ~/.claurst/ui-settings.json).  We also accept
