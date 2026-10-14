@@ -172,7 +172,7 @@ See [Permission Modes](#permission-modes) for a full description of each value.
 
 Tool names match the internal names: `Bash`, `Read`, `Write`, `Edit`, `Glob`,
 `Grep`, `WebSearch`, `WebFetch`, `TodoWrite`, `TodoRead`, and MCP tool names
-prefixed with their server name (`myserver_toolname`).
+in the form `mcp__<server>__<tool>` (see [MCP tool names](mcp.md#mcp-tool-names)).
 
 ### Directory access
 

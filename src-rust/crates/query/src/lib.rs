@@ -841,6 +841,18 @@ pub async fn run_query_loop(
                 }
             }
 
+            // MCP server instructions (from `initialize`) for servers whose
+            // tools this run exposes. Appended after the dynamic boundary:
+            // servers connect and change their tools during a session.
+            if let Some(section) = tool_ctx.mcp_manager.as_ref().and_then(|manager| {
+                manager.instructions_prompt_section(|name| tools.iter().any(|t| t.name() == name))
+            }) {
+                patched.append_system_prompt = Some(match patched.append_system_prompt.take() {
+                    Some(existing) => format!("{}\n\n{}", existing, section),
+                    None => section,
+                });
+            }
+
             // Goal system-prompt addendum (issue #230 / MI-3). Applied fresh
             // each turn (goal state — turns used, elapsed — changes over the
             // run) whenever goal continuation mode is active and a live goal
@@ -1424,13 +1436,15 @@ pub async fn run_query_loop(
                                     is_error: result.is_error,
                                 });
                             }
+                            let is_error = result.is_error;
                             tool_results.push(ContentBlock::ToolResult {
                                 tool_use_id: tool_id,
                                 content: tool_result_for_history(
                                     result.content,
+                                    result.images,
                                     config.tool_result_max_bytes,
                                 ),
-                                is_error: Some(result.is_error),
+                                is_error: Some(is_error),
                             });
                         }
                         messages.push(Message {
@@ -2139,13 +2153,15 @@ pub async fn run_query_loop(
                         });
                     }
 
+                    let is_error = result.is_error;
                     result_blocks.push(ContentBlock::ToolResult {
                         tool_use_id: p.id.clone(),
                         content: tool_result_for_history(
                             result.content,
+                            result.images,
                             config.tool_result_max_bytes,
                         ),
-                        is_error: if result.is_error { Some(true) } else { None },
+                        is_error: if is_error { Some(true) } else { None },
                     });
                 }
 
