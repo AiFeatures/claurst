@@ -116,11 +116,19 @@ const COMPOUND_KEYWORDS: &[&str] = &[
 /// Commands that execute their arguments (or input) as another command.
 const DYNAMIC_COMMANDS: &[&str] = &[
     "eval", "exec", "source", ".", "xargs", "sudo", "doas", "su", "env", "command", "builtin",
-    "nohup", "nice", "time", "timeout", "watch", "parallel",
+    "nohup", "nice", "time", "timeout", "watch", "parallel", "export",
 ];
+
+/// Characters through which the shell can turn one word into other words
+/// (parameter, brace and glob expansion).
+const EXPANSION_CHARS: [char; 6] = ['$', '{', '}', '*', '?', '['];
 
 /// Shells whose `-c` flag runs a command string.
 const SHELLS: &[&str] = &["bash", "sh", "zsh", "dash", "ksh", "mksh", "fish", "csh", "tcsh"];
+
+/// Interpreters whose `-c` / `-e` style flags run code from the command line
+/// (`python3.12` and other versioned pythons are matched separately).
+const INTERPRETERS: &[&str] = &["node", "nodejs", "deno", "bun", "perl", "ruby", "php", "lua"];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Redirect {
@@ -359,7 +367,9 @@ fn opaque_command(command: &SimpleCommand) -> Option<OpaqueReason> {
     if COMPOUND_KEYWORDS.contains(&name.as_str()) {
         return Some(OpaqueReason::Compound);
     }
-    if name.contains('$') {
+    // A command name the shell would expand (`$CMD`, `r{m,}`, `r?`) is not
+    // the name written; `[` and `[[` are the test commands themselves.
+    if name.contains(EXPANSION_CHARS) && name != "[" && name != "[[" {
         return Some(OpaqueReason::DynamicExecution);
     }
     let base = name.rsplit('/').next().unwrap_or(name);
@@ -368,6 +378,17 @@ fn opaque_command(command: &SimpleCommand) -> Option<OpaqueReason> {
     }
     if SHELLS.contains(&base)
         && words.any(|a| a.starts_with('-') && !a.starts_with("--") && a.contains('c'))
+    {
+        return Some(OpaqueReason::DynamicExecution);
+    }
+    // Interpreters running code given on the command line.
+    let interpreter = INTERPRETERS.contains(&base)
+        || base.strip_prefix("python").is_some_and(|v| v.chars().all(|c| c.is_ascii_digit() || c == '.'));
+    if interpreter
+        && command
+            .words
+            .iter()
+            .any(|a| matches!(a.as_str(), "-c" | "-e" | "-E" | "-p" | "--eval" | "--print"))
     {
         return Some(OpaqueReason::DynamicExecution);
     }
@@ -461,6 +482,25 @@ pub fn approval_rules(command: &str) -> Vec<String> {
 /// Quoting in the pattern is honoured, so `git commit -m 'a b'` matches the
 /// words `git`, `commit`, `-m`, `a b`.
 pub fn pattern_matches(pattern: &str, words: &[String]) -> bool {
+    pattern_matches_with(pattern, words, |token, word| token == word)
+}
+
+/// Whether the deny rule `pattern` may cover `words`. Like
+/// [`pattern_matches`], except that a word the shell would expand (it holds
+/// `$`, `{`, `}`, `*`, `?` or `[`) matches any token, so a variable or brace
+/// expansion cannot step around a deny rule. Best effort: one word expanding
+/// into several is not modelled.
+pub fn pattern_denies(pattern: &str, words: &[String]) -> bool {
+    pattern_matches_with(pattern, words, |token, word| {
+        token == word || word.contains(EXPANSION_CHARS)
+    })
+}
+
+fn pattern_matches_with(
+    pattern: &str,
+    words: &[String],
+    eq: impl Fn(&str, &str) -> bool,
+) -> bool {
     let pattern = pattern.trim();
     let (prefix, wildcard) = match pattern.strip_suffix('*') {
         Some(rest) if rest.is_empty() || rest.ends_with(char::is_whitespace) => (rest, true),
@@ -475,9 +515,11 @@ pub fn pattern_matches(pattern: &str, words: &[String]) -> bool {
         _ => return false,
     };
     if wildcard {
-        words.len() >= tokens.len() && tokens.iter().zip(words).all(|(t, w)| t == w)
+        words.len() >= tokens.len() && tokens.iter().zip(words).all(|(t, w)| eq(t.as_str(), w.as_str()))
     } else {
-        !tokens.is_empty() && tokens == words
+        !tokens.is_empty()
+            && tokens.len() == words.len()
+            && tokens.iter().zip(words).all(|(t, w)| eq(t.as_str(), w.as_str()))
     }
 }
 
@@ -605,6 +647,21 @@ mod tests {
         ] {
             assert_eq!(opaque(cmd), OpaqueReason::DynamicExecution, "{cmd}");
         }
+        // Expanded names, `export`, and interpreters running inline code.
+        for cmd in [
+            "{rm,-rf,/tmp/x}",
+            "r{m,} -rf x",
+            "r? x",
+            "export X=push",
+            "python3 -c 'import os'",
+            "python3.12 -c x",
+            "node -e 'x'",
+            "perl -e 'x'",
+        ] {
+            assert_eq!(opaque(cmd), OpaqueReason::DynamicExecution, "{cmd}");
+        }
+        assert_eq!(words("[ -f x ] && cat x"), vec![w(&["[", "-f", "x", "]"]), w(&["cat", "x"])]);
+        assert_eq!(words("python3 script.py"), vec![w(&["python3", "script.py"])]);
         // A shell running a script file is an ordinary command.
         assert_eq!(words("bash ./build.sh --release"), vec![w(&["bash", "./build.sh", "--release"])]);
     }
@@ -682,6 +739,16 @@ mod tests {
         assert!(!pattern_matches("ls; rm *", &w(&["ls"])));
         assert!(!pattern_matches("echo $(id)", &w(&["echo", "$(id)"])));
         assert!(!pattern_matches("git*", &w(&["git", "push"])));
+    }
+
+    #[test]
+    fn deny_patterns_treat_expanding_words_as_wildcards() {
+        assert!(pattern_denies("git push *", &w(&["git", "{push,-f}"])));
+        assert!(pattern_denies("git push *", &w(&["git", "$X", "-f"])));
+        assert!(pattern_denies("git push *", &w(&["git", "pu?h"])));
+        assert!(!pattern_denies("git push *", &w(&["git", "status"])));
+        // Allow matching stays literal.
+        assert!(!pattern_matches("git push *", &w(&["git", "$X"])));
     }
 
     #[test]

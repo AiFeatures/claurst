@@ -3708,7 +3708,7 @@ pub mod permissions {
         ///   matched by an allow pattern and none redirects output to a file.
         /// - An opaque line matches only a rule equal to the whole command.
         fn shell_rule_decision(&self, tool_name: &str, command: &str) -> Option<PermissionDecision> {
-            use crate::shell_scan::{pattern_matches, scan, Scan};
+            use crate::shell_scan::{pattern_denies, pattern_matches, scan, Scan};
             let (deny, allow): (Vec<&PermissionRule>, Vec<&PermissionRule>) = self
                 .rules()
                 .filter(|r| r.tool_name.as_deref().is_none_or(|t| t == tool_name))
@@ -3724,7 +3724,11 @@ pub mod permissions {
                 Scan::Commands(commands) => {
                     let denied = commands.iter().any(|c| {
                         let normalized = c.normalized_words();
-                        deny.iter().any(|r| hit(r, &c.words) || hit(r, &normalized))
+                        deny.iter().any(|r| {
+                            r.path_pattern.as_deref().is_some_and(|p| {
+                                pattern_denies(p, &c.words) || pattern_denies(p, &normalized)
+                            })
+                        })
                     });
                     if denied {
                         return Some(PermissionDecision::Deny);
@@ -4538,6 +4542,29 @@ pub mod permissions {
             // With a deny pattern present, the tool-wide allow does not cover
             // an opaque line that could hide the denied command.
             assert!(is_ask(bash(&m, "eval rm x")));
+        }
+
+        /// #445 review: shell expansion cannot step around a deny rule.
+        #[test]
+        fn shell_expansion_does_not_bypass_deny_rules() {
+            let mut m = mgr(PermissionMode::BypassPermissions);
+            m.add_rule(bash_rule(Some("rm *"), PermissionAction::Deny));
+            m.add_rule(bash_rule(Some("git push *"), PermissionAction::Deny));
+            // Under a broad allow, expanded command names are opaque (they
+            // ask) and expanded arguments hit the deny patterns.
+            let mut guarded = mgr(PermissionMode::Default);
+            guarded.add_rule(bash_rule(Some("git *"), PermissionAction::Allow));
+            guarded.add_rule(bash_rule(Some("rm *"), PermissionAction::Deny));
+            guarded.add_rule(bash_rule(Some("git push *"), PermissionAction::Deny));
+            for cmd in ["{rm,-rf,/tmp/x}", "r{m,} -rf x"] {
+                assert!(is_ask(bash(&guarded, cmd)), "{cmd}");
+            }
+            for cmd in ["git {push,-f}", "export X=push; git $X -f", "X=push; git $X -f", "git pu?h -f"] {
+                assert_ne!(bash(&guarded, cmd), PermissionDecision::Allow, "{cmd}");
+            }
+            assert_eq!(bash(&m, "git {push,-f}"), PermissionDecision::Deny);
+            assert_eq!(bash(&m, "X=push; git $X -f"), PermissionDecision::Deny);
+            assert_eq!(bash(&guarded, "git status"), PermissionDecision::Allow);
         }
 
         #[test]
