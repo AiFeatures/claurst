@@ -767,24 +767,26 @@ impl ToolContext {
         self.request_permission_inner(request)
     }
 
-    /// Check one write call that touches several files (BatchEdit,
-    /// ApplyPatch). The call is allowed without asking when every file is
-    /// allowed on its own (AcceptEdits inside the workspace, or path rules
-    /// covering each file) and refused when any file is refused; otherwise
-    /// the user is asked once for the whole call.
+    /// Check one write call that touches several files (BatchEdit). The
+    /// call is allowed without asking when every file is allowed on its own
+    /// (AcceptEdits inside the workspace, or path rules covering each file)
+    /// and refused when any file is refused; otherwise the user is asked
+    /// once, about the first file that needs approval.
     pub fn check_permission_for_paths(
         &self,
         tool_name: &str,
         description: &str,
         paths: &[PathBuf],
     ) -> Result<(), claurst_core::error::ClaudeError> {
-        let mut all_allowed = !paths.is_empty();
+        let mut needs_approval: Option<&PathBuf> = None;
         for path in paths {
             let request =
                 self.build_permission_request(tool_name, description, None, false, Some(path.clone()));
             match self.permission_handler.check_permission(&request) {
                 PermissionDecision::Allow | PermissionDecision::AllowPermanently => {}
-                PermissionDecision::Ask { .. } => all_allowed = false,
+                PermissionDecision::Ask { .. } => {
+                    needs_approval.get_or_insert(path);
+                }
                 _ => {
                     return Err(claurst_core::error::ClaudeError::PermissionDenied(format!(
                         "Permission denied for tool '{}': {}",
@@ -794,10 +796,13 @@ impl ToolContext {
                 }
             }
         }
-        if all_allowed {
-            return Ok(());
+        match needs_approval {
+            Some(path) => self
+                .check_permission_for_path(tool_name, description, path.clone(), false)
+                .map(|_| ()),
+            None if paths.is_empty() => self.check_permission(tool_name, description, false),
+            None => Ok(()),
         }
-        self.check_permission(tool_name, description, false)
     }
 
     /// Bind a path-scoped permission check to the file that was actually

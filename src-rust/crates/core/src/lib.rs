@@ -3192,7 +3192,9 @@ pub mod permissions {
         }
         let content = serde_json::to_string_pretty(&ProjectApprovals { rules })
             .map_err(std::io::Error::other)?;
-        let tmp = path.with_extension("json.tmp");
+        // Per-process temp name, so two sessions saving at once do not
+        // write the same temp file.
+        let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
         std::fs::write(&tmp, content)?;
         std::fs::rename(&tmp, path)
     }
