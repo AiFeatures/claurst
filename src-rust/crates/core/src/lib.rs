@@ -6303,13 +6303,16 @@ mod tests {
     }
 
     #[test]
-    fn test_auto_handler_accept_edits_only_allows_edit() {
+    fn test_auto_handler_accept_edits_needs_a_workspace_target() {
+        // AcceptEdits allows edits only for a target inside the workspace
+        // (see `auto_handler_accept_edits_covers_workspace_writes_only`); a
+        // request without a target path is not covered.
         let handler = crate::permissions::AutoPermissionHandler {
             mode: crate::config::PermissionMode::AcceptEdits,
         };
         assert_eq!(
             handler.check_permission(&make_req("Edit", false)),
-            crate::permissions::PermissionDecision::Allow
+            crate::permissions::PermissionDecision::Deny
         );
         assert_eq!(
             handler.check_permission(&make_req("FileWrite", false)),
