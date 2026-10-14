@@ -957,7 +957,7 @@ impl Tool for PtyBashTool {
                 },
                 "description": {
                     "type": "string",
-                    "description": "Clear, concise description of what this command does"
+                    "description": "Shown to the user as the approval question: a short question about what this command does, e.g. \"Install the project's npm dependencies?\""
                 },
                 "timeout": {
                     "type": "number",
@@ -981,6 +981,13 @@ impl Tool for PtyBashTool {
             Ok(p) => p,
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
         };
+
+        // `apply_patch <<'EOF' ... EOF` feeds a patch to a program that does
+        // not exist here: apply it as ApplyPatch does, with that tool's
+        // per-path Edit permission checks, from the shell's current directory.
+        if let Some(result) = crate::apply_patch::run_heredoc_invocation(&params.command, ctx).await {
+            return result;
+        }
 
         // Permission check
         let reason = params

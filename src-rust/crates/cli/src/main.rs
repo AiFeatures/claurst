@@ -529,35 +529,53 @@ async fn main() -> anyhow::Result<()> {
             .api_base = Some(base.clone());
     }
 
-    // --dump-system-prompt fast path
-    if cli.dump_system_prompt {
-        let ctx = ContextBuilder::new(cwd.clone())
-            .disable_claude_mds(config.disable_claude_mds);
-        let sys = ctx.build_system_context().await;
-        let user = ctx.build_user_context().await;
-        println!("{}\n\n{}", sys, user);
-        return Ok(());
-    }
-
     // Build context
     let ctx_builder = ContextBuilder::new(cwd.clone())
         .disable_claude_mds(config.disable_claude_mds);
     let system_ctx = ctx_builder.build_system_context().await;
     let user_ctx = ctx_builder.build_user_context().await;
 
-    // Build system prompt. Only session-stable text goes here (it lands in
-    // the cached system block); `system_ctx` (date, git status, IDE context)
-    // is passed separately as `session_context` and sent in the dynamic block.
-    let base_prompt = config
-        .custom_system_prompt
-        .clone()
-        .unwrap_or_else(|| include_str!("system_prompt.txt").to_string());
-    let system_prompt = [Some(base_prompt), Some(user_ctx), config.append_system_prompt.clone()]
+    // Session-stable additions to the default prompt, which
+    // `claurst_core::system_prompt::build_system_prompt` assembles on its own
+    // (identity, capabilities, guidelines). Only session-stable text goes here
+    // (it lands in the cached system block); `system_ctx` (git status, IDE
+    // context) is passed separately as `session_context` and sent in the
+    // dynamic block.
+    let system_prompt = [config.custom_system_prompt.clone(), Some(user_ctx), config.append_system_prompt.clone()]
         .into_iter()
         .flatten()
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
         .join("\n\n");
+
+    // --dump-system-prompt fast path: print the stable and dynamic blocks
+    // assembled the way the first turn of this session would send them.
+    if cli.dump_system_prompt {
+        let opts = claurst_core::system_prompt::SystemPromptOptions {
+            custom_system_prompt: (!system_prompt.is_empty()).then_some(system_prompt),
+            session_context: Some(system_ctx),
+            output_style: config.effective_output_style(),
+            custom_output_style_prompt: config.resolve_output_style_prompt(),
+            working_directory: Some(cwd.display().to_string()),
+            additional_dirs: config
+                .additional_dirs
+                .iter()
+                .map(|dir| dir.display().to_string())
+                .collect(),
+            enabled_tools: Some(
+                claurst_tools::all_tools()
+                    .iter()
+                    .map(|tool| tool.name().to_string())
+                    .collect(),
+            ),
+            permission_mode: Some(config.permission_mode.clone()),
+            ..Default::default()
+        };
+        let prompt = claurst_core::system_prompt::build_system_prompt(&opts);
+        let (stable, dynamic) = claurst_core::system_prompt::split_at_dynamic_boundary(&prompt);
+        println!("{stable}\n\n{dynamic}");
+        return Ok(());
+    }
 
     // Initialize API client.
     // Try config/env first; fall back to saved OAuth tokens.
@@ -794,7 +812,7 @@ async fn main() -> anyhow::Result<()> {
     let mut query_config = claurst_query::QueryConfig::from_config_with_registry(&config, &model_registry);
     query_config.model_registry = Some(model_registry.clone());
     query_config.max_turns = cli.max_turns;
-    query_config.system_prompt = Some(system_prompt);
+    query_config.system_prompt = (!system_prompt.is_empty()).then_some(system_prompt);
     query_config.append_system_prompt = None;
     query_config.session_context = Some(system_ctx);
     query_config.working_directory = Some(cwd.display().to_string());
@@ -4184,6 +4202,7 @@ async fn run_interactive(
                         }
                     }
                 }
+                let aborted = matches!(result, Ok(QueryOutcome::Cancelled));
                 app.last_turn_outcome = claurst_tui::TurnOutcome::from_query_result(&result);
                 if let Ok(QueryOutcome::Error(err)) = result {
                     while app.notifications.current_is_error() {
@@ -4197,6 +4216,12 @@ async fn run_interactive(
                 }
                 // Sync the updated conversation back to our local vector
                 messages = msgs_arc.lock().await.clone();
+                // Tell the next turn that this one was interrupted on purpose.
+                if aborted {
+                    messages.push(claurst_core::types::Message::user(
+                        claurst_core::system_prompt::TURN_ABORTED_MESSAGE,
+                    ));
+                }
                 session.messages = messages.clone();
                 session.updated_at = chrono::Utc::now();
                 session.model = claurst_api::effective_model_for_config(&cmd_ctx.config, &model_registry);
