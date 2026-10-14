@@ -2962,8 +2962,10 @@ pub mod permissions {
     /// A single permission rule.
     ///
     /// Matches requests where:
-    ///   - `tool_name` is `None` (applies to every tool) OR equals the
-    ///     request tool name.
+    ///   - `tool_name` is `None` (applies to every tool), equals the request
+    ///     tool name, or is a server-wide MCP rule (`mcp__<server>` or
+    ///     `mcp__<server>__*`) and the request is one of that server's
+    ///     `mcp__<server>__<tool>` tools.
     ///   - `path_pattern` is `None` OR the glob pattern matches the
     ///     request path.
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2982,7 +2984,7 @@ pub mod permissions {
         pub fn matches(&self, tool_name: &str, path: Option<&str>) -> bool {
             // Tool name check
             if let Some(ref rule_tool) = self.tool_name {
-                if rule_tool != tool_name {
+                if rule_tool != tool_name && !mcp_server_rule_matches(rule_tool, tool_name) {
                     return false;
                 }
             }
@@ -3002,6 +3004,24 @@ pub mod permissions {
             }
             true
         }
+    }
+
+    /// `true` when `rule_tool` is a server-wide MCP rule (`mcp__<server>` or
+    /// `mcp__<server>__*`) and `tool_name` is one of that server's exposed
+    /// `mcp__<server>__<tool>` names. `<server>` is the sanitized server name
+    /// as it appears in the exposed tool names.
+    fn mcp_server_rule_matches(rule_tool: &str, tool_name: &str) -> bool {
+        let Some(rule_server) = rule_tool.strip_prefix("mcp__") else {
+            return false;
+        };
+        let rule_server = rule_server.strip_suffix("__*").unwrap_or(rule_server);
+        if rule_server.is_empty() || rule_server.contains("__") {
+            return false;
+        }
+        tool_name
+            .strip_prefix("mcp__")
+            .and_then(|rest| rest.strip_prefix(rule_server))
+            .is_some_and(|rest| rest.starts_with("__") && rest.len() > 2)
     }
 
     /// The canonical form of an absolute glob whose literal directory prefix
@@ -3745,6 +3765,29 @@ pub mod permissions {
                 scope: PermissionScope::Session,
             });
             assert_eq!(m.evaluate("Bash", "echo hi", None, None, &[]), PermissionDecision::Deny);
+        }
+
+        #[test]
+        fn mcp_server_wide_rules_match_that_servers_tools_only() {
+            let rule = |tool: &str| PermissionRule {
+                tool_name: Some(tool.to_string()),
+                path_pattern: None,
+                action: PermissionAction::Allow,
+                scope: PermissionScope::Session,
+            };
+            for server_rule in ["mcp__git", "mcp__git__*"] {
+                let r = rule(server_rule);
+                assert!(r.matches("mcp__git__status", None), "{server_rule}");
+                assert!(r.matches("mcp__git__lab_status", None), "{server_rule}");
+                assert!(!r.matches("mcp__git_lab__status", None), "{server_rule}");
+                assert!(!r.matches("mcp__git__", None), "{server_rule}");
+                assert!(!r.matches("git_status", None), "{server_rule}");
+                assert!(!r.matches("Bash", None), "{server_rule}");
+            }
+            // An exact tool rule still matches only that tool.
+            let exact = rule("mcp__git__status");
+            assert!(exact.matches("mcp__git__status", None));
+            assert!(!exact.matches("mcp__git__diff", None));
         }
 
         #[test]

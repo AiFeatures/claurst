@@ -57,8 +57,9 @@ use tracing_subscriber::{fmt::writer::BoxMakeWriter, EnvFilter};
 // ---------------------------------------------------------------------------
 
 struct McpToolWrapper {
+    /// Definition under the exposed `mcp__<server>__<tool>` name; the manager
+    /// routes calls by that name.
     tool_def: ToolDefinition,
-    server_name: String,
     manager: Arc<claurst_mcp::McpManager>,
 }
 
@@ -87,14 +88,6 @@ impl Tool for McpToolWrapper {
             return ToolResult::error(e.to_string());
         }
 
-        // Strip the server-name prefix to get the bare tool name.
-        let prefix = format!("{}_", self.server_name);
-        let bare_name = self
-            .tool_def
-            .name
-            .strip_prefix(&prefix)
-            .unwrap_or(&self.tool_def.name);
-
         let args = if input.is_null() { None } else { Some(input) };
 
         match self.manager.call_tool(&self.tool_def.name, args).await {
@@ -106,7 +99,7 @@ impl Tool for McpToolWrapper {
                     ToolResult::success(text)
                 }
             }
-            Err(e) => ToolResult::error(format!("MCP tool '{}' failed: {}", bare_name, e)),
+            Err(e) => ToolResult::error(format!("MCP tool '{}' failed: {}", self.tool_def.name, e)),
         }
     }
 }
@@ -988,10 +981,9 @@ fn build_tools_with_mcp(
     v.push(Box::new(claurst_query::AgentTool));
 
     if let Some(ref manager_arc) = mcp_manager {
-        for (server_name, tool_def) in manager_arc.all_tool_definitions() {
+        for entry in manager_arc.all_tool_definitions() {
             let wrapper = McpToolWrapper {
-                tool_def,
-                server_name,
+                tool_def: entry.definition,
                 manager: manager_arc.clone(),
             };
             v.push(Box::new(wrapper));

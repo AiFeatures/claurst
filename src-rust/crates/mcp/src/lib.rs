@@ -207,6 +207,103 @@ pub struct McpStatusSummary {
 }
 
 // ---------------------------------------------------------------------------
+// Tool naming and routing
+// ---------------------------------------------------------------------------
+
+/// Prefix of every MCP tool name exposed to the model: `mcp__<server>__<tool>`.
+pub const MCP_TOOL_PREFIX: &str = "mcp__";
+
+/// Longest exposed tool name. OpenAI-compatible and Gemini APIs cap function
+/// names at 64 characters; Anthropic allows 128.
+pub const MAX_MCP_TOOL_NAME_LEN: usize = 64;
+
+/// One MCP tool as exposed to the model.
+#[derive(Debug, Clone)]
+pub struct McpToolEntry {
+    pub server_name: String,
+    /// The tool's own name on its server.
+    pub tool_name: String,
+    /// Definition under the exposed `mcp__<server>__<tool>` name.
+    pub definition: ToolDefinition,
+}
+
+/// Replace every character outside `[A-Za-z0-9_-]` (the set every provider
+/// accepts in a tool name) with `_`. An empty input becomes `_`.
+pub fn sanitize_tool_name_part(raw: &str) -> String {
+    let sanitized: String = raw
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .collect();
+    if sanitized.is_empty() {
+        "_".to_string()
+    } else {
+        sanitized
+    }
+}
+
+/// The exposed name for `tool` on `server`, unique within `used`.
+///
+/// Normally `mcp__<server>__<tool>` with both parts sanitized. When that is
+/// longer than [`MAX_MCP_TOOL_NAME_LEN`] or already taken (two raw names that
+/// sanitize alike), it is truncated and suffixed with a hash of the raw
+/// `(server, tool)` pair. Calls are routed through the manager's map from
+/// exposed name to `(server, tool)`, never by parsing the name back.
+fn exposed_tool_name(server: &str, tool: &str, used: &mut std::collections::HashSet<String>) -> String {
+    use sha2::{Digest, Sha256};
+
+    let base = format!(
+        "{}{}__{}",
+        MCP_TOOL_PREFIX,
+        sanitize_tool_name_part(server),
+        sanitize_tool_name_part(tool)
+    );
+    if base.len() <= MAX_MCP_TOOL_NAME_LEN && used.insert(base.clone()) {
+        return base;
+    }
+    let mut attempt: u32 = 0;
+    loop {
+        let mut hasher = Sha256::new();
+        hasher.update(server.as_bytes());
+        hasher.update([0u8]);
+        hasher.update(tool.as_bytes());
+        if attempt > 0 {
+            hasher.update(attempt.to_le_bytes());
+        }
+        let digest = hasher.finalize();
+        let suffix: String = digest[..4].iter().map(|b| format!("{:02x}", b)).collect();
+        // `base` is ASCII after sanitization, so byte truncation is char-safe.
+        let keep = (MAX_MCP_TOOL_NAME_LEN - suffix.len() - 1).min(base.len());
+        let candidate = format!("{}_{}", &base[..keep], suffix);
+        if used.insert(candidate.clone()) {
+            return candidate;
+        }
+        attempt += 1;
+    }
+}
+
+/// Exposed tool entries for `clients` (sorted by server name), in a stable
+/// order: servers by name, tools in server order.
+fn build_tool_entries(clients: &[(String, Arc<McpClient>)]) -> Vec<McpToolEntry> {
+    let mut used = std::collections::HashSet::new();
+    let mut entries = Vec::new();
+    for (server_name, client) in clients {
+        for tool in &client.tools {
+            let name = exposed_tool_name(server_name, &tool.name, &mut used);
+            entries.push(McpToolEntry {
+                server_name: server_name.clone(),
+                tool_name: tool.name.clone(),
+                definition: ToolDefinition {
+                    name,
+                    description: tool.description.clone().unwrap_or_default(),
+                    input_schema: tool.input_schema.clone(),
+                },
+            });
+        }
+    }
+    entries
+}
+
+// ---------------------------------------------------------------------------
 // JSON-RPC 2.0 Types
 // ---------------------------------------------------------------------------
 
@@ -941,6 +1038,28 @@ pub struct McpManager {
 struct ManagerState {
     clients: HashMap<String, Arc<McpClient>>,
     statuses: HashMap<String, McpServerStatus>,
+    /// Exposed tools, rebuilt whenever a client or its tool list changes.
+    tools: Vec<McpToolEntry>,
+    /// Exposed tool name → index into `tools`.
+    routes: HashMap<String, usize>,
+}
+
+impl ManagerState {
+    fn rebuild_tools(&mut self) {
+        let mut clients: Vec<(String, Arc<McpClient>)> = self
+            .clients
+            .iter()
+            .map(|(name, client)| (name.clone(), Arc::clone(client)))
+            .collect();
+        clients.sort_by(|a, b| a.0.cmp(&b.0));
+        self.tools = build_tool_entries(&clients);
+        self.routes = self
+            .tools
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| (entry.definition.name.clone(), index))
+            .collect();
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1107,6 +1226,7 @@ impl McpManager {
             state
                 .statuses
                 .insert(name.clone(), McpServerStatus::Connected { tool_count });
+            state.rebuild_tools();
         }
         self.bump();
         match notifications {
@@ -1179,6 +1299,7 @@ impl McpManager {
             state
                 .statuses
                 .insert(server_name.to_string(), McpServerStatus::Connected { tool_count });
+            state.rebuild_tools();
         }
         self.bump();
         info!(server = %server_name, tools = tool_count, "MCP tool list refreshed");
@@ -1307,43 +1428,37 @@ impl McpManager {
     // Tool / resource helpers
     // -----------------------------------------------------------------------
 
-    /// Get all tool definitions from all connected servers.
-    pub fn all_tool_definitions(&self) -> Vec<(String, ToolDefinition)> {
-        let mut defs = vec![];
-        for (server_name, client) in self.clients_sorted() {
-            for td in client.tool_definitions() {
-                // Prefix tool name with server name to avoid conflicts
-                let prefixed = ToolDefinition {
-                    name: format!("{}_{}", server_name, td.name),
-                    description: format!("[{}] {}", server_name, td.description),
-                    input_schema: td.input_schema.clone(),
-                };
-                defs.push((server_name.clone(), prefixed));
-            }
-        }
-        defs
+    /// Every tool of every connected server under its exposed
+    /// `mcp__<server>__<tool>` name, in a stable order.
+    pub fn all_tool_definitions(&self) -> Vec<McpToolEntry> {
+        self.state.read().tools.clone()
     }
 
-    /// Execute a tool call, routing to the correct server.
-    /// Tool name format: `<server_name>_<tool_name>`.
+    /// Execute a tool call by its exposed name, routed through the
+    /// exposed-name map to the owning server.
     pub async fn call_tool(
         &self,
-        prefixed_name: &str,
+        exposed_name: &str,
         arguments: Option<Value>,
     ) -> anyhow::Result<CallToolResult> {
-        let clients = self.clients_sorted();
-        // Find the server name by matching prefix
-        for (server_name, client) in &clients {
-            let prefix = format!("{}_", server_name);
-            if let Some(tool_name) = prefixed_name.strip_prefix(&prefix) {
-                return client.call_tool(tool_name, arguments).await;
-            }
-        }
-        Err(anyhow::anyhow!(
-            "No MCP server found for tool '{}'. Connected servers: [{}]",
-            prefixed_name,
-            self.server_names().join(", ")
-        ))
+        let (client, tool_name) = {
+            let state = self.state.read();
+            let entry = state
+                .routes
+                .get(exposed_name)
+                .and_then(|&index| state.tools.get(index))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Unknown MCP tool '{}' (its server may have disconnected or removed it)",
+                        exposed_name
+                    )
+                })?;
+            let client = state.clients.get(&entry.server_name).cloned().ok_or_else(|| {
+                anyhow::anyhow!("MCP server '{}' is not connected", entry.server_name)
+            })?;
+            (client, entry.tool_name.clone())
+        };
+        client.call_tool(&tool_name, arguments).await
     }
 
     /// Number of connected servers.
@@ -1863,6 +1978,97 @@ mod tests {
         let failed = mgr.failed_servers();
         assert_eq!(failed.len(), 1);
         assert!(failed[0].1.contains("unsupported transport"));
+    }
+
+    fn test_client(server: &str, tools: &[&str]) -> McpClient {
+        let mut client = client::McpClient::new_for_test(server);
+        client.tools = tools
+            .iter()
+            .map(|name| McpTool {
+                name: (*name).to_string(),
+                description: Some(format!("{} tool", name)),
+                input_schema: serde_json::json!({ "type": "object" }),
+            })
+            .collect();
+        client
+    }
+
+    // ---- tool naming / routing ---------------------------------------------
+
+    #[test]
+    fn test_sanitize_tool_name_part() {
+        assert_eq!(sanitize_tool_name_part("github"), "github");
+        assert_eq!(sanitize_tool_name_part("my.server/v2"), "my_server_v2");
+        assert_eq!(sanitize_tool_name_part("kebab-case_ok"), "kebab-case_ok");
+        assert_eq!(sanitize_tool_name_part("über tool"), "_ber_tool");
+        assert_eq!(sanitize_tool_name_part(""), "_");
+    }
+
+    #[test]
+    fn test_exposed_names_do_not_collide_across_prefix_servers() {
+        // `{server}_{tool}` mapped both of these to `git_lab_status`.
+        let clients = vec![
+            ("git".to_string(), Arc::new(test_client("git", &["lab_status"]))),
+            ("git_lab".to_string(), Arc::new(test_client("git_lab", &["status"]))),
+        ];
+        let entries = build_tool_entries(&clients);
+        let names: Vec<&str> = entries.iter().map(|e| e.definition.name.as_str()).collect();
+        assert_eq!(names, vec!["mcp__git__lab_status", "mcp__git_lab__status"]);
+        assert_eq!(entries[0].server_name, "git");
+        assert_eq!(entries[0].tool_name, "lab_status");
+        assert_eq!(entries[1].server_name, "git_lab");
+        assert_eq!(entries[1].tool_name, "status");
+    }
+
+    #[test]
+    fn test_exposed_names_disambiguate_sanitization_collisions() {
+        let clients = vec![
+            ("a.b".to_string(), Arc::new(test_client("a.b", &["t"]))),
+            ("a_b".to_string(), Arc::new(test_client("a_b", &["t"]))),
+        ];
+        let entries = build_tool_entries(&clients);
+        assert_eq!(entries[0].definition.name, "mcp__a_b__t");
+        assert_ne!(entries[1].definition.name, entries[0].definition.name);
+        assert!(entries[1].definition.name.starts_with("mcp__a_b__t_"));
+        assert!(entries
+            .iter()
+            .all(|e| e.definition.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')));
+    }
+
+    #[test]
+    fn test_exposed_names_are_capped_and_stable() {
+        let long_tool = "x".repeat(100);
+        let mut used = std::collections::HashSet::new();
+        let first = exposed_tool_name("server", &long_tool, &mut used);
+        assert!(first.len() <= MAX_MCP_TOOL_NAME_LEN, "{} chars", first.len());
+        assert!(first.starts_with("mcp__server__xxx"));
+        // Same raw identity → same name on a rebuild.
+        let again = exposed_tool_name("server", &long_tool, &mut std::collections::HashSet::new());
+        assert_eq!(first, again);
+    }
+
+    #[tokio::test]
+    async fn test_manager_routes_by_exposed_name() {
+        let mgr = Arc::new(McpManager::new());
+        mgr.install_client(test_client("git", &["lab_status"]));
+        mgr.install_client(test_client("git_lab", &["status"]));
+        let entries = mgr.all_tool_definitions();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].definition.name, "mcp__git_lab__status");
+        assert_eq!(entries[1].definition.description, "status tool");
+
+        // The legacy `{server}_{tool}` form is not routed.
+        let err = mgr
+            .call_tool("git_lab_status", None)
+            .await
+            .expect_err("legacy names are not routed");
+        assert!(err.to_string().contains("Unknown MCP tool"), "{}", err);
+        // A routed name reaches the owning client (whose test backend is absent).
+        let err = mgr
+            .call_tool("mcp__git_lab__status", None)
+            .await
+            .expect_err("test clients have no backend");
+        assert!(err.to_string().contains("backend missing"), "{}", err);
     }
 
     #[tokio::test]

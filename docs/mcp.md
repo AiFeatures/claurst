@@ -184,7 +184,15 @@ Reads a specific resource by server name and URI.
 
 Use `ListMcpResources` to discover available URIs before calling `ReadMcpResource`.
 
-In addition to these, every tool that an MCP server exposes is automatically available to the model under its declared name (wrapped transparently by `McpToolWrapper`).
+In addition to these, every tool that an MCP server exposes is available to the model (wrapped transparently by `McpToolWrapper`) under a namespaced name, described below.
+
+### MCP tool names
+
+Each MCP tool is exposed as `mcp__<server>__<tool>`, for example `mcp__github__create_issue`. Both parts are sanitized: every character outside `A-Z a-z 0-9 _ -` becomes `_`, so server `my.server` with tool `do it` becomes `mcp__my_server__do_it`. When a name would exceed 64 characters, or two tools sanitize to the same name, the name is truncated and suffixed with `_` and 8 hex characters derived from the original server and tool names. Calls are routed through an explicit map from the exposed name to the server and tool, so servers whose names share a prefix (`git` and `git_lab`) never collide. `/mcp tools` lists each tool's exposed name.
+
+Permission rules match the exposed name. A rule for `mcp__<server>` or `mcp__<server>__*` (with the sanitized server name) matches every tool of that server.
+
+The previous `<server>_<tool>` names are not accepted; permission rules written for them must be renamed.
 
 ---
 

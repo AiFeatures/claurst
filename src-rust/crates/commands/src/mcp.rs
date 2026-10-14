@@ -321,7 +321,7 @@ impl McpCommand {
 
         let all_tools = manager.all_tool_definitions();
         let tools: Vec<_> = if let Some(filter) = server_filter {
-            all_tools.iter().filter(|(srv, _)| srv.as_str() == filter).collect()
+            all_tools.iter().filter(|entry| entry.server_name == filter).collect()
         } else {
             all_tools.iter().collect()
         };
@@ -341,16 +341,20 @@ impl McpCommand {
         };
         let mut out = format!("{}\n{}\n", title, "─".repeat(title.len()));
         let mut last_server = "";
-        for (server, tool) in &tools {
-            if server.as_str() != last_server && server_filter.is_none() {
-                out.push_str(&format!("[{}]\n", server));
-                last_server = server.as_str();
+        for entry in &tools {
+            if entry.server_name != last_server && server_filter.is_none() {
+                out.push_str(&format!("[{}]\n", entry.server_name));
+                last_server = entry.server_name.as_str();
             }
-            // Strip the "servername_" prefix for display
-            let bare = tool.name.strip_prefix(&format!("{}_", server)).unwrap_or(&tool.name);
-            let preview: String = tool.description.chars().take(80).collect();
-            let ellipsis = if tool.description.len() > 80 { "…" } else { "" };
-            out.push_str(&format!("  {}\n    {}{}\n", bare, preview, ellipsis));
+            // Show the server's own name plus the exposed name that
+            // permission rules match on.
+            let description = &entry.definition.description;
+            let preview: String = description.chars().take(80).collect();
+            let ellipsis = if description.chars().count() > 80 { "…" } else { "" };
+            out.push_str(&format!(
+                "  {} ({})\n    {}{}\n",
+                entry.tool_name, entry.definition.name, preview, ellipsis
+            ));
         }
         CommandResult::Message(out)
     }

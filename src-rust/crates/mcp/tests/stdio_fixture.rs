@@ -7,7 +7,7 @@
 // output can corrupt the protocol stream, and no extra binary is shipped.
 
 use claurst_core::config::McpServerConfig;
-use claurst_mcp::{McpManager, McpServerStatus};
+use claurst_mcp::{McpContent, McpManager, McpServerStatus};
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
@@ -43,6 +43,10 @@ fn main() {
     run(
         "servers_connect_concurrently_without_blocking_start",
         Box::pin(servers_connect_concurrently_without_blocking_start()),
+    );
+    run(
+        "exposed_names_are_sanitized_and_routed_by_map",
+        Box::pin(exposed_names_are_sanitized_and_routed_by_map()),
     );
 
     if failed > 0 {
@@ -158,6 +162,48 @@ async fn servers_connect_concurrently_without_blocking_start() -> Result<(), Str
     })
 }
 
+async fn exposed_names_are_sanitized_and_routed_by_map() -> Result<(), String> {
+    // With `{server}_{tool}` naming plus prefix stripping, `git`/`lab_status`
+    // and `git_lab`/`status` both became `git_lab_status`.
+    let manager = McpManager::connect_all(&[
+        fake_server("git", "serve", &[("FAKE_MCP_TOOLS", "lab_status")]),
+        fake_server("git_lab", "serve", &[("FAKE_MCP_TOOLS", "status")]),
+        fake_server("my.server", "serve", &[("FAKE_MCP_TOOLS", "do it")]),
+    ])
+    .await;
+
+    let mut names: Vec<String> = manager
+        .all_tool_definitions()
+        .into_iter()
+        .map(|entry| entry.definition.name)
+        .collect();
+    names.sort();
+    ensure(
+        names == ["mcp__git__lab_status", "mcp__git_lab__status", "mcp__my_server__do_it"],
+        || format!("unexpected exposed names: {names:?}"),
+    )?;
+
+    for (exposed, expected) in [
+        ("mcp__git__lab_status", "server=git tool=lab_status"),
+        ("mcp__git_lab__status", "server=git_lab tool=status"),
+        ("mcp__my_server__do_it", "server=my.server tool=do it"),
+    ] {
+        let result = manager
+            .call_tool(exposed, Some(serde_json::json!({})))
+            .await
+            .map_err(|e| format!("calling {exposed}: {e}"))?;
+        let text = match result.content.first() {
+            Some(McpContent::Text { text }) => text.clone(),
+            other => return Err(format!("{exposed}: unexpected content {other:?}")),
+        };
+        ensure(text == expected, || format!("{exposed} routed to the wrong tool: {text}"))?;
+    }
+
+    ensure(manager.call_tool("git_lab_status", None).await.is_err(), || {
+        "the legacy name must not route".to_string()
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Fake stdio MCP server
 // ---------------------------------------------------------------------------
@@ -177,6 +223,11 @@ mod fake_server {
     /// `serve`: a minimal, well-behaved server.
     pub fn run(mode: &str) {
         let name = std::env::var("FAKE_MCP_NAME").unwrap_or_else(|_| "fake".to_string());
+        let tool_names: Vec<String> = std::env::var("FAKE_MCP_TOOLS")
+            .unwrap_or_else(|_| "echo".to_string())
+            .split(',')
+            .map(str::to_string)
+            .collect();
         let stdin = std::io::stdin();
         let mut stdout = std::io::stdout().lock();
         for line in stdin.lock().lines() {
@@ -193,13 +244,19 @@ mod fake_server {
                     "capabilities": { "tools": { "listChanged": true } },
                     "serverInfo": { "name": name, "version": "0.0.0" },
                 }),
-                "tools/list" => json!({
-                    "tools": [{
-                        "name": "echo",
-                        "description": "Echo which server and tool handled the call",
-                        "inputSchema": { "type": "object" },
-                    }],
-                }),
+                "tools/list" => {
+                    let tools: Vec<Value> = tool_names
+                        .iter()
+                        .map(|tool| {
+                            json!({
+                                "name": tool,
+                                "description": "Echo which server and tool handled the call",
+                                "inputSchema": { "type": "object" },
+                            })
+                        })
+                        .collect();
+                    json!({ "tools": tools })
+                }
                 "tools/call" => {
                     let tool = request["params"]["name"].as_str().unwrap_or_default();
                     json!({
