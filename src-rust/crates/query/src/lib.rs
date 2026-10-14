@@ -309,6 +309,14 @@ pub enum QueryEvent {
     /// Provider-reported subscription usage (0-100 per window), e.g. the
     /// Codex `x-codex-*` rate-limit headers.
     RateLimits { primary_used_percent: Option<f32>, secondary_used_percent: Option<f32> },
+    /// A message was appended to the history for good: an assistant reply
+    /// (after any retry settled, with its final content blocks and tool-use
+    /// ids) or the user message carrying a turn's tool results (#473).
+    MessageCommitted(Message),
+    /// The turn cap was reached: the loop either runs one final tool-less
+    /// summary turn or returns at once (#473). May repeat when that summary
+    /// turn is retried.
+    MaxTurnsReached { max_turns: u32 },
 }
 
 // ---------------------------------------------------------------------------
@@ -546,6 +554,11 @@ pub async fn run_query_loop(
         // dispatched exactly once, and re-exceeding the cap afterwards returns
         // cold. Applies to both goal and non-goal runs.
         let degradation_turn = if turn > effective_max_turns {
+            if !degradation_done {
+                if let Some(ref tx) = event_tx {
+                    let _ = tx.send(QueryEvent::MaxTurnsReached { max_turns: effective_max_turns });
+                }
+            }
             if !config.degradation_enabled || degradation_done {
                 info!(
                     turns = turn,
@@ -691,10 +704,12 @@ pub async fn run_query_loop(
                     stop_hooks(&$assistant_msg, stop_hook_active, config.is_subagent, tool_ctx).await
                 {
                     stop_hook_active = true;
+                    let feedback = Message::user(format!("Stop hook feedback: {reason}"));
                     if let Some(ref tx) = event_tx {
                         let _ = tx.send(QueryEvent::Status(format!("Stop hook blocked stopping: {reason}")));
+                        let _ = tx.send(QueryEvent::MessageCommitted(feedback.clone()));
                     }
-                    messages.push(Message::user(format!("Stop hook feedback: {reason}")));
+                    messages.push(feedback);
                     continue;
                 }
             }};
@@ -1444,6 +1459,7 @@ pub async fn run_query_loop(
                     let model_turn_hooks = post_model_turn(&assistant_msg, tool_ctx).await;
                     if model_turn_hooks.is_deny() {
                         if let Some(ref tx) = event_tx {
+                            let _ = tx.send(QueryEvent::MessageCommitted(assistant_msg.clone()));
                             let _ = tx.send(QueryEvent::Status(format!(
                                 "PostModelTurn hook stopped the turn: {}",
                                 model_turn_hooks.reason_or_default()
@@ -1467,6 +1483,9 @@ pub async fn run_query_loop(
                     // compatible providers (Ollama, LM Studio, etc.) return
                     // finish_reason "stop" even when tool calls are present.
                     if !tool_use_blocks.is_empty() {
+                        if let Some(ref tx) = event_tx {
+                            let _ = tx.send(QueryEvent::MessageCommitted(assistant_msg.clone()));
+                        }
                         let mut tool_results = Vec::new();
                         for (tool_id, tool_name, tool_input) in tool_use_blocks {
                             // Notify TUI that a tool is starting (matches Anthropic path).
@@ -1509,13 +1528,17 @@ pub async fn run_query_loop(
                                 text: format!("PostModelTurn hook context:\n{context}"),
                             });
                         }
-                        messages.push(Message {
+                        let results_msg = Message {
                             role: claurst_core::types::Role::User,
                             content: claurst_core::types::MessageContent::Blocks(tool_results),
                             uuid: None,
                             cost: None,
                             snapshot_patch: None,
-                        });
+                        };
+                        if let Some(ref tx) = event_tx {
+                            let _ = tx.send(QueryEvent::MessageCommitted(results_msg.clone()));
+                        }
+                        messages.push(results_msg);
                         continue; // loop for next turn
                     }
 
@@ -1550,6 +1573,7 @@ pub async fn run_query_loop(
                     }
 
                     if let Some(ref tx) = event_tx {
+                        let _ = tx.send(QueryEvent::MessageCommitted(assistant_msg.clone()));
                         let _ = tx.send(QueryEvent::TurnComplete {
                             stop_reason: stop_str.clone(),
                             turn,
@@ -1812,6 +1836,9 @@ pub async fn run_query_loop(
 
         // Append assistant message to conversation
         messages.push(assistant_msg.clone());
+        if let Some(ref tx) = event_tx {
+            let _ = tx.send(QueryEvent::MessageCommitted(assistant_msg.clone()));
+        }
 
         // If the provider returned an unknown stop reason but the assistant
         // message contains tool_use blocks, treat it as tool_use so we don't
@@ -2114,7 +2141,11 @@ pub async fn run_query_loop(
 
                 // Append tool results as a user message so the history remains
                 // valid (every tool_use is answered) even on cancellation.
-                messages.push(Message::user_blocks(result_blocks));
+                let results_msg = Message::user_blocks(result_blocks);
+                if let Some(ref tx) = event_tx {
+                    let _ = tx.send(QueryEvent::MessageCommitted(results_msg.clone()));
+                }
+                messages.push(results_msg);
 
                 // If the batch was abandoned due to cancellation, stop the loop
                 // now rather than sending the (cancelled) results back to the model.

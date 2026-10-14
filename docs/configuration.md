@@ -146,7 +146,7 @@ See [Permission Modes](#permission-modes) for a full description of each value.
 |-----|------|---------|-------------|
 | `theme` | string | `"default"` | Color theme for the TUI. One of `"default"`, `"dark"`, `"light"`, `"deuteranopia"`. |
 | `output_style` | string \| null | null | Named output style. Built-in values: `"default"`, `"concise"`, `"verbose"`. Custom styles can be added as Markdown files under `~/.claurst/output-styles/`. |
-| `output_format` | string | `"text"` | Output format for headless (`--print`) mode. One of `"text"`, `"json"`, `"stream-json"`. |
+| `output_format` | string | `"text"` | Not used by headless runs: `--output-format` (default `text`) decides. See [Headless mode](advanced.md#headless-mode) for the `json` and `stream-json` shapes. |
 | `verbose` | boolean | false | Enable debug-level log output. |
 
 ### Context compaction
@@ -273,7 +273,9 @@ tool calls are approved.
 
 Read-only operations (file reads, searches, glob) are permitted automatically.
 Write and execute operations (file writes, shell commands) prompt the user for
-confirmation in the TUI, or are denied in headless mode.
+confirmation in the TUI. In headless mode (`--print`) nobody can answer the
+prompt: the call is rejected, the tool result tells the model why, and the run
+continues (see [Headless mode](advanced.md#headless-mode)).
 
 ### `acceptEdits`
 
@@ -733,9 +735,6 @@ matches. They are defined in the `formatter` map:
 
     // Show debug logs
     "verbose": false,
-
-    // Plain text output in --print mode
-    "output_format": "text",
 
     // Add a custom instruction to every session
     "append_system_prompt": "Always explain your reasoning before making changes.",
