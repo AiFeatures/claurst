@@ -47,7 +47,7 @@ Each event maps to a list of **matcher groups**. A group has an optional `matche
 | `matcher` | Selects what the group runs for (see [Matchers](#matchers)). Absent, empty or `"*"` matches everything. |
 | `hooks[].type` | `"command"`, the only hook type. May be omitted. |
 | `hooks[].command` | Shell command. Run with `sh -c` (`cmd /C` on Windows) in the session's working directory. |
-| `hooks[].timeout` | Seconds before the hook is killed. Default `60`. |
+| `hooks[].timeout` | Seconds before the hook is killed. Default `60`; `0` also means the default. |
 
 The same map is also read from `config.hooks` (the nested `config` block); hooks from there run before the top-level ones.
 
@@ -74,7 +74,9 @@ The old claurst shape, a flat list of `{ "command", "tool_filter", "blocking" }`
 | `PreCompact` | Before the conversation is compacted | `trigger` | No |
 | `PostModelTurn` | After the model responds, before its tool calls run (Claurst-specific) | (none) | Yes: ends the turn; can add context |
 
-`Stop` fires exactly once per finished turn, whether the turn ended normally, on a stop sequence or on an unknown stop reason. It does not fire when the turn is cancelled, fails, runs out of output tokens or exceeds the budget.
+`Stop` fires exactly once per finished model turn (each time the model ends its turn without calling a tool), whether the turn ended normally, on a stop sequence or on an unknown stop reason. Under `/goal`, one prompt can run several such turns, and Stop fires for each. It does not fire when the turn is cancelled, fails, runs out of output tokens or exceeds the budget.
+
+Tool and turn hooks (`PreToolUse`, `PostToolUse`, `PostModelTurn`, `Stop`) run for every provider, not only Anthropic's API.
 
 ### Event details
 
@@ -168,7 +170,7 @@ Environment variables set for every hook: `CLAUDE_PROJECT_DIR` (the session's wo
 | `2` | Block: a `deny` decision with stderr as the reason. What blocking means depends on the event (table above). |
 | anything else | Non-blocking error: logged, otherwise ignored. |
 
-A hook that cannot be started, or that is still running when its timeout expires, is also a non-blocking error. A timed-out hook is killed, together with every process it started (its process group, on Unix).
+A hook that cannot be started, or that is still running when its timeout expires, is also a non-blocking error. A timed-out hook is killed, together with every process it started (its process group, on Unix); a hook counts as running until its stdout and stderr close, so a background process that keeps them open is killed too. Only the first 1 MiB of stdout and of stderr is kept.
 
 ### JSON on stdout
 
@@ -221,7 +223,7 @@ A hook that denies does not stop the later hooks from running.
 
 ## Plugin hooks
 
-A plugin can ship hooks in `hooks/hooks.json` or inline under `hooks` in its manifest, in the same shape as settings hooks (optionally wrapped as `{ "description": "...", "hooks": { ... } }`). They are registered when Claurst starts (restart to pick up changes; `/plugin reload` and `/reload-plugins` do not re-register hooks) and run through the same engine after settings hooks. See [plugins](plugins.md#hooks).
+A plugin can ship hooks in `hooks/hooks.json` or inline under `hooks` in its manifest, in the same shape as settings hooks (optionally wrapped as `{ "description": "...", "hooks": { ... } }`). They are registered when Claurst starts and again by `/plugin reload` and `/reload-plugins` (never under `--bare`), and run through the same engine after settings hooks. See [plugins](plugins.md#hooks).
 
 ---
 
@@ -328,7 +330,8 @@ Hook failures, timeouts and skipped settings entries are logged as warnings (on 
 
 - Only `command` hooks exist. The `prompt`, `agent` and `http` hook types, and the `async`, `once`, `statusMessage`, `shell` and `if` fields, are not implemented.
 - Implemented events: the ten above. Claude Code events such as `PermissionRequest`, `PostToolUseFailure`, `PostCompact`, `SubagentStart` and `Setup` are not; settings entries for them are skipped.
-- No `transcript_path` in the input.
+- No `transcript_path`, `permission_mode`, `tool_use_id` or `notification_type` in the input.
+- `tool_response` is always `{ "content": string, "is_error": bool }`, not Claude Code's per-tool object.
 - `SessionStart` has no `clear` or `compact` source, and `SessionEnd` no `clear` or `logout` reason: `/clear` fires neither event.
 - `UserPromptSubmit` does not fire for prompts sent over ACP or as `--input-format stream-json`.
 - Project-level hooks are not read (Claude Code reads `.claude/settings.json` after a trust prompt).

@@ -259,7 +259,7 @@ Entries for events Claurst does not implement are skipped with a warning.
 | `CLAUDE_PLUGIN_NAME` | Plugin name from the manifest |
 | `CLAUDE_PROJECT_DIR` | The session's working directory |
 
-Plugin hooks are registered when Claurst starts; restart to pick up changes (`/plugin reload` and `/reload-plugins` do not re-register hooks). `/hooks` lists them with the plugin's name.
+Plugin hooks are registered when Claurst starts and re-registered by `/plugin reload` and `/reload-plugins` (never under `--bare`). `/hooks` lists them with the plugin's name.
 
 ---
 
@@ -285,7 +285,7 @@ After enabling or disabling a plugin, run `/plugin reload` or use `/reload-plugi
 /reload-plugins
 ```
 
-Rescans `~/.claurst/plugins/`, re-reads all manifests, and reports what changed. Plugin hooks are not re-registered; restart Claurst for hook changes. Use this after making changes to a plugin directory or after installing a new plugin.
+Rescans `~/.claurst/plugins/`, re-reads all manifests, re-registers plugin hooks, and reports what changed. Use this after making changes to a plugin directory or after installing a new plugin.
 
 ---
 
