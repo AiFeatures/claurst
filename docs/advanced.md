@@ -148,7 +148,7 @@ Each journal line is `{"seq":N,"entry":{"type":...}}` with `seq` increasing by o
 |---|---|
 | `meta` | Session metadata (id, title, model, working directory, cost). The first line of every journal; repeated at each checkpoint. |
 | `message` | Append one message. |
-| `truncate` | Drop the messages from `len` on (a rewind). |
+| `truncate` | Drop the messages from `len` on (a rewind). Every journal starts with `meta` then `truncate` to 0, so replaying it onto an older snapshot (from before the journal existed, or after the journal file was lost) replaces that snapshot's history rather than appending a second copy. |
 | `compaction` | Replace the head of the history, `[0, messages_before + 1 - messages_after)`, with `summary`. The replaced messages are kept in the compaction record so `/rewind` can return to them. |
 | `drop_compactions` | Forget the compactions from `keep` on (a rewind past a compaction). |
 

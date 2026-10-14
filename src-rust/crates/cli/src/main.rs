@@ -3390,12 +3390,13 @@ async fn run_interactive(
                         tools_arc = tools_for_session(tool_ctx.mcp_manager.clone(), &base_query_config);
                     }
                     // A /rewind into a compaction's replaced head restores the
-                    // pre-compaction history (issue #449); the next turn's
-                    // journal sync records it.
+                    // pre-compaction history (issue #449) and is checkpointed
+                    // right away (no query is running here).
                     if !app.is_streaming {
                         if let Some(position) = app.pending_rewind.take() {
                             session.messages = std::mem::take(&mut messages);
                             session.rewind_to(position);
+                            persist_live_session(&session_journal, &mut session, false);
                             messages = session.messages.clone();
                             app.replace_messages(messages.clone());
                         }

@@ -4200,6 +4200,9 @@ pub mod history {
     /// `~/.claurst/sessions/<id>.json` atomically (issue #449). Fails with
     /// [`crate::session_journal::SessionLocked`] when another process holds
     /// the session.
+    ///
+    /// The IO is synchronous (small appends plus one snapshot write) and runs
+    /// on the calling task; it is `async` only to keep the existing API.
     pub async fn save_session(session: &mut ConversationSession) -> anyhow::Result<()> {
         crate::session_journal::save(&sessions_dir(), session)
     }

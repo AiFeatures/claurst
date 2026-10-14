@@ -336,12 +336,13 @@ pub fn list(dir: &Path) -> Vec<ConversationSession> {
 pub fn delete(dir: &Path, id: &str) -> anyhow::Result<()> {
     let lock_file = lock_path(dir, id);
     if lock_file.exists() {
-        // Released again before the files go: Windows cannot remove a file
-        // this process still has open.
         let mut lock = fslock::LockFile::open(&lock_file)?;
         if !lock.try_lock()? {
             return Err(SessionLocked(id.to_owned()).into());
         }
+        // Released before the files go: Windows cannot remove a file this
+        // process still has open.
+        drop(lock);
     }
     for path in [snapshot_path(dir, id), journal_path(dir, id), lock_file] {
         match std::fs::remove_file(&path) {
@@ -424,7 +425,11 @@ struct OpenJournal {
     _lock: fslock::LockFile,
     file: File,
     seq: u64,
-    /// The file has no entries yet, so the next append starts with the header.
+    /// The file has no entries yet, so the next append starts with the
+    /// header: `meta` then `truncate {len: 0}`. The truncate makes the
+    /// journal self-describing: replayed onto an older snapshot (one written
+    /// before the journal existed, or after the journal file was lost) it
+    /// replaces that snapshot's history instead of appending a second copy.
     needs_header: bool,
     /// [`message_hash`] of each message in the journal's history.
     persisted: Vec<u64>,
@@ -450,10 +455,6 @@ impl SessionJournal {
     /// A writer for `session` in the default sessions directory.
     pub fn for_session(session: &ConversationSession) -> Arc<Self> {
         Self::new(&crate::history::sessions_dir(), session)
-    }
-
-    pub fn session_id(&self) -> &str {
-        &self.id
     }
 
     /// Take the lock now, so a session held by another process is reported
@@ -556,7 +557,9 @@ impl SessionJournal {
     fn open_journal(&self) -> anyhow::Result<OpenJournal> {
         std::fs::create_dir_all(&self.dir)?;
         crate::accounts::set_user_only_dir_perms(&self.dir);
-        let mut lock = fslock::LockFile::open(&lock_path(&self.dir, &self.id))?;
+        let lock_file = lock_path(&self.dir, &self.id);
+        let mut lock = fslock::LockFile::open(&lock_file)?;
+        crate::accounts::set_user_only_perms(&lock_file);
         if !lock.try_lock_with_pid()? {
             return Err(SessionLocked(self.id.clone()).into());
         }
@@ -569,14 +572,21 @@ impl SessionJournal {
             apply(&mut history, entry);
             seq = seq.max(entry_seq);
         }
+        let on_disk = match std::fs::metadata(&path) {
+            Ok(meta) => meta.len(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(e) => return Err(e.into()),
+        };
+        if on_disk > scan.valid_len {
+            warn!(path = %path.display(), "Cutting the torn last line of the session journal");
+            // A separate write handle: on Windows an append-mode handle has
+            // no FILE_WRITE_DATA, so `set_len` on it is denied.
+            OpenOptions::new().write(true).open(&path)?.set_len(scan.valid_len)?;
+        }
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
         // Session transcripts can contain secrets pulled into context; keep
         // them owner-only (issue #212).
         crate::accounts::set_user_only_perms(&path);
-        if file.metadata()?.len() > scan.valid_len {
-            warn!(path = %path.display(), "Cutting the torn last line of the session journal");
-            file.set_len(scan.valid_len)?;
-        }
         Ok(OpenJournal {
             _lock: lock,
             file,
@@ -590,7 +600,14 @@ impl SessionJournal {
     /// Append `entries` (after the header, for a new journal) as one write
     /// and flush them to disk.
     fn append(&self, open: &mut OpenJournal, entries: Vec<Entry<'_>>) -> anyhow::Result<()> {
-        let header = open.needs_header.then(|| Entry::Meta { session: self.header.clone() });
+        let header = if open.needs_header {
+            vec![
+                Entry::Meta { session: self.header.clone() },
+                Entry::Truncate { len: 0 },
+            ]
+        } else {
+            Vec::new()
+        };
         let mut seq = open.seq;
         let mut buf = Vec::new();
         for entry in header.into_iter().chain(entries) {
@@ -931,6 +948,86 @@ mod tests {
         let rebuilt = load(dir.path(), id).unwrap();
         assert_eq!(texts(&rebuilt.session.messages), ["hello", "hi"]);
         assert_eq!(rebuilt.session.title.as_deref(), Some("old"));
+    }
+
+    /// A journal started beside a pre-journal snapshot (journal_seq 0), with
+    /// a crash before the turn's checkpoint, replays to the live history, not
+    /// the snapshot's history plus a second copy.
+    #[test]
+    fn journal_started_beside_a_legacy_snapshot_replays_without_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut legacy = session_with(&["u1", "a1"]);
+        legacy.journal_seq = 0;
+        std::fs::write(
+            snapshot_path(dir.path(), &legacy.id),
+            serde_json::to_vec_pretty(&legacy).unwrap(),
+        )
+        .unwrap();
+
+        let mut session = load(dir.path(), &legacy.id).unwrap().session;
+        let journal = SessionJournal::new(dir.path(), &session);
+        session.add_message(Message::user("u2"));
+        journal.sync_messages(&session.messages).unwrap();
+        drop(journal);
+
+        let loaded = load(dir.path(), &legacy.id).unwrap();
+        assert!(!loaded.rebuilt);
+        assert_eq!(texts(&loaded.session.messages), ["u1", "a1", "u2"]);
+    }
+
+    /// Same when the journal file is lost after a checkpoint: the new journal
+    /// is numbered above the snapshot and replaces its history on replay.
+    #[test]
+    fn lost_journal_is_restarted_without_duplicating_the_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = session_with(&["u1", "a1"]);
+        save(dir.path(), &mut session).unwrap();
+        std::fs::remove_file(journal_path(dir.path(), &session.id)).unwrap();
+
+        let mut session = load(dir.path(), &session.id).unwrap().session;
+        let journal = SessionJournal::new(dir.path(), &session);
+        session.add_message(Message::user("u2"));
+        journal.sync_messages(&session.messages).unwrap();
+        drop(journal);
+
+        let loaded = load(dir.path(), &session.id).unwrap();
+        assert!(!loaded.rebuilt);
+        assert_eq!(texts(&loaded.session.messages), ["u1", "a1", "u2"]);
+        std::fs::remove_file(snapshot_path(dir.path(), &session.id)).unwrap();
+        let rebuilt = load(dir.path(), &session.id).unwrap();
+        assert_eq!(texts(&rebuilt.session.messages), ["u1", "a1", "u2"]);
+    }
+
+    /// Every session field outside the history is carried by `meta` entries,
+    /// so a journal-only rebuild does not silently drop a field added later.
+    #[test]
+    fn session_meta_covers_every_session_field_but_the_history() {
+        let mut session = session_with(&["u1"]);
+        // Fill every optional field so it serialises.
+        session.branch_from = Some("b".to_string());
+        session.branch_at_message = Some(1);
+        session.remote_session_url = Some("u".to_string());
+        session.parent_session_id = Some("p".to_string());
+        session.fork_point_message_index = Some(1);
+        session.working_dir = Some("/w".to_string());
+        session.tags = vec!["t".to_string()];
+        let keys = |value: serde_json::Value| -> BTreeSet<String> {
+            value.as_object().unwrap().keys().cloned().collect()
+        };
+        let mut session_keys = keys(serde_json::to_value(&session).unwrap());
+        for history in ["messages", "checkpoints", "compactions", "journal_seq"] {
+            session_keys.remove(history);
+        }
+        let meta = SessionMeta::of(&session);
+        assert_eq!(session_keys, keys(serde_json::to_value(&meta).unwrap()));
+
+        let mut rebuilt = ConversationSession::new(String::new());
+        meta.apply(&mut rebuilt);
+        rebuilt.messages = session.messages.clone();
+        assert_eq!(
+            serde_json::to_value(&rebuilt).unwrap(),
+            serde_json::to_value(&session).unwrap()
+        );
     }
 
     #[test]
