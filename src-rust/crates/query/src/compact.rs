@@ -845,22 +845,35 @@ pub fn resolve_context_window(
         )
 }
 
-/// Best-effort estimate of the CURRENT context size in tokens.
+/// Prompt-token count a provider reported for one request, plus how many
+/// messages that request carried. Anchors [`estimate_context_tokens`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UsageMark {
+    /// `UsageInfo::total_input()` of the request (input + cache-read +
+    /// cache-creation): what the model actually saw.
+    pub prompt_tokens: u64,
+    /// `messages.len()` when the request was sent.
+    pub message_count: usize,
+}
+
+/// Best-effort projection of the context size the NEXT request will carry.
 ///
-/// Prefers the REAL context-token count the provider reported for the last
-/// assistant turn (`last_real_usage`, typically `UsageInfo::total_input()` =
-/// input + cache-read + cache-creation), because that is what the model
-/// actually saw. The chars/4 heuristic can be off by a wide margin, and with
-/// prompt caching the bare `input_tokens` field massively *undercounts* — the
-/// bulk of the context is billed as cache reads. We fall back to the chars/4
-/// estimate ([`estimate_tokens_for_messages`]) only before the first response,
-/// or when the provider reported no usage (`None` / `0`).
+/// Anchors on the REAL prompt-token count the provider reported for the last
+/// request (`last_usage`), because that is what the model actually saw: the
+/// chars/4 heuristic can be off by a wide margin, and with prompt caching the
+/// bare `input_tokens` field massively *undercounts*. Everything appended since
+/// that request (the assistant reply, tool results, injected user turns) is
+/// added with the chars/4 estimate ([`estimate_tokens_for_messages`]). Without
+/// a usable anchor (before the first response, after a compaction, or when the
+/// provider reported no usage) the whole history is estimated.
 ///
-/// Mirrors pi's `estimateContextTokens`, which likewise prefers the last
-/// assistant usage and only estimates when it is absent.
-pub fn estimate_context_tokens(messages: &[Message], last_real_usage: Option<u64>) -> u64 {
-    match last_real_usage {
-        Some(tokens) if tokens > 0 => tokens,
+/// Mirrors pi's `estimateContextTokens` and codex's pre-request estimate.
+pub fn estimate_context_tokens(messages: &[Message], last_usage: Option<UsageMark>) -> u64 {
+    match last_usage {
+        Some(mark) if mark.prompt_tokens > 0 && mark.message_count <= messages.len() => {
+            mark.prompt_tokens
+                + estimate_tokens_for_messages(&messages[mark.message_count..]) as u64
+        }
         _ => estimate_tokens_for_messages(messages) as u64,
     }
 }
@@ -900,20 +913,34 @@ pub fn calculate_token_warning_state_for_window(
 /// Convenience wrapper that derives the window from the model-name heuristic.
 /// Prefer [`should_auto_compact_for_window`] with a resolved window.
 pub fn should_auto_compact(input_tokens: u64, model: &str, state: &AutoCompactState) -> bool {
-    should_auto_compact_for_window(input_tokens, context_window_for_model(model), state)
+    should_auto_compact_for_window(input_tokens, context_window_for_model(model), 0, state)
 }
 
-/// Return `true` when auto-compaction should fire, against an explicit window.
+/// Token count at which auto-compaction fires for `window`, leaving room for
+/// `output_reserve` tokens of model output.
+///
+/// The threshold is the lower of [`AUTOCOMPACT_TRIGGER_FRACTION`] of the window
+/// and the window minus the output reserve. The reserve is capped at a quarter
+/// of the window so a large `max_tokens` on a small local model can't push the
+/// threshold to zero.
+pub fn auto_compact_threshold(window: u64, output_reserve: u64) -> u64 {
+    let by_fraction = (window as f64 * AUTOCOMPACT_TRIGGER_FRACTION) as u64;
+    let by_reserve = window.saturating_sub(output_reserve.min(window / 4));
+    by_fraction.min(by_reserve)
+}
+
+/// Return `true` when auto-compaction should fire, against an explicit window
+/// and output reserve (see [`auto_compact_threshold`]).
 pub fn should_auto_compact_for_window(
     input_tokens: u64,
     window: u64,
+    output_reserve: u64,
     state: &AutoCompactState,
 ) -> bool {
     if state.disabled {
         return false;
     }
-    let threshold = (window as f64 * AUTOCOMPACT_TRIGGER_FRACTION) as u64;
-    input_tokens >= threshold
+    input_tokens >= auto_compact_threshold(window, output_reserve)
 }
 
 // ---------------------------------------------------------------------------
@@ -1160,13 +1187,14 @@ fn compute_keep_split_index(messages: &[Message], keep_recent_tokens: u64) -> us
     snap_to_pairing_boundary(messages, raw)
 }
 
-/// Compact `messages` in-place, replacing the head with a summary.
-/// Returns the new messages vector on success.
+/// Compact `messages`, replacing the head with a summary.
+/// Returns the new messages vector on success, or `None` when the whole
+/// conversation already fits the keep-recent budget (nothing to summarise).
 pub async fn compact_conversation(
     provider: &dyn LlmProvider,
     model: &str,
     messages: &[Message],
-) -> Result<Vec<Message>, ClaudeError> {
+) -> Result<Option<Vec<Message>>, ClaudeError> {
     let total = messages.len();
 
     // Token-budget keep: summarise everything older than the most recent
@@ -1179,7 +1207,7 @@ pub async fn compact_conversation(
             keep_recent_tokens = KEEP_RECENT_TOKENS,
             "Whole conversation fits the keep-recent budget – keeping everything"
         );
-        return Ok(messages.to_vec());
+        return Ok(None);
     }
 
     info!(
@@ -1190,7 +1218,7 @@ pub async fn compact_conversation(
     );
 
     // Use a generous token budget for the summary (20k mirrors TypeScript MAX_OUTPUT_TOKENS_FOR_SUMMARY)
-    summarise_head(provider, model, messages, split_at, 20_000).await
+    summarise_head(provider, model, messages, split_at, 20_000).await.map(Some)
 }
 
 /// Auto-compact `messages` if needed.  Updates `state` in place.
@@ -1205,9 +1233,10 @@ pub async fn auto_compact_if_needed(
     messages: &[Message],
     input_tokens: u64,
     context_window: u64,
+    output_reserve: u64,
     state: &mut AutoCompactState,
 ) -> Option<Vec<Message>> {
-    if !should_auto_compact_for_window(input_tokens, context_window, state) {
+    if !should_auto_compact_for_window(input_tokens, context_window, output_reserve, state) {
         return None;
     }
 
@@ -1219,7 +1248,8 @@ pub async fn auto_compact_if_needed(
     );
 
     match compact_conversation(provider, model, messages).await {
-        Ok(new_msgs) => {
+        Ok(None) => None,
+        Ok(Some(new_msgs)) => {
             state.on_success();
             info!(
                 original_count = messages.len(),
@@ -2107,14 +2137,33 @@ mod tests {
     fn context_tokens_prefer_real_usage_over_estimate() {
         let msgs = vec![Message::user(filler(4000))]; // ≈ 1333 estimated tokens
         let estimate = estimate_tokens_for_messages(&msgs) as u64;
+        let mark = |prompt_tokens, message_count| {
+            Some(UsageMark { prompt_tokens, message_count })
+        };
 
-        // Real usage present ⇒ used verbatim, ignoring the (much smaller) estimate.
-        assert_eq!(estimate_context_tokens(&msgs, Some(150_000)), 150_000);
-        assert_ne!(estimate_context_tokens(&msgs, Some(150_000)), estimate);
+        // Real usage covering every message ⇒ used verbatim.
+        assert_eq!(estimate_context_tokens(&msgs, mark(150_000, 1)), 150_000);
 
-        // No usage / zero usage ⇒ fall back to the chars/4 estimate.
+        // Messages appended after the anchored request are estimated on top.
+        assert_eq!(estimate_context_tokens(&msgs, mark(150_000, 0)), 150_000 + estimate);
+
+        // No usage / zero usage / stale anchor ⇒ fall back to the estimate.
         assert_eq!(estimate_context_tokens(&msgs, None), estimate);
-        assert_eq!(estimate_context_tokens(&msgs, Some(0)), estimate);
+        assert_eq!(estimate_context_tokens(&msgs, mark(0, 1)), estimate);
+        assert_eq!(estimate_context_tokens(&msgs, mark(150_000, 5)), estimate);
+    }
+
+    #[test]
+    fn threshold_leaves_room_for_the_output_reserve() {
+        // Small reserve: the 90 % fraction wins.
+        assert_eq!(auto_compact_threshold(200_000, 8_000), 180_000);
+        // Large reserve: window minus reserve wins.
+        assert_eq!(auto_compact_threshold(200_000, 32_000), 168_000);
+        // Reserve is capped at a quarter of the window.
+        assert_eq!(auto_compact_threshold(32_000, 64_000), 24_000);
+        let state = AutoCompactState::default();
+        assert!(should_auto_compact_for_window(170_000, 200_000, 32_000, &state));
+        assert!(!should_auto_compact_for_window(170_000, 200_000, 8_000, &state));
     }
 
     // ---- (3) iterative UPDATE prompt (#231) --------------------------------
