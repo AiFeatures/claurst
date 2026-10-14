@@ -392,16 +392,13 @@ View and manage tool permission rules. Permissions control which tools can run w
 
 ### /hooks
 
-Manage event hooks. Hooks are shell commands or scripts that execute when lifecycle events fire (e.g., before/after tool calls, on session start/end).
+Browse the hooks that will run, read-only: event, matcher, command, timeout and source (settings or a plugin). Edit `~/.claurst/settings.json` to change them; see [Hooks](hooks.md).
 
 ```
 /hooks
-/hooks list
-/hooks add <event> <command>
-/hooks remove <hook-id>
 ```
 
-Available events: `pre-tool`, `post-tool`, `session-start`, `session-end`, `message-send`, `message-receive`.
+Events: `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, `Stop`, `SubagentStop`, `SessionStart`, `SessionEnd`, `Notification`, `PreCompact`, `PostModelTurn`.
 
 ---
 

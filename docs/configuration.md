@@ -228,41 +228,24 @@ case `command` is the base URL).
 
 ### Hooks
 
-Hooks let you run shell commands in response to lifecycle events. They are
-defined as a map from event name to an array of hook entries.
+Hooks run shell commands on session events (before and after tool calls,
+prompt submission, stop, session start and end, and more), using Claude Code's
+hook format. They are global-only. See [Hooks](hooks.md) for the events, the
+JSON input and output, and examples.
 
 ```json
 "hooks": {
   "PreToolUse": [
-    { "command": "echo tool=$TOOL_NAME", "blocking": false }
-  ],
-  "PostToolUse": [
-    { "command": "/path/to/my-logger.sh", "tool_filter": "Bash", "blocking": false }
+    {
+      "matcher": "Bash",
+      "hooks": [{ "type": "command", "command": "~/.claurst/hooks/check-bash.sh", "timeout": 10 }]
+    }
   ],
   "Stop": [
-    { "command": "notify-send 'Claurst done'", "blocking": false }
+    { "hooks": [{ "type": "command", "command": "notify-send 'Claurst done'" }] }
   ]
 }
 ```
-
-Available events:
-
-| Event | When it fires |
-|-------|--------------|
-| `PreToolUse` | Before a tool executes. Receives event JSON on stdin. |
-| `PostToolUse` | After a tool returns its result. |
-| `Stop` | When the model finishes its turn (stop reason). |
-| `PostModelTurn` | After the model samples a response, before tool execution. |
-| `UserPromptSubmit` | When the user submits a prompt. |
-| `Notification` | General-purpose notification event. |
-
-Hook entry fields:
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `command` | string | Shell command to execute. |
-| `tool_filter` | string \| null | Only run for this tool name (`PreToolUse`/`PostToolUse` only). |
-| `blocking` | boolean | If true, a non-zero exit code blocks the operation. Default: false. |
 
 ### External status line
 
@@ -783,13 +766,10 @@ matches. They are defined in the `formatter` map:
       "MY_PROJECT_TOKEN": "{env:HOME}/.project_token"
     },
 
-    // Run a script after every tool use
+    // Run a script after every tool use (see docs/hooks.md)
     "hooks": {
       "PostToolUse": [
-        {
-          "command": "/home/user/scripts/audit-log.sh",
-          "blocking": false
-        }
+        { "hooks": [{ "type": "command", "command": "/home/user/scripts/audit-log.sh" }] }
       ]
     },
 

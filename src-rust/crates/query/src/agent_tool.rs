@@ -386,6 +386,7 @@ impl Tool for AgentTool {
             degradation_enabled: ctx.config.degradation_summary_enabled_or_default(),
             retry: claurst_api::RetryConfig::with_max_retries(ctx.config.max_retries),
             auto_compact: true,
+            is_subagent: true,
         };
         // -----------------------------------------------------------------------
         // Background mode: spawn and return agent_id immediately.
@@ -693,6 +694,7 @@ pub fn init_team_swarm_runner() {
                     ),
                     degradation_enabled: ctx.config.degradation_summary_enabled_or_default(),
                     retry: claurst_api::RetryConfig::with_max_retries(ctx.config.max_retries),
+                    is_subagent: true,
                     ..Default::default()
                 };
 

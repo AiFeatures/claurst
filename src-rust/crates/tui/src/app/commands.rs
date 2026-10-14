@@ -249,7 +249,7 @@ impl App {
                 true
             }
             "hooks" => {
-                self.hooks_config_menu.open();
+                self.hooks_config_menu.open(&self.config.hooks);
                 true
             }
             "import-config" => {

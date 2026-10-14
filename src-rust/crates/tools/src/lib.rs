@@ -658,6 +658,14 @@ impl ToolContext {
                     )));
                 };
 
+                // Notification hooks (#447): the user's attention is needed.
+                claurst_core::hooks::notify(
+                    &self.config.hooks,
+                    &self.session_id,
+                    &self.working_dir,
+                    &format!("Claurst needs your permission to use {}", request.tool_name),
+                );
+
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 queue.lock().queue.push_back(PendingPermissionRequest {
                     tool_use_id: format!(

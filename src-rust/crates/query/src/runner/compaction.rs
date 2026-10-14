@@ -51,7 +51,8 @@ pub(crate) fn claude_error_is_overflow(err: &ClaudeError) -> bool {
 }
 
 /// Pre-request check point: compact when the projected context crosses the
-/// threshold. Returns `true` when the history was replaced.
+/// threshold. Returns `true` when the history was replaced. PreCompact hooks
+/// run before a compaction starts.
 ///
 /// With the `reactive_compact` feature gate the 90 % / 97 % reactive
 /// compact / context-collapse ladder runs instead of the proactive path.
@@ -66,6 +67,7 @@ pub(crate) async fn compact_before_request(
     state: &mut compact::AutoCompactState,
     event_tx: Option<&mpsc::UnboundedSender<QueryEvent>>,
     cancel_token: &tokio_util::sync::CancellationToken,
+    tool_ctx: &ToolContext,
 ) -> bool {
     let send_status = |text: &str| {
         if let Some(tx) = event_tx {
@@ -81,6 +83,7 @@ pub(crate) async fn compact_before_request(
         let Some((provider, model)) = compaction_endpoint(route, client, effective_model) else {
             return false;
         };
+        pre_compact(tool_ctx).await;
         // Pass a clone so the live conversation survives a failed
         // compaction; `*messages` is only overwritten on success (#213).
         let outcome = if collapse {
@@ -120,6 +123,7 @@ pub(crate) async fn compact_before_request(
     let Some((provider, model)) = compaction_endpoint(route, client, effective_model) else {
         return false;
     };
+    pre_compact(tool_ctx).await;
     send_status("Compacting context...");
     match compact::auto_compact_if_needed(
         provider.as_ref(),
@@ -142,14 +146,16 @@ pub(crate) async fn compact_before_request(
 
 /// Overflow recovery: the provider rejected the request for exceeding the
 /// context window, so compact once before the caller retries. Returns `true`
-/// when the history was compacted.
+/// when the history was compacted. PreCompact hooks run first.
 pub(crate) async fn compact_after_overflow(
     messages: &mut Vec<Message>,
     provider: &dyn claurst_api::LlmProvider,
     model: &str,
     max_output_tokens: u32,
     event_tx: Option<&mpsc::UnboundedSender<QueryEvent>>,
+    tool_ctx: &ToolContext,
 ) -> bool {
+    pre_compact(tool_ctx).await;
     if let Some(tx) = event_tx {
         let _ = tx.send(QueryEvent::Status(
             "Context window exceeded — compacting and retrying…".to_string(),
