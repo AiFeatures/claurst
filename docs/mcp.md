@@ -194,6 +194,20 @@ Permission rules match the exposed name. A rule for `mcp__<server>` or `mcp__<se
 
 The previous `<server>_<tool>` names are not accepted; permission rules written for them must be renamed.
 
+### Tool list changes
+
+When a server sends `notifications/tools/list_changed`, Claurst re-lists that server's tools (bounded by the catalog timeout) and the new list is used from the next turn on. Calls to a tool the server removed fail with an "Unknown MCP tool" error.
+
+### Server instructions
+
+Instructions a server returns from `initialize` are added to the system prompt under `# MCP Server Instructions`, one `## <server>` section per server, for servers with at least one tool in the current tool set. They are placed after the dynamic boundary (with the environment and memory sections), so connecting or refreshing a server does not invalidate the cached part of the prompt.
+
+### Tool results
+
+- `structuredContent`, when a result has it, is passed to the model as compact JSON in place of the text blocks (the MCP spec makes those a serialization of the same value).
+- Images (and image resource blobs) of type PNG, JPEG, GIF or WebP up to 5 MB are passed as image blocks inside the tool result. Anthropic and Bedrock send them to the model; providers whose tool-result format is text-only (OpenAI-compatible, Gemini, Copilot) drop them. Every image also produces a text line such as `[Image: image/png, 48.2 KB]`, and the line says when an image was not attached because of its type or size.
+- Other binary resources are described as `[Binary resource: <mime>, <size>]`.
+
 ---
 
 ## Startup, Timeouts and Retries

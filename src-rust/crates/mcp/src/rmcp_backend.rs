@@ -858,6 +858,7 @@ fn convert_get_prompt_result(result: rmcp_model::GetPromptResult) -> GetPromptRe
 fn convert_call_tool_result(result: rmcp_model::CallToolResult) -> CallToolResult {
     CallToolResult {
         content: result.content.into_iter().map(convert_content).collect(),
+        structured_content: result.structured_content,
         is_error: result.is_error.unwrap_or(false),
     }
 }

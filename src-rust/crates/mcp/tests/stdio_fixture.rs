@@ -7,7 +7,8 @@
 // output can corrupt the protocol stream, and no extra binary is shipped.
 
 use claurst_core::config::McpServerConfig;
-use claurst_mcp::{McpContent, McpManager, McpServerStatus};
+use claurst_core::types::ContentBlock;
+use claurst_mcp::{mcp_result_to_output, McpContent, McpManager, McpServerStatus};
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
@@ -47,6 +48,15 @@ fn main() {
     run(
         "exposed_names_are_sanitized_and_routed_by_map",
         Box::pin(exposed_names_are_sanitized_and_routed_by_map()),
+    );
+    run("list_changed_refreshes_tools", Box::pin(list_changed_refreshes_tools()));
+    run(
+        "server_instructions_reach_the_prompt_section",
+        Box::pin(server_instructions_reach_the_prompt_section()),
+    );
+    run(
+        "structured_content_and_images_are_converted",
+        Box::pin(structured_content_and_images_are_converted()),
     );
 
     if failed > 0 {
@@ -204,6 +214,112 @@ async fn exposed_names_are_sanitized_and_routed_by_map() -> Result<(), String> {
     })
 }
 
+fn exposed_names(manager: &McpManager) -> Vec<String> {
+    let mut names: Vec<String> = manager
+        .all_tool_definitions()
+        .into_iter()
+        .map(|entry| entry.definition.name)
+        .collect();
+    names.sort();
+    names
+}
+
+async fn list_changed_refreshes_tools() -> Result<(), String> {
+    let manager =
+        McpManager::connect_all(&[fake_server("dyn", "serve", &[("FAKE_MCP_TOOLS", "echo,add_tool")])]).await;
+    let before = exposed_names(&manager);
+    ensure(before == ["mcp__dyn__add_tool", "mcp__dyn__echo"], || {
+        format!("unexpected initial tools: {before:?}")
+    })?;
+    let generation = manager.generation();
+
+    // `add_tool` makes the server add `late_tool` and send
+    // `notifications/tools/list_changed`.
+    manager
+        .call_tool("mcp__dyn__add_tool", Some(serde_json::json!({})))
+        .await
+        .map_err(|e| format!("add_tool: {e}"))?;
+    let refreshed = wait_for(Duration::from_secs(10), || {
+        exposed_names(&manager).iter().any(|name| name == "mcp__dyn__late_tool")
+    })
+    .await;
+    ensure(refreshed, || {
+        format!("tool list was not refreshed: {:?}", exposed_names(&manager))
+    })?;
+    ensure(manager.generation() != generation, || {
+        "a refresh must bump the generation".to_string()
+    })?;
+    ensure(
+        matches!(manager.server_status("dyn"), McpServerStatus::Connected { tool_count: 3 }),
+        || format!("status not updated: {:?}", manager.server_status("dyn")),
+    )?;
+
+    let result = manager
+        .call_tool("mcp__dyn__late_tool", Some(serde_json::json!({})))
+        .await
+        .map_err(|e| format!("late_tool: {e}"))?;
+    ensure(mcp_result_to_output(&result).text == "server=dyn tool=late_tool", || {
+        "late_tool must route after the refresh".to_string()
+    })
+}
+
+async fn server_instructions_reach_the_prompt_section() -> Result<(), String> {
+    let manager = McpManager::connect_all(&[
+        fake_server(
+            "docs",
+            "serve",
+            &[("FAKE_MCP_INSTRUCTIONS", "Search before you answer; cite page URLs.")],
+        ),
+        fake_server("plain", "serve", &[]),
+    ])
+    .await;
+
+    let section = manager
+        .instructions_prompt_section(|name| name.starts_with("mcp__"))
+        .ok_or("expected an instructions section")?;
+    ensure(
+        section.contains("## docs\nSearch before you answer; cite page URLs."),
+        || format!("instructions missing from section:\n{section}"),
+    )?;
+    ensure(!section.contains("## plain"), || {
+        format!("a server without instructions must not appear:\n{section}")
+    })?;
+    ensure(
+        manager.instructions_prompt_section(|name| name == "mcp__plain__echo").is_none(),
+        || "instructions must only be injected for servers whose tools are active".to_string(),
+    )
+}
+
+async fn structured_content_and_images_are_converted() -> Result<(), String> {
+    let manager =
+        McpManager::connect_all(&[fake_server("rich", "serve", &[("FAKE_MCP_TOOLS", "structured,image")])]).await;
+
+    let structured = manager
+        .call_tool("mcp__rich__structured", Some(serde_json::json!({})))
+        .await
+        .map_err(|e| format!("structured: {e}"))?;
+    let output = mcp_result_to_output(&structured);
+    ensure(output.text == r#"{"answer":42}"#, || {
+        format!("structuredContent should replace the text blocks, got {:?}", output.text)
+    })?;
+
+    let image = manager
+        .call_tool("mcp__rich__image", Some(serde_json::json!({})))
+        .await
+        .map_err(|e| format!("image: {e}"))?;
+    let output = mcp_result_to_output(&image);
+    ensure(output.text == "chart\n[Image: image/png, 6 B]", || {
+        format!("unexpected image placeholder text {:?}", output.text)
+    })?;
+    match output.images.as_slice() {
+        [ContentBlock::Image { source }] => ensure(
+            source.data.as_deref() == Some("iVBORw0K") && source.media_type.as_deref() == Some("image/png"),
+            || format!("unexpected image source {source:?}"),
+        ),
+        other => Err(format!("expected one image block, got {other:?}")),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Fake stdio MCP server
 // ---------------------------------------------------------------------------
@@ -220,7 +336,8 @@ mod fake_server {
     }
 
     /// `hang`: read requests and never answer, like a server stuck at startup.
-    /// `serve`: a minimal, well-behaved server.
+    /// `serve`: a minimal, well-behaved server. `FAKE_MCP_TOOLS` lists its
+    /// tools; calling `add_tool` adds `late_tool` and announces the change.
     pub fn run(mode: &str) {
         let name = std::env::var("FAKE_MCP_NAME").unwrap_or_else(|_| "fake".to_string());
         let tool_names: Vec<String> = std::env::var("FAKE_MCP_TOOLS")
@@ -228,6 +345,8 @@ mod fake_server {
             .split(',')
             .map(str::to_string)
             .collect();
+        let mut tool_names = tool_names;
+        let instructions = std::env::var("FAKE_MCP_INSTRUCTIONS").ok();
         let stdin = std::io::stdin();
         let mut stdout = std::io::stdout().lock();
         for line in stdin.lock().lines() {
@@ -239,11 +358,17 @@ mod fake_server {
             let Some(id) = request.get("id").cloned() else { continue };
             let method = request["method"].as_str().unwrap_or_default();
             let result = match method {
-                "initialize" => json!({
-                    "protocolVersion": request["params"]["protocolVersion"],
-                    "capabilities": { "tools": { "listChanged": true } },
-                    "serverInfo": { "name": name, "version": "0.0.0" },
-                }),
+                "initialize" => {
+                    let mut result = json!({
+                        "protocolVersion": request["params"]["protocolVersion"],
+                        "capabilities": { "tools": { "listChanged": true } },
+                        "serverInfo": { "name": name, "version": "0.0.0" },
+                    });
+                    if let Some(instructions) = &instructions {
+                        result["instructions"] = json!(instructions);
+                    }
+                    result
+                }
                 "tools/list" => {
                     let tools: Vec<Value> = tool_names
                         .iter()
@@ -257,12 +382,39 @@ mod fake_server {
                         .collect();
                     json!({ "tools": tools })
                 }
-                "tools/call" => {
-                    let tool = request["params"]["name"].as_str().unwrap_or_default();
-                    json!({
+                "tools/call" => match request["params"]["name"].as_str().unwrap_or_default() {
+                    "add_tool" => {
+                        if !tool_names.iter().any(|tool| tool == "late_tool") {
+                            tool_names.push("late_tool".to_string());
+                        }
+                        send(
+                            &mut stdout,
+                            &json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": { "content": [{ "type": "text", "text": "added" }] },
+                            }),
+                        );
+                        send(
+                            &mut stdout,
+                            &json!({ "jsonrpc": "2.0", "method": "notifications/tools/list_changed" }),
+                        );
+                        continue;
+                    }
+                    "structured" => json!({
+                        "content": [{ "type": "text", "text": "{\"answer\": 42}" }],
+                        "structuredContent": { "answer": 42 },
+                    }),
+                    "image" => json!({
+                        "content": [
+                            { "type": "text", "text": "chart" },
+                            { "type": "image", "data": "iVBORw0K", "mimeType": "image/png" },
+                        ],
+                    }),
+                    tool => json!({
                         "content": [{ "type": "text", "text": format!("server={name} tool={tool}") }],
-                    })
-                }
+                    }),
+                },
                 "ping" => json!({}),
                 _ => {
                     send(

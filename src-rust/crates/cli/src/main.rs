@@ -92,11 +92,11 @@ impl Tool for McpToolWrapper {
 
         match self.manager.call_tool(&self.tool_def.name, args).await {
             Ok(result) => {
-                let text = claurst_mcp::mcp_result_to_string(&result);
+                let output = claurst_mcp::mcp_result_to_output(&result);
                 if result.is_error {
-                    ToolResult::error(text)
+                    ToolResult::error(output.text)
                 } else {
-                    ToolResult::success(text)
+                    ToolResult::success(output.text).with_images(output.images)
                 }
             }
             Err(e) => ToolResult::error(format!("MCP tool '{}' failed: {}", self.tool_def.name, e)),

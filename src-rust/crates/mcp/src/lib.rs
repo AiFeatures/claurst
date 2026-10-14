@@ -17,7 +17,7 @@
 use async_trait::async_trait;
 use claurst_core::config::McpServerConfig;
 use claurst_core::mcp_templates::TemplateRenderer;
-use claurst_core::types::ToolDefinition;
+use claurst_core::types::{ContentBlock, ImageSource, ToolDefinition};
 use dashmap::DashMap;
 use futures::stream::{BoxStream, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -446,6 +446,10 @@ pub mod types {
     #[serde(rename_all = "camelCase")]
     pub struct CallToolResult {
         pub content: Vec<McpContent>,
+        /// Structured result (`structuredContent`). Per the MCP spec, any text
+        /// content alongside it is a serialization of the same value.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub structured_content: Option<Value>,
         #[serde(default)]
         pub is_error: bool,
     }
@@ -1466,6 +1470,41 @@ impl McpManager {
         self.state.read().clients.len()
     }
 
+    /// The system-prompt section carrying server instructions (from the
+    /// `initialize` response) for every connected server with at least one
+    /// tool for which `is_active` returns `true` (checked against exposed
+    /// `mcp__<server>__<tool>` names). `None` when no server qualifies.
+    ///
+    /// Recomputed per request, so it belongs in the dynamic (uncached) part
+    /// of the system prompt: servers connect, disconnect and change tools
+    /// during a session.
+    pub fn instructions_prompt_section(&self, is_active: impl Fn(&str) -> bool) -> Option<String> {
+        let state = self.state.read();
+        let mut servers: Vec<(&String, &Arc<McpClient>)> = state.clients.iter().collect();
+        servers.sort_by(|a, b| a.0.cmp(b.0));
+        let sections: Vec<String> = servers
+            .into_iter()
+            .filter_map(|(name, client)| {
+                let instructions = client.instructions.as_deref()?.trim();
+                if instructions.is_empty() {
+                    return None;
+                }
+                let has_active_tool = state
+                    .tools
+                    .iter()
+                    .any(|entry| &entry.server_name == name && is_active(&entry.definition.name));
+                has_active_tool.then(|| format!("## {}\n{}", name, instructions))
+            })
+            .collect();
+        if sections.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "# MCP Server Instructions\n\nThe following MCP servers have provided instructions for how to use their tools and resources:\n\n{}",
+            sections.join("\n\n")
+        ))
+    }
+
     /// Get server instructions (from initialize response).
     pub fn server_instructions(&self) -> Vec<(String, String)> {
         self.clients_sorted()
@@ -1705,52 +1744,128 @@ impl Default for McpManager {
 }
 
 // ---------------------------------------------------------------------------
-// MCP result → string conversion
+// MCP result → model output conversion
 // ---------------------------------------------------------------------------
 
-/// Convert an MCP tool call result to a string for the model.
+/// Image types every image-capable provider accepts.
+const ATTACHABLE_IMAGE_TYPES: &[&str] = &["image/png", "image/jpeg", "image/gif", "image/webp"];
+
+/// Largest decoded image passed through to the model (the Anthropic API's
+/// per-image limit).
+const MAX_ATTACHED_IMAGE_BYTES: usize = 5 * 1024 * 1024;
+
+/// An MCP tool result converted for the model.
+#[derive(Debug, Clone, Default)]
+pub struct McpToolOutput {
+    /// Text of the tool result. Each image is represented by a placeholder
+    /// line with its type and size, so a provider that drops images from
+    /// tool results still tells the model what came back.
+    pub text: String,
+    /// Image blocks to send after `text` where the provider supports images
+    /// in tool results.
+    pub images: Vec<ContentBlock>,
+}
+
+/// Decoded size of a base64 payload, without decoding it.
+fn base64_decoded_len(data: &str) -> usize {
+    let trimmed = data.trim_end_matches('=');
+    trimmed.len() * 3 / 4
+}
+
+fn format_size(bytes: usize) -> String {
+    const KB: f64 = 1024.0;
+    let b = bytes as f64;
+    if b < KB {
+        format!("{} B", bytes)
+    } else if b < KB * KB {
+        format!("{:.1} KB", b / KB)
+    } else {
+        format!("{:.1} MB", b / (KB * KB))
+    }
+}
+
+/// Describe an image and, when it can be attached, push it to `images`.
+fn image_part(data: &str, mime_type: &str, images: &mut Vec<ContentBlock>) -> String {
+    let size = base64_decoded_len(data);
+    let size_label = format_size(size);
+    if !ATTACHABLE_IMAGE_TYPES.contains(&mime_type) {
+        return format!("[Image: {}, {}; not attached: unsupported image type]", mime_type, size_label);
+    }
+    if size > MAX_ATTACHED_IMAGE_BYTES {
+        return format!(
+            "[Image: {}, {}; not attached: larger than {}]",
+            mime_type,
+            size_label,
+            format_size(MAX_ATTACHED_IMAGE_BYTES)
+        );
+    }
+    images.push(ContentBlock::Image {
+        source: ImageSource {
+            source_type: "base64".to_string(),
+            media_type: Some(mime_type.to_string()),
+            data: Some(data.to_string()),
+            url: None,
+        },
+    });
+    format!("[Image: {}, {}]", mime_type, size_label)
+}
+
+/// Convert an MCP tool call result into model output.
 ///
-/// Content type handling:
-/// - `text`     → the text itself
-/// - `image`    → `[Image: <mime_type>]` with a short base64 preview
-/// - `resource` → `[Resource: <uri>]` plus text content if present
+/// - `structuredContent`, when present, is used as the text (compact JSON)
+///   and plain text blocks are skipped: the spec makes them a serialization
+///   of the same value.
+/// - `text` → the text itself.
+/// - `image` → a `[Image: <mime>, <size>]` placeholder line plus an image
+///   block (PNG/JPEG/GIF/WebP up to 5 MB; otherwise the placeholder says why
+///   it was not attached).
+/// - `resource` → `[Resource: <uri>]` plus its text; image blobs are handled
+///   like images, other blobs become `[Binary resource: <mime>, <size>]`.
 ///
-/// Mixed content is joined with newlines.
-/// If all content is empty, returns an empty string.
-pub fn mcp_result_to_string(result: &CallToolResult) -> String {
-    let parts: Vec<String> = result
-        .content
-        .iter()
-        .map(|c| match c {
-            McpContent::Text { text } => text.clone(),
+/// Parts are joined with newlines.
+pub fn mcp_result_to_output(result: &CallToolResult) -> McpToolOutput {
+    let mut images = Vec::new();
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(structured) = &result.structured_content {
+        parts.push(structured.to_string());
+    }
+    for content in &result.content {
+        match content {
+            McpContent::Text { text } => {
+                if result.structured_content.is_none() {
+                    parts.push(text.clone());
+                }
+            }
             McpContent::Image { data, mime_type } => {
-                // Show a short preview (first 32 chars of base64) so the model
-                // knows an image was returned without embedding the full blob.
-                let preview_len = data.len().min(32);
-                let preview = &data[..preview_len];
-                let ellipsis = if data.len() > 32 { "…" } else { "" };
-                format!(
-                    "[Image: {} | base64 preview: {}{}]",
-                    mime_type, preview, ellipsis
-                )
+                parts.push(image_part(data, mime_type, &mut images));
             }
             McpContent::Resource { resource } => {
-                let mut parts = vec![format!("[Resource: {}]", resource.uri)];
-                if let Some(ref text) = resource.text {
+                parts.push(format!("[Resource: {}]", resource.uri));
+                if let Some(text) = &resource.text {
                     parts.push(text.clone());
-                } else if resource.blob.is_some() {
+                } else if let Some(blob) = &resource.blob {
                     let mime = resource
                         .mime_type
                         .as_deref()
                         .unwrap_or("application/octet-stream");
-                    parts.push(format!("[Binary resource: {}]", mime));
+                    if mime.starts_with("image/") {
+                        parts.push(image_part(blob, mime, &mut images));
+                    } else {
+                        parts.push(format!(
+                            "[Binary resource: {}, {}]",
+                            mime,
+                            format_size(base64_decoded_len(blob))
+                        ));
+                    }
                 }
-                parts.join("\n")
             }
-        })
-        .collect();
+        }
+    }
 
-    parts.join("\n")
+    McpToolOutput {
+        text: parts.join("\n"),
+        images,
+    }
 }
 
 #[cfg(test)]
@@ -1859,84 +1974,128 @@ mod tests {
         assert_eq!(def.description, "Search the web");
     }
 
-    // ---- mcp_result_to_string ----------------------------------------------
+    // ---- mcp_result_to_output ----------------------------------------------
 
-    #[test]
-    fn test_result_to_string_text() {
-        let result = CallToolResult {
-            content: vec![McpContent::Text {
-                text: "hello".to_string(),
-            }],
+    fn result(content: Vec<McpContent>) -> CallToolResult {
+        CallToolResult {
+            content,
+            structured_content: None,
             is_error: false,
-        };
-        assert_eq!(mcp_result_to_string(&result), "hello");
+        }
     }
 
     #[test]
-    fn test_result_to_string_image() {
-        let result = CallToolResult {
-            content: vec![McpContent::Image {
-                data: "abc123".to_string(),
+    fn test_result_output_text() {
+        let out = mcp_result_to_output(&result(vec![McpContent::Text {
+            text: "hello".to_string(),
+        }]));
+        assert_eq!(out.text, "hello");
+        assert!(out.images.is_empty());
+    }
+
+    #[test]
+    fn test_result_output_image_is_attached_with_placeholder() {
+        // 8 base64 chars = 6 bytes.
+        let out = mcp_result_to_output(&result(vec![McpContent::Image {
+            data: "iVBORw0K".to_string(),
+            mime_type: "image/png".to_string(),
+        }]));
+        assert_eq!(out.text, "[Image: image/png, 6 B]");
+        assert_eq!(out.images.len(), 1);
+        match &out.images[0] {
+            ContentBlock::Image { source } => {
+                assert_eq!(source.source_type, "base64");
+                assert_eq!(source.media_type.as_deref(), Some("image/png"));
+                assert_eq!(source.data.as_deref(), Some("iVBORw0K"));
+            }
+            other => panic!("expected an image block, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_result_output_unsupported_or_huge_image_is_not_attached() {
+        let svg = mcp_result_to_output(&result(vec![McpContent::Image {
+            data: "PHN2Zz4=".to_string(),
+            mime_type: "image/svg+xml".to_string(),
+        }]));
+        assert!(svg.images.is_empty());
+        assert!(svg.text.contains("not attached: unsupported image type"), "{}", svg.text);
+
+        let huge = "A".repeat(8 * 1024 * 1024);
+        let big = mcp_result_to_output(&result(vec![McpContent::Image {
+            data: huge,
+            mime_type: "image/png".to_string(),
+        }]));
+        assert!(big.images.is_empty());
+        assert!(big.text.contains("6.0 MB; not attached: larger than 5.0 MB"), "{}", big.text);
+    }
+
+    #[test]
+    fn test_result_output_prefers_structured_content() {
+        let mut r = result(vec![
+            McpContent::Text {
+                text: "{\"temperature\": 22}".to_string(),
+            },
+            McpContent::Image {
+                data: "iVBORw0K".to_string(),
                 mime_type: "image/png".to_string(),
-            }],
-            is_error: false,
-        };
-        let s = mcp_result_to_string(&result);
-        assert!(s.contains("Image:"));
-        assert!(s.contains("image/png"));
-        assert!(s.contains("abc123"));
+            },
+        ]);
+        r.structured_content = Some(serde_json::json!({ "temperature": 22 }));
+        let out = mcp_result_to_output(&r);
+        assert_eq!(out.text, "{\"temperature\":22}\n[Image: image/png, 6 B]");
+        assert_eq!(out.images.len(), 1);
     }
 
     #[test]
-    fn test_result_to_string_resource_with_text() {
-        let result = CallToolResult {
-            content: vec![McpContent::Resource {
-                resource: ResourceContents {
-                    uri: "file:///foo.txt".to_string(),
-                    mime_type: Some("text/plain".to_string()),
-                    text: Some("file contents".to_string()),
-                    blob: None,
-                },
-            }],
-            is_error: false,
-        };
-        let s = mcp_result_to_string(&result);
-        assert!(s.contains("[Resource: file:///foo.txt]"));
-        assert!(s.contains("file contents"));
+    fn test_result_output_resource_with_text() {
+        let out = mcp_result_to_output(&result(vec![McpContent::Resource {
+            resource: ResourceContents {
+                uri: "file:///foo.txt".to_string(),
+                mime_type: Some("text/plain".to_string()),
+                text: Some("file contents".to_string()),
+                blob: None,
+            },
+        }]));
+        assert_eq!(out.text, "[Resource: file:///foo.txt]\nfile contents");
     }
 
     #[test]
-    fn test_result_to_string_resource_binary() {
-        let result = CallToolResult {
-            content: vec![McpContent::Resource {
+    fn test_result_output_resource_blobs() {
+        let out = mcp_result_to_output(&result(vec![
+            McpContent::Resource {
                 resource: ResourceContents {
                     uri: "file:///img.png".to_string(),
                     mime_type: Some("image/png".to_string()),
                     text: None,
-                    blob: Some("BASE64==".to_string()),
+                    blob: Some("iVBORw0K".to_string()),
                 },
-            }],
-            is_error: false,
-        };
-        let s = mcp_result_to_string(&result);
-        assert!(s.contains("[Resource: file:///img.png]"));
-        assert!(s.contains("[Binary resource: image/png]"));
+            },
+            McpContent::Resource {
+                resource: ResourceContents {
+                    uri: "file:///data.bin".to_string(),
+                    mime_type: None,
+                    text: None,
+                    blob: Some("AAAA".to_string()),
+                },
+            },
+        ]));
+        assert!(out.text.contains("[Resource: file:///img.png]\n[Image: image/png, 6 B]"), "{}", out.text);
+        assert!(out.text.contains("[Binary resource: application/octet-stream, 3 B]"), "{}", out.text);
+        assert_eq!(out.images.len(), 1);
     }
 
     #[test]
-    fn test_result_to_string_mixed() {
-        let result = CallToolResult {
-            content: vec![
-                McpContent::Text {
-                    text: "line one".to_string(),
-                },
-                McpContent::Text {
-                    text: "line two".to_string(),
-                },
-            ],
-            is_error: false,
-        };
-        assert_eq!(mcp_result_to_string(&result), "line one\nline two");
+    fn test_result_output_mixed_text() {
+        let out = mcp_result_to_output(&result(vec![
+            McpContent::Text {
+                text: "line one".to_string(),
+            },
+            McpContent::Text {
+                text: "line two".to_string(),
+            },
+        ]));
+        assert_eq!(out.text, "line one\nline two");
     }
 
     // ---- McpManager --------------------------------------------------------
@@ -2069,6 +2228,30 @@ mod tests {
             .await
             .expect_err("test clients have no backend");
         assert!(err.to_string().contains("backend missing"), "{}", err);
+    }
+
+    #[tokio::test]
+    async fn test_instructions_section_only_for_servers_with_active_tools() {
+        let mgr = Arc::new(McpManager::new());
+        let mut docs = test_client("docs", &["search"]);
+        docs.instructions = Some("  Always cite the page URL.  ".to_string());
+        mgr.install_client(docs);
+        let mut quiet = test_client("quiet", &["noop"]);
+        quiet.instructions = Some("Never shown.".to_string());
+        mgr.install_client(quiet);
+        let mut blank = test_client("blank", &["noop"]);
+        blank.instructions = Some("   ".to_string());
+        mgr.install_client(blank);
+
+        let section = mgr
+            .instructions_prompt_section(|name| name != "mcp__quiet__noop")
+            .expect("docs has an active tool and instructions");
+        assert!(section.starts_with("# MCP Server Instructions"));
+        assert!(section.contains("## docs\nAlways cite the page URL."), "{}", section);
+        assert!(!section.contains("quiet"), "{}", section);
+        assert!(!section.contains("## blank"), "{}", section);
+
+        assert!(mgr.instructions_prompt_section(|_| false).is_none());
     }
 
     #[tokio::test]
