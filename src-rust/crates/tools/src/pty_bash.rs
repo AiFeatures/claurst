@@ -1232,7 +1232,11 @@ async fn run_pty_sandboxed(
         Ok(run) => run,
         Err(result) => return result,
     };
-    if !crate::sandbox::is_likely_sandbox_denied(run.exit_code, &run.output) {
+    if !crate::sandbox::is_likely_sandbox_denied(
+        run.exit_code,
+        &run.output,
+        ctx.config.sandbox.network,
+    ) {
         return finish_pty_run(run, command, shell_state);
     }
     let decision = crate::sandbox::request_unsandboxed_retry(ctx, command).await;

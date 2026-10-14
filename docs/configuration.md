@@ -345,20 +345,41 @@ policies):
 - Reading any file.
 - `workspace-write`: writing beneath the working directory, `workspace_paths`,
   `additional_dirs` / `--add-dir` directories, `$TMPDIR` and `/tmp`. Inside
-  every writable root, `.git` and `.claurst` stay read-only, so a sandboxed
-  command can run `git status` or `git diff` but not `git commit`.
+  every writable root, `.git`, `.claurst`, `.ssh`, `.aws` and `.gnupg` stay
+  read-only, so a sandboxed command can run `git status` or `git diff` but not
+  `git commit`.
 - `read-only`: no writes (only `/dev/null` and the terminal).
 - Network only with `network: true`.
 - Everything else is denied (`(deny default)`), including XPC services.
 
+What the sandbox does not protect against:
+
+- Every file stays readable, including `~/.ssh`, `~/.aws`, keychains, other
+  repositories and `~/.claurst/settings.json` (API keys). With `network: true`
+  nothing stops a command from sending them elsewhere.
+- Any binary can be executed; the profile only limits what it can write and
+  reach.
+- Only Bash commands are sandboxed. The file tools (Write, Edit, ApplyPatch),
+  PowerShell, REPL, MCP servers, hooks and the status line are not.
+- `.git` is read-only, so `git add`, `git commit` and `git stash` go through
+  the rerun prompt.
+- If Claurst itself already runs under Seatbelt (a sandboxed terminal or
+  agent), every command fails with `sandbox-exec: sandbox_apply: Operation not
+  permitted` (exit 71); set `mode` to `off` there.
+- Apple marks `sandbox-exec` as deprecated, but it ships and works on macOS 15
+  and 26.
+- Linux and Windows run commands unsandboxed.
+
 When a sandboxed command fails with a non-zero exit (other than 2, 126 or 127)
 and its output contains a denial message such as `Operation not permitted`,
-`Permission denied` or `Read-only file system`, it is treated as a likely
-sandbox denial:
+`Permission denied` or `Read-only file system` (or, with `network: false`,
+`Could not resolve host`, `Couldn't connect to server` or `Network is
+unreachable`), it is treated as a likely sandbox denial:
 
 - In the interactive TUI a **Sandbox Denied** dialog offers to rerun it
   outside the sandbox **once**, **for this session**, or **always for commands
-  starting with the same word** (saved to `sandbox.unsandboxedPrefixes`). The
+  starting with the same word** (saved to `sandbox.unsandboxedPrefixes`; not
+  offered for launchers such as `bash`, `sh`, `env`, `xargs` or `python3`). The
   dialog is never answered by permission rules or `allowedBashPrefixes`.
 - In headless (`--print`) and ACP sessions nobody is asked: the failed result
   is returned with a `[sandbox]` note so the caller can decide.

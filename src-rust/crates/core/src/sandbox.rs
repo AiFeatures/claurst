@@ -78,9 +78,17 @@ pub fn render_sandbox_state(settings: &SandboxSettings) -> Option<String> {
         }
         SandboxMode::ReadOnly => "cannot write files",
     };
-    let network = if settings.network { "on" } else { "off" };
+    let (network, blocked) = if settings.network {
+        ("on", "\"Operation not permitted\"")
+    } else {
+        (
+            "off",
+            "\"Operation not permitted\", or for network access with resolver or connection errors \
+             (\"Could not resolve host\")",
+        )
+    };
     Some(format!(
-        "# Sandbox\nBash commands run in a macOS Seatbelt sandbox ({}): they can read any file but {writes}; network access is {network}. A command the sandbox blocks fails with \"Operation not permitted\"; say so instead of working around it, so the user can approve a rerun outside the sandbox.",
+        "# Sandbox\nBash commands run in a macOS Seatbelt sandbox ({}): they can read any file but {writes}; network access is {network}. A command the sandbox blocks fails with {blocked}; say so instead of working around it, so the user can approve a rerun outside the sandbox.",
         settings.mode.as_str()
     ))
 }
@@ -148,6 +156,7 @@ mod tests {
         assert_eq!(line.lines().count(), 2);
         assert!(line.contains("(workspace-write)"));
         assert!(line.contains("network access is off"));
+        assert!(line.contains("Could not resolve host"));
         assert_eq!(status_label(&write).as_deref(), Some("sandbox: workspace-write"));
 
         let line = render_sandbox_state(&read_only).unwrap();

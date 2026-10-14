@@ -36,8 +36,9 @@ const SEATBELT_TLS_TRUST_POLICY: &str =
     "(allow mach-lookup (global-name \"com.apple.TrustEvaluationAgent\"))\n";
 
 /// Entries kept read-only directly beneath every writable root: the
-/// repository metadata and claurst's own project settings.
-const PROTECTED_NAMES: [&str; 2] = [".git", ".claurst"];
+/// repository metadata, claurst's own project settings, and the credential
+/// directories that sit beneath a root when the workspace is `$HOME`.
+const PROTECTED_NAMES: [&str; 5] = [".git", ".claurst", ".ssh", ".aws", ".gnupg"];
 
 /// A generated Seatbelt profile plus the `-D` parameters it refers to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -213,17 +214,29 @@ const SANDBOX_DENIED_KEYWORDS: [&str; 7] = [
     "failed to write file",
 ];
 
+/// What a client reports when the sandbox blocks its network access: the
+/// resolver and `connect` fail rather than returning EPERM. Matched only while
+/// `sandbox.network` is off, so real network outages with the network open
+/// are not reported as denials.
+const NETWORK_DENIED_KEYWORDS: [&str; 3] = [
+    "could not resolve host",
+    "couldn't connect to server",
+    "network is unreachable",
+];
+
 /// Whether a failed sandboxed command was likely stopped by the sandbox.
 /// There is no exact signal: a command can fail with "permission denied" for
 /// its own reasons, so this is the codex heuristic: a non-zero exit that is
-/// not 2, 126 or 127, with a denial keyword in the (merged PTY) output.
-pub fn is_likely_sandbox_denied(exit_code: i32, output: &str) -> bool {
+/// not 2, 126 or 127, with a denial keyword in the (merged PTY) output. With
+/// `network` off, resolver and connect failures count as denials too.
+pub fn is_likely_sandbox_denied(exit_code: i32, output: &str, network: bool) -> bool {
     if exit_code == 0 || QUICK_REJECT_EXIT_CODES.contains(&exit_code) {
         return false;
     }
     let lower = output.to_lowercase();
     SANDBOX_DENIED_KEYWORDS
         .iter()
+        .chain(if network { &[][..] } else { &NETWORK_DENIED_KEYWORDS[..] })
         .any(|needle| lower.contains(needle))
 }
 
@@ -246,19 +259,27 @@ pub enum EscalationScope {
     Prefix,
 }
 
+/// First words that run whatever follows them: approving one of these
+/// "always" would switch the sandbox off for every command.
+const LAUNCHERS: [&str; 18] = [
+    "bash", "sh", "zsh", "dash", "fish", "env", "xargs", "sudo", "exec", "eval", "nohup",
+    "time", "command", "python", "python3", "node", "perl", "ruby",
+];
+
 /// The prefix a "for this command prefix" approval covers: the command's
 /// first word, when the command is a single simple command. Chained,
 /// piped, redirected or substituted commands have none, so approving `git`
-/// can never cover `git status; curl ...` or `git log > ~/.zshrc`.
+/// can never cover `git status; curl ...` or `git log > ~/.zshrc`; nor do
+/// launchers such as `bash` or `env` (see [`LAUNCHERS`]).
 pub fn unsandboxed_prefix(command: &str) -> Option<&str> {
     let command = command.trim();
     if command.contains(['\n', ';', '&', '|', '`', '<', '>']) || command.contains("$(") {
         return None;
     }
-    command
-        .split_whitespace()
-        .next()
-        .filter(|word| !word.contains('='))
+    command.split_whitespace().next().filter(|word| {
+        let name = word.rsplit('/').next().unwrap_or(word);
+        !word.contains('=') && !LAUNCHERS.contains(&name)
+    })
 }
 
 /// Record the user's approval to run `command` outside the sandbox.
@@ -427,17 +448,24 @@ mod tests {
     #[test]
     fn snapshot_workspace_write_with_protected_entries() {
         let roots = vec![PathBuf::from("/work/repo"), PathBuf::from("/private/tmp")];
-        let protected = protected_paths(&roots);
         assert_eq!(
-            protected,
+            protected_paths(&roots[..1]),
             [
                 "/work/repo/.git",
                 "/work/repo/.claurst",
-                "/private/tmp/.git",
-                "/private/tmp/.claurst",
+                "/work/repo/.ssh",
+                "/work/repo/.aws",
+                "/work/repo/.gnupg",
             ]
             .map(PathBuf::from)
         );
+        let protected = [
+            "/work/repo/.git",
+            "/work/repo/.claurst",
+            "/private/tmp/.git",
+            "/private/tmp/.claurst",
+        ]
+        .map(PathBuf::from);
         let profile = SeatbeltProfile::new(&roots, &protected, false);
         let expected = format!(
             "(allow file-write*\n\
@@ -527,15 +555,32 @@ mod tests {
 
     #[test]
     fn denial_needs_a_failure_and_a_keyword() {
-        assert!(is_likely_sandbox_denied(1, "bash: /x: Operation not permitted"));
-        assert!(is_likely_sandbox_denied(1, "touch: /x: Permission denied"));
-        assert!(is_likely_sandbox_denied(128, "fatal: Unable to create '.git/index.lock': Operation not permitted"));
-        assert!(is_likely_sandbox_denied(1, "error: Read-only file system"));
-        assert!(is_likely_sandbox_denied(71, "sandbox-exec: sandbox_apply: Operation not permitted"));
-        assert!(!is_likely_sandbox_denied(0, "Operation not permitted"));
-        assert!(!is_likely_sandbox_denied(1, "error: tests failed"));
-        for code in QUICK_REJECT_EXIT_CODES {
-            assert!(!is_likely_sandbox_denied(code, "Permission denied"));
+        for network in [false, true] {
+            assert!(is_likely_sandbox_denied(1, "bash: /x: Operation not permitted", network));
+            assert!(is_likely_sandbox_denied(1, "touch: /x: Permission denied", network));
+            assert!(is_likely_sandbox_denied(128, "fatal: Unable to create '.git/index.lock': Operation not permitted", network));
+            assert!(is_likely_sandbox_denied(1, "error: Read-only file system", network));
+            assert!(is_likely_sandbox_denied(71, "sandbox-exec: sandbox_apply: Operation not permitted", network));
+            assert!(!is_likely_sandbox_denied(0, "Operation not permitted", network));
+            assert!(!is_likely_sandbox_denied(1, "error: tests failed", network));
+            for code in QUICK_REJECT_EXIT_CODES {
+                assert!(!is_likely_sandbox_denied(code, "Permission denied", network));
+            }
+        }
+    }
+
+    /// With the network off, resolver and connect failures are denials;
+    /// with it on they are ordinary network errors.
+    #[test]
+    fn network_failures_count_only_while_network_is_off() {
+        for (code, output) in [
+            (6, "curl: (6) Could not resolve host: example.com"),
+            (7, "curl: (7) Couldn't connect to server"),
+            (128, "fatal: unable to access 'https://github.com/x/y/': Could not resolve host: github.com"),
+            (1, "connect: Network is unreachable"),
+        ] {
+            assert!(is_likely_sandbox_denied(code, output, false), "{output}");
+            assert!(!is_likely_sandbox_denied(code, output, true), "{output}");
         }
     }
 
@@ -553,6 +598,11 @@ mod tests {
             "git status\nrm x",
             "make &",
             "FOO=1 make",
+            "bash -c 'rm -rf ~'",
+            "/bin/sh x.sh",
+            "env rm x",
+            "xargs rm",
+            "python3 evil.py",
             "",
         ] {
             assert_eq!(unsandboxed_prefix(chained), None, "{chained}");
@@ -648,7 +698,14 @@ mod tests {
         let protected = protected_paths(std::slice::from_ref(&root));
         assert_eq!(
             protected,
-            [elsewhere, root.join(".git"), root.join(".claurst")]
+            [
+                elsewhere,
+                root.join(".git"),
+                root.join(".claurst"),
+                root.join(".ssh"),
+                root.join(".aws"),
+                root.join(".gnupg"),
+            ]
         );
     }
 }
