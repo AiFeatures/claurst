@@ -172,6 +172,10 @@ pub fn default_bindings() -> Vec<ParsedBinding> {
         // Message submission
         ("enter", "submit", KeyContext::Chat),
 
+        // Stop the running turn, like Ctrl+C. Ignored while idle, so Esc keeps
+        // its vim / transcript-focus meanings there.
+        ("escape", "cancelTurn", KeyContext::Chat),
+
         // Newline insertion (Shift+Enter / Ctrl+J for multi-line composing)
         ("shift+enter", "newline", KeyContext::Chat),
         // Fallback for terminals that do not support the kitty keyboard protocol

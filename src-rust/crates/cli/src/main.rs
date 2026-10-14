@@ -290,19 +290,15 @@ fn resolve_bridge_config(
     bridge_config.is_active().then_some(bridge_config)
 }
 
-fn handle_exit_key(app: &mut claurst_tui::app::App, key: crossterm::event::KeyEvent, cancel: &Option<tokio_util::sync::CancellationToken>) -> bool {
+fn handle_exit_key(app: &mut claurst_tui::app::App, key: crossterm::event::KeyEvent) -> bool {
     if !key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
         return false;
     }
 
     match key.code {
         crossterm::event::KeyCode::Char('c') => {
-            // Cancel background task first, then let app handle state cleanup
-            if app.is_streaming {
-                if let Some(ref ct) = cancel {
-                    ct.cancel();
-                }
-            }
+            // During a turn the app interrupts it and sets `cancel_requested`;
+            // the main loop then cancels the token, as for Esc (#444).
             app.handle_key_event(key);
             true
         }
@@ -2286,6 +2282,8 @@ async fn run_interactive(
             .map(|s| (s.terminal_progress_bar, s.terminal_program_status))
             .unwrap_or((true, true));
     let mut progress_shown = false;
+    // Set while an interrupted turn's task winds down (#444).
+    let mut discard_turn_events = false;
     'main: loop {
         app.frame_count = app.frame_count.wrapping_add(1);
         app.tick_rustle_pose();
@@ -2342,6 +2340,8 @@ async fn run_interactive(
             claurst_tui::set_program_status(app.program_status(current_query.is_some()));
         }
 
+        app.query_in_flight = current_query.is_some();
+
         // Poll for crossterm events (keyboard/mouse) with short timeout
         // unless an auto-submit (queued message) is pending — in which case
         // synthesize an Enter event to dequeue and submit it.
@@ -2393,7 +2393,7 @@ async fn run_interactive(
                     }
 
                     // Ctrl+C and Ctrl+D: exit confirmation handling
-                    if handle_exit_key(&mut app, key, &cancel) {
+                    if handle_exit_key(&mut app, key) {
                         if app.should_exit {
                             break 'main;
                         }
@@ -2436,7 +2436,10 @@ async fn run_interactive(
                         && !key.modifiers.contains(KeyModifiers::SHIFT)
                         && !key.modifiers.contains(KeyModifiers::ALT)
                         && !key.modifiers.contains(KeyModifiers::CONTROL);
-                    if plain_enter && app.is_streaming && !any_dialog_open {
+                    // A turn is running until its task ends: `is_streaming`
+                    // drops between model requests and right after Esc.
+                    let turn_running = app.is_streaming || current_query.is_some();
+                    if plain_enter && turn_running && !any_dialog_open {
                         // Steer (#444): the loop delivers the text before its
                         // next model request. Slash commands cannot steer the
                         // model, so they wait for the turn to end (issue #149).
@@ -2449,7 +2452,7 @@ async fn run_interactive(
                         }
                         continue;
                     }
-                    if plain_enter && !app.is_streaming && !any_dialog_open {
+                    if plain_enter && !turn_running && !any_dialog_open {
                         // If a file-ref suggestion is active, accept it instead of submitting.
                         if !app.prompt_input.suggestions.is_empty()
                             && app.prompt_input.suggestion_index.is_some_and(|index| {
@@ -3330,6 +3333,16 @@ async fn run_interactive(
             }
         }
 
+        // Esc / Ctrl+C interrupted the turn (#444): cancel its token, which
+        // stops the model request and running tools. Events the task already
+        // queued are dropped so they cannot restart the spinner.
+        if std::mem::take(&mut app.cancel_requested) {
+            if let Some(ref ct) = cancel {
+                ct.cancel();
+            }
+            discard_turn_events = current_query.is_some();
+        }
+
         if app.permission_request.is_none() {
             loop {
                 let next_pending = pending_permissions.lock().queue.pop_front();
@@ -3384,6 +3397,9 @@ async fn run_interactive(
             // Record loop compactions in the session (issue #441).
             if let QueryEvent::Compacted(record) = &evt {
                 session.compactions.push(record.clone());
+            }
+            if discard_turn_events {
+                continue;
             }
             // Forward to bridge before consuming (clone only what we need).
             if let Some(ref runtime) = bridge_runtime {
@@ -4152,6 +4168,13 @@ async fn run_interactive(
             if let Some((handle, msgs_arc)) = current_query.take() {
                 // Get the outcome and handle errors
                 let result = handle.await;
+                if std::mem::take(&mut discard_turn_events) {
+                    while let Ok(evt) = event_rx.try_recv() {
+                        if let QueryEvent::Compacted(record) = evt {
+                            session.compactions.push(record);
+                        }
+                    }
+                }
                 app.last_turn_outcome = claurst_tui::TurnOutcome::from_query_result(&result);
                 if let Ok(QueryOutcome::Error(err)) = result {
                     while app.notifications.current_is_error() {

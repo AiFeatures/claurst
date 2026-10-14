@@ -246,6 +246,57 @@ mod tests {
     }
 
     #[test]
+    fn esc_and_ctrl_c_cancel_the_turn_the_same_way() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        for key in [
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        ] {
+            let (mut app, queue) = app_with_queue();
+            app.query_in_flight = true;
+            app.is_streaming = true;
+            app.streaming_text = "partial answer".to_string();
+            app.retry_status = Some((1, 5));
+            app.steer("not sent yet".to_string());
+            app.handle_key_event(key);
+            assert!(app.cancel_requested, "{key:?} must cancel the turn's token");
+            assert!(!app.is_streaming);
+            assert!(app.retry_status.is_none());
+            assert_eq!(
+                app.messages.last().map(Message::get_all_text).as_deref(),
+                Some("partial answer"),
+                "partial output stays visible"
+            );
+            assert!(queue.is_empty(), "no steer is delivered after a cancel");
+            assert_eq!(app.prompt_input.text, "not sent yet");
+        }
+    }
+
+    #[test]
+    fn esc_between_model_requests_still_cancels() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (mut app, _queue) = app_with_queue();
+        // Tools running: the query task is alive but nothing is streaming.
+        app.query_in_flight = true;
+        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.cancel_requested);
+    }
+
+    #[test]
+    fn esc_esc_on_an_idle_prompt_does_nothing() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (mut app, _queue) = app_with_queue();
+        app.push_message(Message::user("earlier prompt"));
+        app.set_prompt_text("draft".to_string());
+        for _ in 0..2 {
+            app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        }
+        assert!(!app.cancel_requested);
+        assert!(!app.rewind_flow.visible);
+        assert_eq!(app.prompt_input.text, "draft");
+    }
+
+    #[test]
     fn cancel_returns_undelivered_steers_to_the_prompt() {
         let (mut app, queue) = app_with_queue();
         app.steer("one".to_string());

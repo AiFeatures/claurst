@@ -1387,18 +1387,6 @@ impl App {
         }
 
         match key.code {
-            // ---- ESC: cancel streaming (status bar advertises "esc interrupt") ----
-            KeyCode::Esc if self.is_streaming => {
-                self.is_streaming = false;
-                self.spinner_verb = None;
-                self.streaming_text.clear();
-                self.streaming_thinking.clear();
-                self.tool_use_blocks.clear();
-                self.retry_status = None;
-                self.status_message = Some("Cancelled.".to_string());
-                self.complete_current_turn_snapshot(true);
-            }
-
             // ---- Quit / cancel ----------------------------------------
             // Accept both 'c' and 'C' so Shift+Ctrl+C also triggers copy
             // (issue #149 follow-up).
@@ -1414,15 +1402,8 @@ impl App {
                     if copied {
                         self.push_notification(NotificationKind::Info, "Copied to clipboard".to_string(), Some(2));
                     }
-                } else if self.is_streaming {
-                    // Cancel streaming.
-                    self.is_streaming = false;
-                    self.spinner_verb = None;
-                    self.streaming_text.clear();
-                    self.streaming_thinking.clear();
-                    self.tool_use_blocks.clear();
-                    self.status_message = Some("Cancelled.".to_string());
-                    self.complete_current_turn_snapshot(true);
+                } else if self.turn_running() {
+                    self.interrupt_turn();
                 } else {
                     // No text selected and not streaming: handle exit confirmation sequence.
                     // Always clear the prompt input on Ctrl+C.
@@ -2092,20 +2073,22 @@ impl App {
     fn keybinding_action_applies(&self, action: &str) -> bool {
         match action {
             "editQueued" | "removeQueued" => self.pending_prompts().next().is_some(),
+            // Idle Esc keeps its other meanings (vim, transcript focus). There
+            // is no backtrack picker, so Esc-Esc on an idle prompt does nothing.
+            "cancelTurn" => self.turn_running(),
             _ => true,
         }
     }
 
     pub(super) fn handle_keybinding_action(&mut self, action: &str) -> bool {
         match action {
+            "cancelTurn" => {
+                self.interrupt_turn();
+                false
+            }
             "interrupt" => {
-                if self.is_streaming {
-                    self.is_streaming = false;
-                    self.spinner_verb = None;
-                    self.streaming_text.clear();
-                    self.streaming_thinking.clear();
-                    self.tool_use_blocks.clear();
-                    self.status_message = Some("Cancelled.".to_string());
+                if self.turn_running() {
+                    self.interrupt_turn();
                 } else {
                     // Handle exit confirmation: require two exit key presses within 2 seconds.
                     // Always clear the prompt input on Ctrl+C.

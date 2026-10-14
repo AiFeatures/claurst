@@ -94,6 +94,30 @@ impl App {
         }
     }
 
+    /// Whether a turn is running: the model is streaming, or the query task
+    /// is between requests (tools running, retry back-off).
+    pub(super) fn turn_running(&self) -> bool {
+        self.is_streaming || self.query_in_flight
+    }
+
+    /// Esc / Ctrl+C during a turn (#444): stop it the same way from either
+    /// key. What streamed so far stays in the transcript, the retry pill is
+    /// cleared, undelivered steers go back to the prompt, and the interactive
+    /// loop cancels the turn's token (stopping the model and running tools).
+    pub(super) fn interrupt_turn(&mut self) {
+        self.is_streaming = false;
+        self.spinner_verb = None;
+        self.stall_start = None;
+        self.retry_status = None;
+        self.flush_streamed_assistant_message();
+        self.tool_use_blocks.retain(|b| b.status != super::types::ToolStatus::Running);
+        self.status_message = Some("Cancelled.".to_string());
+        self.complete_current_turn_snapshot(true);
+        self.restore_pending_steers();
+        self.cancel_requested = true;
+        self.invalidate_transcript();
+    }
+
     pub(super) fn flush_streamed_assistant_message(&mut self) {
         if self.streaming_text.trim().is_empty() && self.streaming_thinking.trim().is_empty() {
             self.streaming_text.clear();

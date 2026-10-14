@@ -447,6 +447,13 @@ pub struct App {
     /// `(attempt, max)` while a model request is being retried (#439);
     /// drives the "Reconnecting n/max" footer pill.
     pub retry_status: Option<(u32, u32)>,
+    /// A query task is running (set by the interactive loop each frame).
+    /// Unlike `is_streaming` it stays true between model requests while
+    /// tools run and during retry back-off.
+    pub query_in_flight: bool,
+    /// Set when the user interrupts the turn (Esc / Ctrl+C); the interactive
+    /// loop takes it and cancels the turn's token (#444).
+    pub cancel_requested: bool,
     /// Background task status text shown in footer pill.
     pub background_task_status: Option<String>,
     /// External status line output (`statusLine` / CLAUDE_STATUS_COMMAND),
@@ -770,6 +777,8 @@ impl App {
             ).map(|repo_root| claurst_core::git_utils::get_current_branch(&repo_root)),
             background_task_count: 0,
             retry_status: None,
+            query_in_flight: false,
+            cancel_requested: false,
             background_task_status: None,
             status_line_override: None,
             voice_recorder: {
