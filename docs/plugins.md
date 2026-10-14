@@ -199,7 +199,7 @@ An array of LSP server definitions for language-aware editing support:
 
 ### hooks
 
-Either a path string pointing to a `hooks.json` file inside the plugin directory, or an inline hooks configuration object (see the Hooks section below).
+An inline hooks configuration object (see [Hooks](#hooks) below). A `hooks/hooks.json` file in the plugin directory takes precedence over it.
 
 ### user_config
 
@@ -222,85 +222,11 @@ Known categories: `"read_files"`, `"write_files"`, `"network"`, `"shell"`, `"bro
 
 ---
 
-## Hook Events
+## Hooks
 
-Plugins can run shell commands in response to lifecycle events. Hooks receive a JSON payload on stdin describing the event.
+Plugins can ship hooks: shell commands that run on session events. Plugin hooks use exactly the same format, events, input and output as settings hooks, and run through the same engine, after the user's settings hooks. See [Hooks](hooks.md) for the events (`PreToolUse`, `PostToolUse`, `UserPromptSubmit`, `Stop`, `SubagentStop`, `SessionStart`, `SessionEnd`, `Notification`, `PreCompact`, `PostModelTurn`), the JSON on stdin, exit code 2 and the stdout JSON fields.
 
-### Available Events
-
-| Event | When it fires |
-|---|---|
-| `PreToolUse` | Before any tool is executed |
-| `PostToolUse` | After a tool returns its result |
-| `PostToolUseFailure` | After a tool call throws an error |
-| `PermissionDenied` | When a permission request is rejected |
-| `PermissionRequest` | When a permission is requested (before decision) |
-| `Notification` | General notification from the agent |
-| `UserPromptSubmit` | When the user submits a prompt |
-| `SessionStart` | At the beginning of a session |
-| `SessionEnd` | At clean session shutdown |
-| `Stop` | When the model finishes its turn |
-| `StopFailure` | When the stop sequence fails |
-| `SubagentStart` | When a sub-agent is spawned |
-| `SubagentStop` | When a sub-agent finishes |
-| `PreCompact` | Before context compaction |
-| `PostCompact` | After context compaction |
-| `Setup` | During plugin setup phase |
-| `TeammateIdle` | When a teammate agent becomes idle |
-| `TaskCreated` | When a task is created |
-| `TaskCompleted` | When a task finishes |
-| `Elicitation` | When the model requests clarification |
-| `ElicitationResult` | When elicitation receives a response |
-| `ConfigChange` | When configuration is modified |
-| `WorktreeCreate` | When a git worktree is created |
-| `WorktreeRemove` | When a git worktree is removed |
-| `InstructionsLoaded` | When CLAUDE.md / instructions are loaded |
-| `CwdChanged` | When the working directory changes |
-| `FileChanged` | When a watched file changes |
-
-### HookEntry Fields
-
-Each hook entry in a hooks configuration:
-
-| Field | Type | Description |
-|---|---|---|
-| `command` | string | Shell command to run. Receives event JSON on stdin. |
-| `matcher` | string | Optional tool-name filter. Supports `*` wildcard (e.g. `"File*"`, `"*Tool"`). Only relevant for `PreToolUse` / `PostToolUse`. |
-| `blocking` | bool | If `true`, a non-zero exit code blocks the operation. Non-blocking hooks (default) only log a warning on failure. |
-
-### Hooks Configuration Format
-
-Hooks can be defined inline in the manifest or in a separate `hooks/hooks.json` file. Both the flat form and the wrapped form are accepted:
-
-**Flat form:**
-
-```json
-{
-  "PreToolUse": [
-    {
-      "matcher": "Bash",
-      "hooks": [
-        {
-          "command": "echo \"About to run Bash tool\" >&2",
-          "blocking": false
-        }
-      ]
-    }
-  ],
-  "Stop": [
-    {
-      "hooks": [
-        {
-          "command": "notify-send 'Claurst finished'",
-          "blocking": false
-        }
-      ]
-    }
-  ]
-}
-```
-
-**Wrapped form (with description):**
+Hooks are read from `hooks/hooks.json` in the plugin directory or, if there is none, from the manifest's inline `hooks` object. Both the plain events map and a wrapped form with a description are accepted:
 
 ```json
 {
@@ -308,30 +234,32 @@ Hooks can be defined inline in the manifest or in a separate `hooks/hooks.json` 
   "hooks": {
     "PostToolUse": [
       {
-        "matcher": "Edit",
+        "matcher": "Edit|Write",
         "hooks": [
-          {
-            "command": "python3 lint_check.py",
-            "blocking": true
-          }
+          { "type": "command", "command": "\"$CLAUDE_PLUGIN_ROOT\"/scripts/lint.sh", "timeout": 30 }
         ]
       }
+    ],
+    "Stop": [
+      { "hooks": [{ "type": "command", "command": "notify-send 'Claurst finished'" }] }
     ]
   }
 }
 ```
 
-When a blocking hook exits non-zero, Claurst denies the operation and reports the hook's stderr as the reason.
+Entries for events Claurst does not implement are skipped with a warning.
 
-**Environment variables available to hook processes:**
+**Trust.** Hooks from plugins in `~/.claurst/plugins/` run like your own hooks. Hooks from plugins found in a project's `.claurst/plugins/` are ignored (a warning is logged and `/plugin info` marks them as not run), for the same reason project settings cannot define hooks: they come from the repository, not from you.
+
+**Environment variables available to plugin hook processes:**
 
 | Variable | Value |
 |---|---|
 | `CLAUDE_PLUGIN_ROOT` | Absolute path to the plugin directory |
 | `CLAUDE_PLUGIN_NAME` | Plugin name from the manifest |
-| `CLAUDE_TOOL_NAME` | Tool name (PostToolUse hooks only) |
-| `CLAUDE_TOOL_INPUT` | Tool input as JSON string (PostToolUse hooks only) |
-| `CLAUDE_TOOL_RESULT` | Tool result as JSON string (PostToolUse hooks only) |
+| `CLAUDE_PROJECT_DIR` | The session's working directory |
+
+Plugin hooks are registered when Claurst starts; restart to pick up changes (`/plugin reload` and `/reload-plugins` do not re-register hooks). `/hooks` lists them with the plugin's name.
 
 ---
 
@@ -357,7 +285,7 @@ After enabling or disabling a plugin, run `/plugin reload` or use `/reload-plugi
 /reload-plugins
 ```
 
-Rescans `~/.claurst/plugins/`, re-reads all manifests, and refreshes the active hook registry, commands, agents, skills, and MCP server definitions. Use this after making changes to a plugin directory or after installing a new plugin.
+Rescans `~/.claurst/plugins/`, re-reads all manifests, and reports what changed. Plugin hooks are not re-registered; restart Claurst for hook changes. Use this after making changes to a plugin directory or after installing a new plugin.
 
 ---
 
@@ -384,7 +312,7 @@ Locally installed plugins (via a file path) do not require a `marketplace_id`.
 
 name        = "code-quality"
 version     = "0.3.1"
-description = "Runs linters and formatters as blocking pre-tool hooks"
+description = "Runs linters and formatters after file edits"
 license     = "MIT"
 keywords    = ["lint", "format", "quality"]
 
@@ -407,20 +335,11 @@ default     = false
   "hooks": {
     "PostToolUse": [
       {
-        "matcher": "Edit",
+        "matcher": "Edit|Write",
         "hooks": [
           {
-            "command": "eslint --fix \"$CLAUDE_TOOL_INPUT\" 2>&1 || true",
-            "blocking": false
-          }
-        ]
-      },
-      {
-        "matcher": "Write",
-        "hooks": [
-          {
-            "command": "prettier --write \"$CLAUDE_TOOL_INPUT\" 2>&1 || true",
-            "blocking": false
+            "type": "command",
+            "command": "f=$(jq -r .tool_input.file_path); eslint --fix \"$f\" >/dev/null 2>&1; prettier --write \"$f\" >/dev/null 2>&1; exit 0"
           }
         ]
       }
