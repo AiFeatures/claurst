@@ -195,7 +195,7 @@ pub(crate) fn profile_for(ctx: &ToolContext, command: &str) -> Option<SeatbeltPr
 
 /// Tool name of the "retry outside the sandbox?" request pushed onto the
 /// pending-permission queue. The TUI renders it as its own dialog and never
-/// auto-resolves it from permission rules; ACP denies it without asking.
+/// auto-resolves it from permission rules; ACP leaves it unanswered.
 pub const SANDBOX_ESCALATION_TOOL: &str = "SandboxEscalation";
 
 /// Exit codes that mean "usage error", "not executable" or "not found" rather

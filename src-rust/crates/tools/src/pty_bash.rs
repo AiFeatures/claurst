@@ -1059,7 +1059,6 @@ impl Tool for PtyBashTool {
                         timeout_dur,
                         timeout_ms,
                         &spill_dir,
-                        None,
                     )
                     .await
                 }
@@ -1169,9 +1168,9 @@ fn finish_pty_run(
     shell_result(output, exit_code)
 }
 
-/// Run `command` in a PTY with the session's persisted shell state, fold the
-/// wrapper's state block back into that state, and render the bounded result.
-/// With a `sandbox` profile the shell runs under Seatbelt (#470).
+/// Run `command` unsandboxed in a PTY with the session's persisted shell
+/// state, fold the wrapper's state block back into that state, and render the
+/// bounded result.
 #[cfg(unix)]
 async fn run_pty_foreground(
     command: &str,
@@ -1180,7 +1179,6 @@ async fn run_pty_foreground(
     timeout_dur: Duration,
     timeout_ms: u64,
     spill_dir: &Path,
-    sandbox: Option<&SeatbeltProfile>,
 ) -> ToolResult {
     match run_pty_once(
         command,
@@ -1189,7 +1187,7 @@ async fn run_pty_foreground(
         timeout_dur,
         timeout_ms,
         spill_dir,
-        sandbox,
+        None,
     )
     .await
     {
@@ -1240,7 +1238,6 @@ async fn run_pty_sandboxed(
             timeout_dur,
             timeout_ms,
             spill_dir,
-            None,
         )
         .await;
     }
@@ -1378,7 +1375,6 @@ mod tests {
             Duration::from_secs(30),
             30_000,
             spill_dir.path(),
-            None,
         )
         .await;
         assert_eq!(result.content, "foo");
@@ -1391,7 +1387,6 @@ mod tests {
             Duration::from_secs(30),
             30_000,
             spill_dir.path(),
-            None,
         )
         .await;
         assert_eq!(result.content, "a\n");
@@ -1477,7 +1472,6 @@ mod tests {
                 Duration::from_secs(30),
                 30_000,
                 spill_dir.path(),
-                None,
             )
             .await;
             assert!(!result.is_error, "{}", result.content);
@@ -1605,7 +1599,6 @@ mod tests {
             Duration::from_secs(120),
             120_000,
             spill_dir.path(),
-            None,
         )
         .await;
         assert!(
@@ -1714,7 +1707,6 @@ mod tests {
             Duration::from_secs(30),
             30_000,
             spill_dir.path(),
-            None,
         )
         .await;
         assert!(!result.is_error, "{}", result.content);
