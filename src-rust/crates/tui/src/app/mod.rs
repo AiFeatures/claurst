@@ -7,12 +7,14 @@ mod mouse;
 mod prompt;
 mod providers;
 mod run;
+mod steering;
 #[cfg(test)]
 mod tests;
 mod turns;
 mod types;
 mod views;
 
+pub use steering::PendingKind;
 pub use types::{
     ContextMenuKind, DisplayMessage, FocusTarget, HistorySearch,
     RecentSession, SystemAnnotation, SystemMessageStyle, ToolStatus,
@@ -405,9 +407,15 @@ pub struct App {
     pub recent_sessions_rx: Option<tokio::sync::mpsc::Receiver<Vec<RecentSession>>>,
     /// Credential store for provider API keys and OAuth tokens.
     pub auth_store: claurst_core::AuthStore,
-    /// Messages typed by the user while a query was streaming. They will be
+    /// Messages queued with Tab while a query was streaming. They are
     /// auto-submitted in order once the current turn completes (issue #149).
     pub queued_messages: std::collections::VecDeque<String>,
+    /// Queue the query loop drains at each step boundary (#444). Enter during
+    /// a turn pushes steers here; background tasks push completion notices.
+    pub command_queue: Option<claurst_query::CommandQueue>,
+    /// Steers pushed to `command_queue` and not yet delivered, oldest first:
+    /// `(queue id, text)`. Shown in the queued-prompt dock.
+    pub pending_steers: Vec<(u64, String)>,
     /// When `true`, the main loop will inject a synthetic Enter event on the
     /// next iteration to dequeue and submit the next queued message.
     pub pending_auto_submit: bool,
@@ -730,6 +738,8 @@ impl App {
             recent_sessions_rx: None,
             auth_store: claurst_core::AuthStore::load(),
             queued_messages: std::collections::VecDeque::new(),
+            command_queue: None,
+            pending_steers: Vec::new(),
             pending_auto_submit: false,
             connect_dialog: DialogSelectState::new("Connect a provider", provider_picker_items()),
             import_config_picker: DialogSelectState::new("Import config", import_config_picker_items()),

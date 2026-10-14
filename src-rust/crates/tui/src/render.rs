@@ -595,23 +595,32 @@ pub fn render_app(frame: &mut Frame, app: &App) {
         .status_line_override
         .as_deref()
         .map_or(0, |text| u16::try_from(text.lines().count().max(1)).unwrap_or(u16::MAX));
+    let dock_lines = queued_dock_lines(app);
+    let dock_height = u16::try_from(dock_lines.len()).unwrap_or(u16::MAX);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),
             Constraint::Length(separator_height),
             Constraint::Length(status_height),
+            Constraint::Length(dock_height),
             Constraint::Length(prompt_height),
             Constraint::Length(suggestions_height),
             Constraint::Length(status_line_height),
             Constraint::Length(1),
         ])
         .split(size);
+    // Take the dock slot out so the indices below keep naming the same rows.
+    let dock_area = chunks[3];
+    let chunks = [chunks[0], chunks[1], chunks[2], chunks[4], chunks[5], chunks[6], chunks[7]];
 
     render_messages(frame, app, chunks[0]);
     // chunks[1] is the blank separator — intentionally left empty
     if status_height > 0 {
         render_status_row(frame, app, chunks[2]);
+    }
+    if dock_height > 0 {
+        frame.render_widget(Paragraph::new(dock_lines), dock_area);
     }
     // The `/effort` selector replaces the prompt box while open: render it into
     // the input area (full width) and SKIP the prompt input. The prompt returns
@@ -2178,6 +2187,51 @@ fn render_todo_block(
         ]));
     }
     true
+}
+
+// -----------------------------------------------------------------------
+// Queued-prompt dock (#444)
+// -----------------------------------------------------------------------
+
+/// Rows of the dock above the prompt: undelivered steers and Tab-queued
+/// prompts (first line of each), then the key hint. Empty when nothing waits.
+fn queued_dock_lines(app: &App) -> Vec<Line<'static>> {
+    const MAX_ITEMS: usize = 4;
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut lines = Vec::new();
+    let mut total = 0usize;
+    for (kind, text) in app.pending_prompts() {
+        total += 1;
+        if total > MAX_ITEMS {
+            continue;
+        }
+        let (label, color) = match kind {
+            crate::app::PendingKind::Steer => ("steer ", Color::Cyan),
+            crate::app::PendingKind::Queued => ("queued", Color::Yellow),
+        };
+        let mut shown = text.lines().next().unwrap_or_default().to_string();
+        if text.lines().nth(1).is_some() {
+            shown.push_str(" \u{2026}");
+        }
+        lines.push(Line::from(vec![
+            Span::styled(format!("  \u{21b3} {label} "), Style::default().fg(color)),
+            Span::raw(shown),
+        ]));
+    }
+    if total == 0 {
+        return lines;
+    }
+    if total > MAX_ITEMS {
+        lines.push(Line::from(Span::styled(
+            format!("    +{} more", total - MAX_ITEMS),
+            dim,
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        "    enter steers \u{00b7} tab queues \u{00b7} alt+up edits \u{00b7} alt+x removes",
+        dim,
+    )));
+    lines
 }
 
 // -----------------------------------------------------------------------
@@ -4172,6 +4226,25 @@ mod status_line_tests {
             "footer: {:?}",
             rows(&terminal)[0]
         );
+    }
+
+    #[test]
+    fn queued_dock_lists_steers_and_queued_prompts_above_the_input() {
+        let mut app = App::new(Config::default(), CostTracker::new());
+        app.command_queue = Some(claurst_query::CommandQueue::new());
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| render_app(f, &app)).unwrap();
+        assert!(!rows(&terminal).iter().any(|r| r.contains("alt+x removes")));
+
+        app.steer("check the error path".to_string());
+        app.queued_messages.push_back("then write the docs\nsecond line".to_string());
+        terminal.draw(|f| render_app(f, &app)).unwrap();
+        let rows = rows(&terminal);
+        let steer = rows.iter().position(|r| r.contains("steer  check the error path"));
+        let queued = rows.iter().position(|r| r.contains("queued then write the docs \u{2026}"));
+        let hint = rows.iter().position(|r| r.contains("alt+x removes"));
+        assert!(steer.is_some() && queued.is_some() && hint.is_some(), "{rows:#?}");
+        assert!(steer < queued && queued < hint, "{rows:#?}");
     }
 
     #[test]

@@ -1222,6 +1222,10 @@ impl App {
         if let Some(keystroke) = key_event_to_keystroke(&key) {
             let had_pending_chord = self.keybindings.has_pending_chord();
             match self.keybindings.process(keystroke, &key_context) {
+                // Contextual actions that do not apply right now fall through,
+                // so their key keeps its ordinary meaning (Alt+Up scrolls when
+                // nothing is queued).
+                KeybindingResult::Action(action) if !self.keybinding_action_applies(&action) => {}
                 KeybindingResult::Action(action) => {
                     return self.handle_keybinding_action(&action);
                 }
@@ -2083,6 +2087,15 @@ impl App {
         self.exit_key_sequence_start = Some(key_char);
     }
 
+    /// Whether a contextual keybinding action has anything to act on.
+    /// Actions that do not apply leave the key to the hardcoded handlers.
+    fn keybinding_action_applies(&self, action: &str) -> bool {
+        match action {
+            "editQueued" | "removeQueued" => self.pending_prompts().next().is_some(),
+            _ => true,
+        }
+    }
+
     pub(super) fn handle_keybinding_action(&mut self, action: &str) -> bool {
         match action {
             "interrupt" => {
@@ -2399,6 +2412,23 @@ impl App {
                 if !self.is_streaming {
                     self.prompt_input.insert_newline();
                     self.refresh_prompt_input();
+                }
+                false
+            }
+            "editQueued" => {
+                self.edit_last_pending();
+                false
+            }
+            "removeQueued" => {
+                self.remove_last_pending();
+                false
+            }
+            "indent" if self.is_streaming && self.prompt_input.suggestions.is_empty() => {
+                // Tab during a turn: queue the prompt as a new turn for after
+                // this one ends (#444). Enter would steer it into this turn.
+                let input = self.take_input();
+                if !input.is_empty() {
+                    self.queued_messages.push_back(input);
                 }
                 false
             }

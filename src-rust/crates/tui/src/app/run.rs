@@ -390,6 +390,7 @@ impl App {
                     self.rate_limit_7day_pct = secondary_used_percent;
                 }
             }
+            QueryEvent::InputInjected(texts) => self.show_injected_input(texts),
         }
 
         // Update token count from tracker.
