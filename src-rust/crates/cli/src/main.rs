@@ -2039,11 +2039,6 @@ async fn run_interactive(
     // setup dialog instead of failing silently on the first message.
     app.has_credentials = has_credentials;
 
-    // Restore "always allow" bash prefixes persisted from earlier sessions so
-    // previously-approved command prefixes don't prompt again.
-    app.bash_prefix_allowlist
-        .extend(settings.allowed_bash_prefixes.iter().cloned());
-
     // If a non-Anthropic provider is active, prefix model_name with "provider/model"
     // so the status bar can show the provider name.
     if let Some(ref provider) = live_config.provider {
@@ -3209,10 +3204,19 @@ async fn run_interactive(
                             app.permission_request = None;
 
                             if let Some(prefix) = bash_prefix {
-                                app.bash_prefix_allowlist.insert(prefix.clone());
+                                if let Some(manager) = tool_ctx.permission_manager.as_ref() {
+                                    if let Ok(mut manager) = manager.lock() {
+                                        manager.add_rule(claurst_core::permissions::PermissionRule {
+                                            tool_name: Some("Bash".to_string()),
+                                            path_pattern: Some(format!("{} *", prefix)),
+                                            action: claurst_core::permissions::PermissionAction::Allow,
+                                            scope: claurst_core::permissions::PermissionScope::Session,
+                                        });
+                                    }
+                                }
                                 // "Always allow" must survive restarts: persist
-                                // the prefix to settings.json so it is reloaded
-                                // into the allowlist on the next launch.
+                                // the prefix to settings.json; the permission
+                                // manager loads it as the rule `<prefix> *`.
                                 if let Ok(mut settings) = claurst_core::config::Settings::load_sync() {
                                     if !settings.allowed_bash_prefixes.contains(&prefix) {
                                         settings.allowed_bash_prefixes.push(prefix);
@@ -3229,17 +3233,23 @@ async fn run_interactive(
 
                                 if let Some(manager) = tool_ctx.permission_manager.as_ref() {
                                     if let Ok(mut manager) = manager.lock() {
+                                        let tool_name = pending.request.tool_name.as_str();
+                                        let is_shell = claurst_core::permissions::is_shell_tool(tool_name);
                                         match selected_key {
-                                            Some('Y') => {
-                                                if let Some(path) = selected_path.as_deref() {
-                                                    manager.add_session_allow_path(&pending.request.tool_name, path);
-                                                } else {
-                                                    manager.add_session_allow(&pending.request.tool_name);
+                                            Some('Y') => match selected_path.as_deref() {
+                                                Some(command) if is_shell => {
+                                                    manager.add_session_allow_command(tool_name, command);
                                                 }
-                                            }
+                                                Some(path) => manager.add_session_allow_path(tool_name, path),
+                                                None => manager.add_session_allow(tool_name),
+                                            },
                                             Some('p') => {
                                                 let mut settings = claurst_core::config::Settings::load_sync().unwrap_or_default();
-                                                if let Some(path) = selected_path.as_deref() {
+                                                if let (true, Some(command)) = (is_shell, selected_path.as_deref()) {
+                                                    for rule in claurst_core::shell_scan::approval_rules(command) {
+                                                        let _ = manager.add_persistent_allow_path(tool_name, &rule, &mut settings);
+                                                    }
+                                                } else if let Some(path) = selected_path.as_deref() {
                                                     let pattern = format!("{}*", path);
                                                     let _ = manager.add_persistent_allow_path(&pending.request.tool_name, &pattern, &mut settings);
                                                 } else {
@@ -3338,31 +3348,21 @@ async fn run_interactive(
                     break;
                 };
 
-                let prefix_allowed = pending.request.tool_name == "Bash"
-                    && pending
-                        .request
-                        .path
-                        .as_deref()
-                        .map(|command| app.bash_command_allowed_by_prefix(command))
-                        .unwrap_or(false);
-
-                let reevaluated = if prefix_allowed {
-                    Some(claurst_core::permissions::PermissionDecision::Allow)
-                } else {
-                    tool_ctx
-                        .permission_manager
-                        .as_ref()
-                        .and_then(|manager| manager.lock().ok())
-                        .map(|manager| {
-                            manager.evaluate(
-                                &pending.request.tool_name,
-                                &pending.request.description,
-                                pending.request.path.as_deref(),
-                                pending.request.working_dir.as_deref(),
-                                &pending.request.allowed_roots,
-                            )
-                        })
-                };
+                // Re-evaluate: an approval saved while this request waited
+                // in the queue may cover it now.
+                let reevaluated = tool_ctx
+                    .permission_manager
+                    .as_ref()
+                    .and_then(|manager| manager.lock().ok())
+                    .map(|manager| {
+                        manager.evaluate(
+                            &pending.request.tool_name,
+                            &pending.request.description,
+                            pending.request.path.as_deref(),
+                            pending.request.working_dir.as_deref(),
+                            &pending.request.allowed_roots,
+                        )
+                    });
 
                 match reevaluated {
                     Some(claurst_core::permissions::PermissionDecision::Ask { .. }) | None => {

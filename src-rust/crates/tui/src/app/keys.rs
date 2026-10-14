@@ -2476,99 +2476,17 @@ impl App {
     }
 
     /// Handle a key event while a permission dialog is active.
+    ///
+    /// The decision itself (and any rule it saves) is applied by the event
+    /// loop that owns the pending request; this only drives the dialog and
+    /// closes it once an option is confirmed.
     pub(super) fn handle_permission_key(&mut self, key: KeyEvent) {
-        let pr = match self.permission_request.as_mut() {
-            Some(p) => p,
-            None => return,
-        };
-
-        match key.code {
-            KeyCode::Char(c) => {
-                if let Some(digit) = c.to_digit(10) {
-                    let idx = (digit as usize).saturating_sub(1);
-                    if idx < pr.options.len() {
-                        pr.selected_option = idx;
-                    }
-                } else {
-                    // Check if any option matches this key.
-                    let mut matched_idx = None;
-                    for (i, opt) in pr.options.iter().enumerate() {
-                        if opt.key == c {
-                            matched_idx = Some(i);
-                            break;
-                        }
-                    }
-                    if let Some(idx) = matched_idx {
-                        pr.selected_option = idx;
-                        // If this is the prefix-allow option ('P'), record the prefix.
-                        self.maybe_record_bash_prefix();
-                        self.permission_request = None;
-                    }
-                }
-            }
-            KeyCode::Enter => {
-                // If the currently selected option is the prefix-allow option, record it.
-                self.maybe_record_bash_prefix();
-                self.permission_request = None;
-            }
-            KeyCode::Up => {
-                let pr = self.permission_request.as_mut().unwrap();
-                if pr.selected_option > 0 {
-                    pr.selected_option -= 1;
-                }
-            }
-            KeyCode::Down => {
-                let pr = self.permission_request.as_mut().unwrap();
-                if pr.selected_option + 1 < pr.options.len() {
-                    pr.selected_option += 1;
-                }
-            }
-            KeyCode::Esc => {
-                self.permission_request = None;
-            }
-            _ => {}
-        }
-    }
-
-    /// If the active permission dialog's selected option is the prefix-allow
-    /// option ('P') for a Bash dialog, extract the suggested prefix and add it
-    /// to `bash_prefix_allowlist` so future requests with the same prefix are
-    /// silently approved.
-    pub(super) fn maybe_record_bash_prefix(&mut self) {
-        use crate::dialogs::PermissionDialogKind;
-        let pr = match self.permission_request.as_ref() {
-            Some(p) => p,
-            None => return,
-        };
-        // Only act on Bash dialogs where the selected option key is 'P'.
-        let selected_key = pr.options.get(pr.selected_option).map(|o| o.key);
-        if selected_key != Some('P') {
+        let Some(pr) = self.permission_request.as_mut() else {
             return;
+        };
+        if crate::dialogs::handle_permission_key(pr, key) {
+            self.permission_request = None;
         }
-        if let PermissionDialogKind::Bash { command, .. } = &pr.kind {
-            // Always normalize to the first whitespace-delimited word so
-            // that the allowlist check in `bash_command_allowed_by_prefix`
-            // (which also uses `split_whitespace().next()`) matches correctly.
-            let first_word = command.split_whitespace().next().unwrap_or("").to_string();
-            if !first_word.is_empty() {
-                self.bash_prefix_allowlist.insert(first_word.clone());
-                // Persist so the "always allow" choice survives restarts.
-                if let Ok(mut settings) = claurst_core::config::Settings::load_sync() {
-                    if !settings.allowed_bash_prefixes.contains(&first_word) {
-                        settings.allowed_bash_prefixes.push(first_word);
-                        let _ = settings.save_sync();
-                    }
-                }
-            }
-        }
-    }
-
-    /// Returns `true` if the given bash `command` is covered by the session-local
-    /// prefix allowlist (i.e. its first word matches an entry in
-    /// `bash_prefix_allowlist`).  Used by callers to skip the permission dialog.
-    pub fn bash_command_allowed_by_prefix(&self, command: &str) -> bool {
-        let first_word = command.split_whitespace().next().unwrap_or("");
-        !first_word.is_empty() && self.bash_prefix_allowlist.contains(first_word)
     }
 
     pub(super) fn prompt_can_accept_selection_paste(&self) -> bool {
