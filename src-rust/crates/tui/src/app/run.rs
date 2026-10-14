@@ -358,6 +358,14 @@ impl App {
                 self.context_used_tokens = record.tokens_after;
                 self.token_warning_threshold_shown = 0;
             }
+            QueryEvent::RateLimits { primary_used_percent, secondary_used_percent } => {
+                if primary_used_percent.is_some() {
+                    self.rate_limit_5h_pct = primary_used_percent;
+                }
+                if secondary_used_percent.is_some() {
+                    self.rate_limit_7day_pct = secondary_used_percent;
+                }
+            }
         }
 
         // Update token count from tracker.
