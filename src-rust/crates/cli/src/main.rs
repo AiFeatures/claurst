@@ -4381,7 +4381,9 @@ async fn run_interactive(
             let tracker = cost_tracker.clone();
             let tx = event_tx.clone();
             let client_clone = client.clone();
+            let skill_listings = skill_listings.clone();
             let handle = tokio::spawn(async move {
+                qcfg.available_skills = session_skill_listings(skill_listings).await;
                 let mut msgs = msgs_arc_clone.lock().await.clone();
                 let outcome = claurst_query::run_query_loop(
                     client_clone.as_ref(),
