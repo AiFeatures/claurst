@@ -7,7 +7,9 @@
 //   Screen 4 ViewHook      — full detail for a single hook
 //
 // The menu is intentionally read-only; as in the TS original, users edit
-// ~/.claurst/settings.json directly or ask Claurst to change hooks.
+// ~/.claurst/settings.json directly or ask Claurst to change hooks. It lists
+// the hooks the engine actually runs (#447): the effective settings hooks,
+// then the hooks registered by plugins.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Rect};
@@ -27,31 +29,22 @@ use crate::overlays::{
 /// A single configured hook.
 #[derive(Debug, Clone)]
 pub struct HookEntry {
-    /// e.g. "PreToolUse", "PostToolUse", "PreSession", "PostSession", "Stop"
+    /// Event name, e.g. "PreToolUse".
     pub event: String,
-    /// Glob / regex matcher pattern, e.g. "Bash", "*", "Write"
+    /// Matcher pattern; "*" when the hook has none.
     pub matcher: String,
-    /// Hook type: "command", "prompt", "agent", "http"
-    pub hook_type: String,
-    /// Primary hook target:
-    /// - command → the shell command string
-    /// - prompt  → the prompt text
-    /// - agent   → the agent name
-    /// - http    → the URL
-    pub target: String,
+    /// The shell command.
+    pub command: String,
+    /// Timeout in seconds (configured or the default).
+    pub timeout_secs: u64,
+    /// "settings", or "plugin <name>".
+    pub source: String,
 }
 
 impl HookEntry {
     /// Short one-line description of the hook shown in the list view.
     pub fn summary(&self) -> String {
-        let prefix = match self.hook_type.as_str() {
-            "command" => "\u{f120}",  // nerd-font terminal icon, falls back to plain
-            "prompt"  => "\u{f075}",
-            "agent"   => "\u{f013}",
-            "http"    => "\u{f0c1}",
-            _         => "\u{2022}",
-        };
-        format!("{} {}", prefix, self.target)
+        format!("\u{f120} {}", self.command)
     }
 }
 
@@ -107,15 +100,19 @@ impl HooksConfigMenuState {
         }
     }
 
-    /// Open the menu at the event list, loading hooks from settings.
-    pub fn open(&mut self) {
+    /// Open the menu at the event list, showing the effective settings
+    /// hooks `hooks` followed by the hooks registered by plugins.
+    pub fn open(&mut self, hooks: &claurst_core::config::HookMap) {
         self.mode = HooksMenuMode::SelectEvent;
         self.selected = 0;
         self.scroll_offset = 0;
         self.selected_event = None;
         self.selected_matcher = None;
         self.hooks.clear();
-        self.load_hooks();
+        self.load_hooks(hooks, "settings");
+        if let Some(plugin_hooks) = claurst_core::hooks::plugin_hooks() {
+            self.load_hooks(&plugin_hooks, "plugin");
+        }
         self.build_events();
         self.visible = true;
     }
@@ -232,10 +229,12 @@ impl HooksConfigMenuState {
                 seen.push(h.event.clone());
             }
         }
-        // Canonical order for well-known events
-        let order = ["PreToolUse", "PostToolUse", "PreSession", "PostSession", "Stop"];
+        // Canonical event order (as documented).
         seen.sort_by_key(|e| {
-            order.iter().position(|o| *o == e.as_str()).unwrap_or(usize::MAX)
+            claurst_core::config::HookEvent::ALL
+                .iter()
+                .position(|o| o.as_str() == e.as_str())
+                .unwrap_or(usize::MAX)
         });
         self.events = seen;
     }
@@ -268,64 +267,30 @@ impl HooksConfigMenuState {
         self.hooks.iter().filter(|h| h.event == event && h.matcher == matcher).count()
     }
 
-    fn load_hooks(&mut self) {
-        let settings_path = claurst_core::config::Settings::config_dir().join("settings.json");
-        let json_str = match std::fs::read_to_string(&settings_path) {
-            Ok(s)  => s,
-            Err(_) => return,
-        };
-        let root: serde_json::Value = match serde_json::from_str(&json_str) {
-            Ok(v)  => v,
-            Err(_) => return,
-        };
-
-        // Schema:
-        // {
-        //   "hooks": {
-        //     "PreToolUse": [
-        //       { "matcher": "Bash", "hooks": [{ "type": "command", "command": "echo hi" }] }
-        //     ]
-        //   }
-        // }
-        let hooks_map = match root.get("hooks").and_then(|h| h.as_object()) {
-            Some(m) => m,
-            None    => return,
-        };
-
-        for (event_name, event_val) in hooks_map {
-            let entries = match event_val.as_array() {
-                Some(a) => a,
-                None    => continue,
-            };
-            for entry in entries {
-                let matcher = entry
-                    .get("matcher")
-                    .and_then(|v| v.as_str())
+    fn load_hooks(&mut self, hooks: &claurst_core::config::HookMap, origin: &str) {
+        use claurst_core::config::HookEvent;
+        for event in HookEvent::ALL {
+            for group in hooks.get(&event).into_iter().flatten() {
+                let matcher = group
+                    .matcher
+                    .as_deref()
+                    .filter(|m| !m.trim().is_empty())
                     .unwrap_or("*")
                     .to_string();
-
-                if let Some(hook_list) = entry.get("hooks").and_then(|h| h.as_array()) {
-                    for hook in hook_list {
-                        let hook_type = hook
-                            .get("type").and_then(|v| v.as_str())
-                            .unwrap_or("command")
-                            .to_string();
-                        let target = match hook_type.as_str() {
-                            "command" => hook.get("command").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                            "prompt"  => hook.get("prompt").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                            "agent"   => hook.get("agent").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                            "http"    => hook.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                            _         => hook.get("command").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                        };
-                        if !target.is_empty() {
-                            self.hooks.push(HookEntry {
-                                event: event_name.clone(),
-                                matcher: matcher.clone(),
-                                hook_type,
-                                target,
-                            });
-                        }
-                    }
+                for hook in &group.hooks {
+                    let source = match &hook.plugin {
+                        Some(plugin) => format!("plugin {}", plugin.name),
+                        None => origin.to_string(),
+                    };
+                    self.hooks.push(HookEntry {
+                        event: event.as_str().to_string(),
+                        matcher: matcher.clone(),
+                        command: hook.command.clone(),
+                        timeout_secs: hook
+                            .timeout
+                            .unwrap_or(claurst_core::hooks::DEFAULT_HOOK_TIMEOUT_SECS),
+                        source,
+                    });
                 }
             }
         }
@@ -468,8 +433,7 @@ fn render_hook_list(state: &HooksConfigMenuState) -> (&'static str, Vec<Line<'st
     let hooks = state.hooks_for_selection();
     for (i, hook) in hooks.iter().enumerate() {
         let selected = i == state.selected;
-        let badge = hook.hook_type.to_uppercase();
-        push_list_row(&mut lines, &hook.summary(), &badge, selected);
+        push_list_row(&mut lines, &hook.summary(), &hook.source, selected);
     }
 
     (" Hooks — Select Hook ", lines)
@@ -491,14 +455,15 @@ fn render_hook_detail(state: &HooksConfigMenuState) -> (&'static str, Vec<Line<'
     lines.push(Line::from(""));
     push_detail_row(&mut lines, "Event",   &hook.event);
     push_detail_row(&mut lines, "Matcher", &hook.matcher);
-    push_detail_row(&mut lines, "Type",    &hook.hook_type);
+    push_detail_row(&mut lines, "Timeout", &format!("{}s", hook.timeout_secs));
+    push_detail_row(&mut lines, "Source",  &hook.source);
     lines.push(Line::from(""));
     lines.push(Line::from(vec![Span::styled(
-        "  Target:",
+        "  Command:",
         Style::default().fg(Color::DarkGray),
     )]));
-    // Wrap long target strings across multiple lines
-    for chunk in hook.target.chars().collect::<Vec<_>>().chunks(60) {
+    // Wrap long commands across multiple lines
+    for chunk in hook.command.chars().collect::<Vec<_>>().chunks(60) {
         let text: String = chunk.iter().collect();
         lines.push(Line::from(vec![Span::styled(
             format!("    {text}"),
@@ -547,14 +512,44 @@ mod tests {
     use ratatui::layout::Rect;
 
     #[test]
+    fn hooks_menu_lists_effective_config_hooks() {
+        use claurst_core::config::{HookCommand, HookEvent, HookMap, HookMatcher, HookType};
+        let command = |command: &str, timeout| HookCommand {
+            kind: HookType::Command,
+            command: command.to_string(),
+            timeout,
+            plugin: None,
+        };
+        let mut hooks = HookMap::new();
+        hooks.insert(
+            HookEvent::Stop,
+            vec![HookMatcher { matcher: None, hooks: vec![command("notify-done", None)] }],
+        );
+        hooks.insert(
+            HookEvent::PreToolUse,
+            vec![HookMatcher { matcher: Some("Edit|Write".into()), hooks: vec![command("fmt", Some(5))] }],
+        );
+        let mut state = HooksConfigMenuState::new();
+        state.open(&hooks);
+
+        assert_eq!(state.events, vec!["PreToolUse".to_string(), "Stop".to_string()]);
+        let pre = &state.hooks[0];
+        assert_eq!((pre.matcher.as_str(), pre.command.as_str(), pre.timeout_secs), ("Edit|Write", "fmt", 5));
+        assert_eq!(pre.source, "settings");
+        let stop = &state.hooks[1];
+        assert_eq!((stop.matcher.as_str(), stop.timeout_secs), ("*", 60));
+    }
+
+    #[test]
     fn hooks_menu_renders_opaque_event_list() {
         let mut state = HooksConfigMenuState::new();
         state.visible = true;
         state.hooks = vec![HookEntry {
             event: "PreToolUse".to_string(),
             matcher: "Bash".to_string(),
-            hook_type: "command".to_string(),
-            target: "echo hi".to_string(),
+            command: "echo hi".to_string(),
+            timeout_secs: 60,
+            source: "settings".to_string(),
         }];
         state.build_events();
 

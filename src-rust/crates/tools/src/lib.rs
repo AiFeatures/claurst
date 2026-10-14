@@ -616,9 +616,16 @@ impl ToolContext {
         let decision = self.permission_handler.request_permission(&request);
         match decision {
             PermissionDecision::Allow | PermissionDecision::AllowPermanently => Ok(PermissionGrant::Policy),
+            // Nobody can answer the ask in a non-interactive run: reject it
+            // with an explanation the model can act on, so the run continues.
             PermissionDecision::Ask { reason } if self.non_interactive => Err(
                 claurst_core::error::ClaudeError::PermissionDenied(format!(
-                    "Permission denied for tool '{}': {}",
+                    "Permission denied for tool '{}': {}. This run is non-interactive, so \
+                     the request needed approval that nobody can give and it was rejected. \
+                     Do not retry the same call. Continue with actions that need no \
+                     approval, or finish and report what could not be done and why. To \
+                     allow it, the operator can add a permission rule or rerun with a less \
+                     restrictive --permission-mode.",
                     request.tool_name,
                     interactive_reason.unwrap_or(reason)
                 )),
@@ -630,6 +637,14 @@ impl ToolContext {
                         request.tool_name
                     )));
                 };
+
+                // Notification hooks (#447): the user's attention is needed.
+                claurst_core::hooks::notify(
+                    &self.config.hooks,
+                    &self.session_id,
+                    &self.working_dir,
+                    &format!("Claurst needs your permission to use {}", request.tool_name),
+                );
 
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 queue.lock().queue.push_back(PendingPermissionRequest {
@@ -651,11 +666,29 @@ impl ToolContext {
                     )),
                 }
             }
-            _ => Err(claurst_core::error::ClaudeError::PermissionDenied(format!(
-                "Permission denied for tool '{}'",
-                request.tool_name
-            ))),
+            _ => Err(claurst_core::error::ClaudeError::PermissionDenied(match interactive_reason {
+                Some(details) => format!("Permission denied for tool '{}': {}", request.tool_name, details),
+                None => format!("Permission denied for tool '{}'", request.tool_name),
+            })),
         }
+    }
+
+    /// Error for a `*_with_details` check. A non-interactive rejection already
+    /// carries the details and the explanation for the model; otherwise the
+    /// details replace the generic denial.
+    fn denial_with_details(
+        &self,
+        error: claurst_core::error::ClaudeError,
+        tool_name: &str,
+        details: &str,
+    ) -> claurst_core::error::ClaudeError {
+        if self.non_interactive {
+            return error;
+        }
+        claurst_core::error::ClaudeError::PermissionDenied(format!(
+            "Permission denied for tool '{}': {}",
+            tool_name, details
+        ))
     }
 
     /// Check permissions for a tool invocation.
@@ -747,12 +780,9 @@ impl ToolContext {
             is_read_only,
             None,
         );
-        self.request_permission_inner(request).map(|_| ()).map_err(|_| {
-            claurst_core::error::ClaudeError::PermissionDenied(format!(
-                "Permission denied for tool '{}': {}",
-                tool_name, details
-            ))
-        })
+        self.request_permission_inner(request)
+            .map(|_| ())
+            .map_err(|e| self.denial_with_details(e, tool_name, details))
     }
 
     pub fn path_is_within_workspace(&self, path: &std::path::Path) -> bool {
@@ -819,12 +849,9 @@ impl ToolContext {
             is_read_only,
             Some(path),
         );
-        self.request_permission_inner(request).map(|_| ()).map_err(|_| {
-            claurst_core::error::ClaudeError::PermissionDenied(format!(
-                "Permission denied for tool '{}': {}",
-                tool_name, details
-            ))
-        })
+        self.request_permission_inner(request)
+            .map(|_| ())
+            .map_err(|e| self.denial_with_details(e, tool_name, details))
     }
 
     pub fn current_turn_index(&self) -> usize {
@@ -948,7 +975,7 @@ pub fn all_tools() -> Vec<Box<dyn Tool>> {
         Box::new(ReplTool),
         Box::new(TeamCreateTool),
         Box::new(TeamDeleteTool),
-        Box::new(SyntheticOutputTool),
+        // SyntheticOutputTool (StructuredOutput) is added only with --json-schema.
         Box::new(McpAuthTool),
         Box::new(RemoteTriggerTool),
         Box::new(MonitorTool),
@@ -1207,6 +1234,30 @@ mod tests {
 
         let error = ctx.request_permission_inner(request).unwrap_err().to_string();
         assert!(error.contains("generic reason"));
+    }
+
+    #[test]
+    fn test_non_interactive_ask_is_rejected_with_an_explanation() {
+        let ctx = test_tool_context(Arc::new(AskPermissionHandler {
+            reason: "writes outside the workspace".to_string(),
+        }));
+        let error = ctx.check_permission("Write", "write /etc/hosts", false).unwrap_err().to_string();
+        assert!(error.contains("Permission denied for tool 'Write': writes outside the workspace"));
+        assert!(error.contains("non-interactive"), "the model must learn why: {error}");
+        assert!(error.contains("Do not retry"), "the model must learn what to do: {error}");
+    }
+
+    #[test]
+    fn test_non_interactive_details_keep_the_explanation() {
+        let ctx = test_tool_context(Arc::new(AskPermissionHandler {
+            reason: "generic reason".to_string(),
+        }));
+        let error = ctx
+            .check_permission_with_details("PowerShell", "run", "[High risk] policy change", false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("[High risk] policy change"));
+        assert!(error.contains("non-interactive"), "{error}");
     }
 
     // ---- PermissionLevel tests ---------------------------------------------

@@ -871,20 +871,11 @@ Requires a display server (X11, Wayland, or Windows Desktop). Not available in h
 
 **Permission level:** None
 
-Return structured JSON output as the agent's final response. This tool is surfaced only in non-interactive (SDK/headless) sessions and in hook handlers. The model must call it exactly once at the end of its response to deliver structured data to the caller.
+Return the final answer of a headless run as JSON. The tool exists only when `--json-schema <file|inline JSON>` is passed with `--print`; it is not part of the default tool set.
 
-The input schema is open — it accepts any JSON object. The specific expected schema is communicated via the system prompt for each session type.
+The schema given to `--json-schema` (it must have `"type": "object"`) is the tool's input schema. A call whose top-level properties do not match it (missing `required` keys, wrong property `type`) returns an error so the model can correct it. The input of the last accepted call is reported as `structured_output` in the run's `result` event. See [Headless mode](advanced.md#structured-output).
 
-**Example usage in a hook handler:**
-
-```json
-{
-  "ok": true,
-  "reason": "All tests passed."
-}
-```
-
-**Example in an SDK session returning structured analysis:**
+**Example** with `--json-schema '{"type":"object","properties":{"summary":{"type":"string"},"issues":{"type":"array"}},"required":["summary"]}'`:
 
 ```json
 {
@@ -894,8 +885,6 @@ The input schema is open — it accepts any JSON object. The specific expected s
   ]
 }
 ```
-
-Calling this tool in an interactive session has no effect; the confirmation string is returned but the structured output is not surfaced to the TUI.
 
 ---
 

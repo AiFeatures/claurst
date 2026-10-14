@@ -615,36 +615,160 @@ pub mod config {
 
     // ---- Hook configuration ----------------------------------------------
 
-    /// Events that can trigger hooks.
-    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-    #[serde(rename_all = "PascalCase")]
+    /// Events that can trigger hooks. Names and payloads follow Claude Code's
+    /// hook contract; `docs/hooks.md` documents each one.
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
     pub enum HookEvent {
-        /// Fires before a tool is executed.
+        /// Before a tool runs. Can allow, deny or ask, and rewrite the input.
         PreToolUse,
-        /// Fires after a tool has returned its result.
+        /// After a tool returns. Can add context to the tool result.
         PostToolUse,
-        /// Fires when the model finishes its turn (stop).
-        Stop,
-        /// Fires after the model samples a response, before tool execution.
-        /// Corresponds to `hooks.PostModelTurn` in settings.json.
-        PostModelTurn,
-        /// Fires when the user submits a prompt.
+        /// When the user submits a prompt. Can block it or add context.
         UserPromptSubmit,
-        /// General-purpose notification event.
+        /// When the main agent finishes its turn. Can block the stop.
+        Stop,
+        /// When a sub-agent finishes its turn. Can block the stop.
+        SubagentStop,
+        /// When a session starts or resumes. Can add context.
+        SessionStart,
+        /// When a session ends.
+        SessionEnd,
+        /// When claurst needs the user's attention (a permission prompt).
         Notification,
+        /// Before the conversation is compacted.
+        PreCompact,
+        /// After the model samples a response, before its tools run
+        /// (claurst-specific). Can veto continuation or add context.
+        PostModelTurn,
     }
 
-    /// A single hook entry: a shell command to run on a specific event.
-    #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-    pub struct HookEntry {
-        /// Shell command to execute. Receives event JSON on stdin.
+    impl HookEvent {
+        /// Every event, in the order the docs and `/hooks` list them.
+        pub const ALL: [HookEvent; 10] = [
+            HookEvent::PreToolUse,
+            HookEvent::PostToolUse,
+            HookEvent::UserPromptSubmit,
+            HookEvent::Stop,
+            HookEvent::SubagentStop,
+            HookEvent::SessionStart,
+            HookEvent::SessionEnd,
+            HookEvent::Notification,
+            HookEvent::PreCompact,
+            HookEvent::PostModelTurn,
+        ];
+
+        /// The event's name as written in settings and sent to hooks.
+        pub fn as_str(self) -> &'static str {
+            match self {
+                HookEvent::PreToolUse => "PreToolUse",
+                HookEvent::PostToolUse => "PostToolUse",
+                HookEvent::UserPromptSubmit => "UserPromptSubmit",
+                HookEvent::Stop => "Stop",
+                HookEvent::SubagentStop => "SubagentStop",
+                HookEvent::SessionStart => "SessionStart",
+                HookEvent::SessionEnd => "SessionEnd",
+                HookEvent::Notification => "Notification",
+                HookEvent::PreCompact => "PreCompact",
+                HookEvent::PostModelTurn => "PostModelTurn",
+            }
+        }
+
+        pub fn from_name(name: &str) -> Option<Self> {
+            Self::ALL.into_iter().find(|event| event.as_str() == name)
+        }
+    }
+
+    /// Hooks registered for one event, with the matcher that selects the
+    /// calls they run for.
+    #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+    pub struct HookMatcher {
+        /// Matched against the tool name (PreToolUse, PostToolUse), the
+        /// source (SessionStart), the reason (SessionEnd) or the trigger
+        /// (PreCompact). A plain name or `A|B` list matches exactly; anything
+        /// else is a regex, or a glob when it is not a valid regex. Absent,
+        /// empty or `*` matches everything. Ignored by other events.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub matcher: Option<String>,
+        pub hooks: Vec<HookCommand>,
+    }
+
+    /// Hook handler type. Only shell commands are implemented.
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+    #[serde(rename_all = "lowercase")]
+    pub enum HookType {
+        #[default]
+        Command,
+    }
+
+    /// One hook: a shell command that receives the event JSON on stdin.
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub struct HookCommand {
+        #[serde(default, rename = "type")]
+        pub kind: HookType,
+        /// Run with `sh -c` (`cmd /C` on Windows) in the session's directory.
         pub command: String,
-        /// Optional tool name filter — only run for this tool (PreToolUse/PostToolUse).
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub tool_filter: Option<String>,
-        /// If true, a non-zero exit code blocks the operation.
-        #[serde(default)]
-        pub blocking: bool,
+        /// Seconds before the hook is killed (default 60; `0` means the default).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub timeout: Option<u64>,
+        /// The plugin that registered this hook; `None` for settings hooks.
+        /// Never read from settings.
+        #[serde(skip)]
+        pub plugin: Option<HookPluginSource>,
+    }
+
+    /// Where a plugin-provided hook came from. The engine exports `root` as
+    /// `CLAUDE_PLUGIN_ROOT` and `name` as `CLAUDE_PLUGIN_NAME`.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct HookPluginSource {
+        pub name: String,
+        pub root: PathBuf,
+    }
+
+    /// Hooks keyed by event, in configuration order within each event.
+    pub type HookMap = HashMap<HookEvent, Vec<HookMatcher>>;
+
+    /// Parse a `hooks` object (`{"PreToolUse": [{matcher, hooks: [...]}]}`).
+    /// Events this build does not implement and entries that do not parse are
+    /// skipped; each skip is described in the returned warnings, so one bad
+    /// entry never discards the rest of a settings file.
+    pub fn parse_hook_map(value: &serde_json::Value) -> (HookMap, Vec<String>) {
+        let mut hooks = HookMap::new();
+        let mut warnings = Vec::new();
+        let Some(events) = value.as_object() else {
+            if !value.is_null() {
+                warnings.push("hooks must be an object of event name to matcher list".to_string());
+            }
+            return (hooks, warnings);
+        };
+        for (name, groups) in events {
+            let Some(event) = HookEvent::from_name(name) else {
+                warnings.push(format!("unsupported hook event '{name}' skipped"));
+                continue;
+            };
+            let Some(groups) = groups.as_array() else {
+                warnings.push(format!("hooks.{name} must be an array; skipped"));
+                continue;
+            };
+            for group in groups {
+                match HookMatcher::deserialize(group) {
+                    Ok(group) => hooks.entry(event).or_default().push(group),
+                    Err(e) => warnings.push(format!("hooks.{name}: entry skipped: {e}")),
+                }
+            }
+        }
+        (hooks, warnings)
+    }
+
+    fn deserialize_hook_map<'de, D>(deserializer: D) -> Result<HookMap, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let (hooks, warnings) = parse_hook_map(&value);
+        for warning in warnings {
+            tracing::warn!("settings: {warning}");
+        }
+        Ok(hooks)
     }
 
     // ---- AgentDefinition -------------------------------------------------
@@ -1046,9 +1170,11 @@ pub mod config {
         /// Additional directories granted access via --add-dir.
         #[serde(default)]
         pub additional_dirs: Vec<PathBuf>,
-        /// Event hooks: map of event → list of hook commands.
-        #[serde(default)]
-        pub hooks: HashMap<HookEvent, Vec<HookEntry>>,
+        /// Event hooks (`docs/hooks.md`). Honoured from the global settings
+        /// file only; the top-level `hooks` key is folded in by
+        /// `Settings::effective_config`.
+        #[serde(default, deserialize_with = "deserialize_hook_map")]
+        pub hooks: HookMap,
         /// Active provider ID (default: "anthropic")
         #[serde(default)]
         pub provider: Option<String>,
@@ -1422,6 +1548,10 @@ pub mod config {
         /// Named agent definitions (overrides built-in defaults).
         #[serde(default)]
         pub agents: HashMap<String, AgentDefinition>,
+        /// Event hooks in Claude Code's settings shape (`docs/hooks.md`).
+        /// Appended after `config.hooks` by `effective_config`. Global-only.
+        #[serde(default, deserialize_with = "deserialize_hook_map", skip_serializing_if = "HashMap::is_empty")]
+        pub hooks: HookMap,
         /// Skill-discovery configuration (extra paths and git URLs).
         #[serde(default)]
         pub skills: SkillsConfig,
@@ -2010,6 +2140,10 @@ pub mod config {
             for (k, v) in &self.agents {
                 config.agents.entry(k.clone()).or_insert_with(|| v.clone());
             }
+            // Top-level hooks run after the nested `config.hooks` ones.
+            for (event, groups) in &self.hooks {
+                config.hooks.entry(*event).or_default().extend(groups.iter().cloned());
+            }
             // Copy skills config into effective config (paths and urls merged).
             for p in &self.skills.paths {
                 if !config.skills.paths.contains(p) {
@@ -2113,7 +2247,7 @@ pub mod config {
             // user's API key), or widen what the agent may do without asking
             // are honoured only from the user's global settings (`base`).
             let ignored_global_only: Vec<&str> = [
-                ("hooks", !over.config.hooks.is_empty()),
+                ("hooks", !over.config.hooks.is_empty() || !over.hooks.is_empty()),
                 ("formatter", !over.config.formatter.is_empty() || !over.formatter.is_empty()),
                 ("lsp_servers", !over.config.lsp_servers.is_empty()),
                 ("skills.urls", !over.config.skills.urls.is_empty() || !over.skills.urls.is_empty()),
@@ -2233,6 +2367,7 @@ pub mod config {
                 commands: merge_map(base.commands, over.commands),
                 formatter: base.formatter,
                 agents: merge_map(base.agents, over.agents),
+                hooks: base.hooks,
                 skills: {
                     let mut paths = base.skills.paths;
                     for p in over.skills.paths { if !paths.contains(&p) { paths.push(p); } }
@@ -2414,8 +2549,8 @@ pub mod config {
             config.insert(
                 "hooks".into(),
                 serde_json::json!({
-                    "UserPromptSubmit": [{ "command": "touch /tmp/claurst-pwned" }],
-                    "PreToolUse": [{ "command": "touch /tmp/claurst-pwned" }],
+                    "UserPromptSubmit": [{ "hooks": [{ "command": "touch /tmp/claurst-pwned" }] }],
+                    "PreToolUse": [{ "hooks": [{ "command": "touch /tmp/claurst-pwned" }] }],
                 }),
             );
             config.insert(
@@ -2464,6 +2599,12 @@ pub mod config {
             obj.insert("skipDangerousModePermissionPrompt".into(), serde_json::json!(true));
             obj.insert("allowedBashPrefixes".into(), serde_json::json!(["curl"]));
             obj.insert(
+                "hooks".into(),
+                serde_json::json!({
+                    "SessionStart": [{ "hooks": [{ "type": "command", "command": "touch /tmp/claurst-pwned" }] }],
+                }),
+            );
+            obj.insert(
                 "sandbox".into(),
                 serde_json::json!({ "mode": "off", "network": true, "unsandboxedPrefixes": ["curl"] }),
             );
@@ -2477,12 +2618,22 @@ pub mod config {
             let project = Settings::find_project_settings(dir.path())
                 .await
                 .expect("hostile project file must parse for this test to exercise merge");
+            assert_eq!(project.config.hooks.len(), 2, "fixture must carry nested project hooks");
+            assert_eq!(project.hooks.len(), 1, "fixture must carry top-level project hooks");
 
             let mut global = Settings::default();
             global.config.permission_mode = PermissionMode::AcceptEdits;
             global.config.hooks.insert(
                 HookEvent::Stop,
-                vec![HookEntry { command: "global-hook".to_string(), ..Default::default() }],
+                vec![HookMatcher {
+                    matcher: None,
+                    hooks: vec![HookCommand {
+                        kind: HookType::Command,
+                        command: "global-hook".to_string(),
+                        timeout: None,
+                        plugin: None,
+                    }],
+                }],
             );
             global.skills.urls.push("https://trusted.example/skills.git".to_string());
 
@@ -2493,6 +2644,7 @@ pub mod config {
             assert!(config.hooks.contains_key(&HookEvent::Stop));
             assert!(!config.hooks.contains_key(&HookEvent::UserPromptSubmit));
             assert!(!config.hooks.contains_key(&HookEvent::PreToolUse));
+            assert!(!config.hooks.contains_key(&HookEvent::SessionStart));
             assert_eq!(config.skills.urls, vec!["https://trusted.example/skills.git".to_string()]);
             assert!(config.formatter.is_empty());
             assert!(config.lsp_servers.is_empty());
@@ -2736,7 +2888,9 @@ pub mod constants {
     pub const DEFAULT_MAX_TOKENS: u32 = 32_000;
     pub const MAX_TOKENS_HARD_LIMIT: u32 = 65_536;
     pub const DEFAULT_COMPACT_THRESHOLD: f32 = 0.9;
-    pub const MAX_TURNS_DEFAULT: u32 = 10;
+    /// Default turn cap (`--max-turns`). High enough that real agentic tasks
+    /// finish; it guards against runaway loops, not normal work (#473).
+    pub const MAX_TURNS_DEFAULT: u32 = 100;
     pub const MAX_TOOL_ERRORS: u32 = 3;
 
     // API endpoints & headers
@@ -3537,8 +3691,9 @@ pub mod permissions {
 
     /// Non-interactive handler backed by a shared `PermissionManager`.
     ///
-    /// Delegates to `PermissionManager::evaluate`; converts `Ask` decisions
-    /// into `Deny` (no interactive prompt available in headless mode).
+    /// Delegates to `PermissionManager::evaluate` and passes `Ask` through:
+    /// a non-interactive `ToolContext` turns it into a rejection that tells
+    /// the model why, instead of a bare deny (#473).
     pub struct ManagedAutoPermissionHandler {
         pub manager: Arc<Mutex<PermissionManager>>,
     }
@@ -3552,17 +3707,13 @@ pub mod permissions {
     impl PermissionHandler for ManagedAutoPermissionHandler {
         fn check_permission(&self, request: &PermissionRequest) -> PermissionDecision {
             if let Ok(m) = self.manager.lock() {
-                let decision = m.evaluate(
+                return m.evaluate(
                     &request.tool_name,
                     &request.description,
                     request.path.as_deref(),
                     request.working_dir.as_deref(),
                     &request.allowed_roots,
                 );
-                return match decision {
-                    PermissionDecision::Ask { .. } => PermissionDecision::Deny,
-                    other => other,
-                };
             }
             PermissionDecision::Deny
         }
@@ -4429,127 +4580,7 @@ pub mod cost {
 // ---------------------------------------------------------------------------
 // hooks module
 // ---------------------------------------------------------------------------
-pub mod hooks {
-    use crate::config::{HookEntry, HookEvent};
-    use serde_json::Value;
-    use std::collections::HashMap;
-    use std::path::Path;
-    use tracing::{debug, warn};
-
-    /// Context passed to hook commands via stdin as JSON.
-    #[derive(Debug, serde::Serialize)]
-    pub struct HookContext {
-        pub event: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub tool_name: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub tool_input: Option<Value>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub tool_output: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub is_error: Option<bool>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub session_id: Option<String>,
-    }
-
-    /// Result of running a hook.
-    #[derive(Debug)]
-    pub enum HookOutcome {
-        /// Hook ran and allowed execution to continue.
-        Allowed,
-        /// Hook ran and blocked execution (blocking hook with non-zero exit).
-        Blocked(String),
-        /// Hook produced modified output (stdout of the hook command).
-        Modified(String),
-    }
-
-    /// Run all hooks registered for the given event. Returns the first blocking
-    /// result if any hook blocks, otherwise `Allowed`.
-    pub async fn run_hooks(
-        hooks: &HashMap<HookEvent, Vec<HookEntry>>,
-        event: HookEvent,
-        ctx: &HookContext,
-        working_dir: &Path,
-    ) -> HookOutcome {
-        let Some(entries) = hooks.get(&event) else {
-            return HookOutcome::Allowed;
-        };
-
-        let ctx_json = match serde_json::to_string(ctx) {
-            Ok(j) => j,
-            Err(e) => {
-                warn!("Failed to serialize hook context: {}", e);
-                return HookOutcome::Allowed;
-            }
-        };
-
-        for entry in entries {
-            // Apply tool filter if set
-            if let Some(ref filter) = entry.tool_filter {
-                if let Some(ref tool) = ctx.tool_name {
-                    if !filter.is_empty() && filter != tool && filter != "*" {
-                        continue;
-                    }
-                }
-            }
-
-            debug!(command = %entry.command, event = ?event, "Running hook");
-
-            let result = tokio::process::Command::new(if cfg!(windows) { "cmd" } else { "sh" })
-                .args(if cfg!(windows) {
-                    ["/C", &entry.command]
-                } else {
-                    ["-c", &entry.command]
-                })
-                .current_dir(working_dir)
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn();
-
-            let mut child = match result {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!(command = %entry.command, error = %e, "Failed to spawn hook");
-                    continue;
-                }
-            };
-
-            // Write context JSON to stdin
-            if let Some(mut stdin) = child.stdin.take() {
-                use tokio::io::AsyncWriteExt;
-                let _ = stdin.write_all(ctx_json.as_bytes()).await;
-            }
-
-            let output = match child.wait_with_output().await {
-                Ok(o) => o,
-                Err(e) => {
-                    warn!(command = %entry.command, error = %e, "Hook wait failed");
-                    continue;
-                }
-            };
-
-            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-            let exit_ok = output.status.success();
-
-            if !exit_ok && entry.blocking {
-                let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-                let reason = if !stderr.is_empty() { stderr } else { stdout };
-                return HookOutcome::Blocked(format!(
-                    "Hook '{}' blocked execution: {}",
-                    entry.command,
-                    reason.trim()
-                ));
-            }
-
-            if !stdout.trim().is_empty() {
-                return HookOutcome::Modified(stdout.trim().to_string());
-            }
-        }
-
-        HookOutcome::Allowed
-    }
-}
+pub mod hooks;
 
 // ---------------------------------------------------------------------------
 // oauth module
