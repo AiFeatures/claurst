@@ -18,8 +18,8 @@
 #![allow(clippy::too_many_arguments)]
 
 use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, KeyboardEnhancementFlags,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 // EnableBracketedPaste is enabled on macOS and Linux only. On Windows, it causes
 // Windows Terminal to wrap Ctrl+V content in VT escape sequences that crossterm's
@@ -85,6 +85,8 @@ pub mod image_paste;
 pub mod kitty_image;
 /// Application state and main event loop.
 pub mod app;
+/// Attention alerts: bell and desktop notification while unfocused.
+pub mod attention;
 /// Input helpers: slash command parsing.
 pub mod input;
 /// All ratatui rendering logic.
@@ -226,6 +228,8 @@ pub use file_injection_dialog::{FileInjectionDialogState, FileInjectionOutcome, 
 /// Restore terminal capabilities (alternate screen, mouse capture, bracketed paste, keyboard enhancement).
 /// Used by both restore_terminal and the panic hook.
 fn restore_terminal_cleanup() -> io::Result<()> {
+    // Best-effort: terminals without focus reporting ignore both sequences.
+    let _ = execute!(io::stdout(), DisableFocusChange);
     #[cfg(not(target_os = "windows"))]
     if MOUSE_CAPTURE_ACTIVE.load(Ordering::Relaxed) {
         execute!(io::stdout(), DisableMouseCapture)?;
@@ -340,6 +344,11 @@ pub fn setup_terminal(mouse_capture: bool) -> io::Result<Terminal<CrosstermBacke
     // re-shift it — issue #183). Failure to query is treated as "no kitty".
     let kitty_active = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
     KEYBOARD_ENHANCEMENT_ACTIVE.store(kitty_active, Ordering::Relaxed);
+
+    // Focus reporting drives attention alerts (#444): notify only while the
+    // terminal is in the background. Without support no focus events arrive
+    // and the app keeps assuming it is focused, so it never alerts.
+    let _ = execute!(io::stdout(), EnableFocusChange);
 
     set_terminal_title("\u{1f980} Claurst");
     let backend = CrosstermBackend::new(stdout);

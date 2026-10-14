@@ -2336,8 +2336,14 @@ async fn run_interactive(
         // Report OSC 7501 program status (idle / working / blocked / done /
         // error) so terminals and multiplexer UIs can show which session needs
         // attention. Written only on change; cleared in restore_terminal.
+        let program_status = app.program_status(current_query.is_some());
         if program_status_enabled {
-            claurst_tui::set_program_status(app.program_status(current_query.is_some()));
+            claurst_tui::set_program_status(program_status);
+        }
+        // Bell + desktop notification when a turn finishes or waits on the
+        // user while the terminal is in the background (#444).
+        if let Some(attention) = app.attention_alert(program_status) {
+            claurst_tui::attention::emit(attention);
         }
 
         app.query_in_flight = current_query.is_some();
@@ -3331,6 +3337,8 @@ async fn run_interactive(
                 Event::Resize(_, _) => {
                     // Terminal resize - will be handled on next draw
                 }
+                Event::FocusGained => app.terminal_focused = true,
+                Event::FocusLost => app.terminal_focused = false,
                 _ => {}
             }
         }

@@ -486,6 +486,11 @@ pub struct App {
     /// How the last finished turn ended, reported as OSC 7501 `done` / `error`
     /// until the user starts typing the next prompt. `None` = report `idle`.
     pub last_turn_outcome: Option<crate::program_status::TurnOutcome>,
+    /// Whether the terminal window has focus, from crossterm focus events.
+    /// Starts `true` so terminals without focus reporting never alert.
+    pub terminal_focused: bool,
+    /// Program status seen by the last [`App::attention_alert`] call.
+    pub attention_status: crate::program_status::ProgramStatus,
 
     // ---- Context window & rate limit info ----------------------------------
 
@@ -814,6 +819,8 @@ impl App {
             user_question_rx: None,
             ask_user_dialog: crate::ask_user_dialog::AskUserDialogState::new(),
             last_turn_outcome: None,
+            terminal_focused: true,
+            attention_status: crate::program_status::ProgramStatus::Idle,
             context_window_size: 0,
             context_used_tokens: 0,
             rate_limit_5h_pct: None,
