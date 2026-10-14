@@ -23,19 +23,17 @@ fn push_rules(out: &mut String, title: &str, rules: &[PermissionRule]) {
     }
 }
 
-/// Validate a `/permissions allow|deny` argument as a rule spec.
-fn checked_spec(sub: &str, arg: &str) -> Result<String, CommandResult> {
+/// Validate a `/permissions allow|deny` argument as a rule spec; the error
+/// is the message to show.
+fn checked_spec(sub: &str, arg: &str) -> Result<String, String> {
     if arg.is_empty() {
-        return Err(CommandResult::Error(format!(
-            "Usage: /permissions {} <Tool | Tool(pattern)>",
-            sub
-        )));
+        return Err(format!("Usage: /permissions {} <Tool | Tool(pattern)>", sub));
     }
     if parse_rule_spec(arg, PermissionAction::Allow).is_none() {
-        return Err(CommandResult::Error(format!(
+        return Err(format!(
             "Invalid rule '{}': expected Tool, Tool(pattern) or * (e.g. Bash(git status *), Edit(/repo/src/**))",
             arg
-        )));
+        ));
     }
     Ok(arg.to_string())
 }
@@ -135,7 +133,7 @@ impl SlashCommand for PermissionsCommand {
             "allow" => {
                 let tool = match checked_spec(sub, arg) {
                     Ok(spec) => spec,
-                    Err(e) => return e,
+                    Err(message) => return CommandResult::Error(message),
                 };
                 let mut new_config = ctx.config.clone();
                 if !new_config.allowed_tools.contains(&tool) {
@@ -155,7 +153,7 @@ impl SlashCommand for PermissionsCommand {
             "deny" => {
                 let tool = match checked_spec(sub, arg) {
                     Ok(spec) => spec,
-                    Err(e) => return e,
+                    Err(message) => return CommandResult::Error(message),
                 };
                 let mut new_config = ctx.config.clone();
                 if !new_config.disallowed_tools.contains(&tool) {
