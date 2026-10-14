@@ -1868,7 +1868,7 @@ pub mod config {
             }
         }
 
-        fn load_from_path_sync(path: &Path) -> anyhow::Result<Self> {
+        pub(crate) fn load_from_path_sync(path: &Path) -> anyhow::Result<Self> {
             if path.exists() {
                 let content = std::fs::read_to_string(path)?;
                 Self::parse_file(&content, path)
@@ -1896,7 +1896,7 @@ pub mod config {
             Ok(())
         }
 
-        fn save_to_path_sync(&self, path: &Path) -> anyhow::Result<()> {
+        pub(crate) fn save_to_path_sync(&self, path: &Path) -> anyhow::Result<()> {
             if path.exists() {
                 let content = std::fs::read_to_string(path)?;
                 Self::parse_file(&content, path).map_err(|error| {
@@ -2943,8 +2943,76 @@ pub mod permissions {
     pub enum PermissionScope {
         /// Only lasts for the current process session.
         Session,
-        /// Saved to settings.json and survives restarts.
+        /// Saved to the global settings.json and survives restarts.
         Persistent,
+        /// Saved for the current project only (see [`project_approvals_path`]).
+        Project,
+    }
+
+    /// Where an "always allow" approval from the permission dialog is saved.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ApprovalScope {
+        /// The current project only, in a file under the claurst home (never
+        /// inside the repository, so a repository cannot grant itself
+        /// approvals).
+        Project,
+        /// Every project: `permissionRules` in the global settings file.
+        Global,
+    }
+
+    /// File holding one project's saved approvals.
+    #[derive(Debug, Default, Serialize, Deserialize)]
+    struct ProjectApprovals {
+        #[serde(default)]
+        rules: Vec<SerializedPermissionRule>,
+    }
+
+    /// The saved-approvals file for `project_root`:
+    /// `<home>/projects/<encoded canonical root>/permissions.json`, next to
+    /// the project's session transcripts.
+    pub fn project_approvals_path(
+        home: &std::path::Path,
+        project_root: &std::path::Path,
+    ) -> std::path::PathBuf {
+        let root = std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+        crate::session_storage::transcript_dir_in(home, &root).join("permissions.json")
+    }
+
+    /// Read a project's saved approvals. A missing file has none; an
+    /// unreadable or malformed one is an error and is never overwritten.
+    fn read_project_approvals(
+        path: &std::path::Path,
+    ) -> Result<Vec<SerializedPermissionRule>, String> {
+        match std::fs::read_to_string(path) {
+            Ok(content) => serde_json::from_str::<ProjectApprovals>(&content)
+                .map(|file| file.rules)
+                .map_err(|e| format!("malformed {}: {}", path.display(), e)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(format!("cannot read {}: {}", path.display(), e)),
+        }
+    }
+
+    /// Write a project's saved approvals (write-then-rename, so a concurrent
+    /// reader never sees a partial file).
+    fn write_project_approvals(
+        path: &std::path::Path,
+        rules: Vec<SerializedPermissionRule>,
+    ) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let content = serde_json::to_string_pretty(&ProjectApprovals { rules })
+            .map_err(std::io::Error::other)?;
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, content)?;
+        std::fs::rename(&tmp, path)
+    }
+
+    fn project_rule(rule: &SerializedPermissionRule) -> PermissionRule {
+        PermissionRule {
+            scope: PermissionScope::Project,
+            ..PermissionRule::from(rule)
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -3187,8 +3255,15 @@ pub mod permissions {
         pub mode: crate::config::PermissionMode,
         /// Rules added during this session only.
         pub session_rules: Vec<PermissionRule>,
-        /// Rules loaded from / saved to settings.json.
+        /// Rules loaded from / saved to the global settings.json.
         pub persistent_rules: Vec<PermissionRule>,
+        /// Approvals saved for the current project.
+        pub project_rules: Vec<PermissionRule>,
+        /// File backing `project_rules`; `None` when no project store is
+        /// attached or its file is malformed.
+        project_store: Option<std::path::PathBuf>,
+        /// Global settings file that "always allow everywhere" writes to.
+        global_settings_path: std::path::PathBuf,
         /// Pending interactive decisions keyed by tool_use_id.
         pending: Vec<PendingPermission>,
     }
@@ -3204,13 +3279,117 @@ pub mod permissions {
                 mode,
                 session_rules: Vec::new(),
                 persistent_rules: global_rules(settings),
+                project_rules: Vec::new(),
+                project_store: None,
+                global_settings_path: crate::config::Settings::global_settings_path(),
                 pending: Vec::new(),
             }
         }
 
-        /// Every rule, persistent first.
+        /// Load the current project's saved approvals from `path` (see
+        /// [`project_approvals_path`]) and save new project approvals there.
+        /// A malformed file is left untouched: its rules are not loaded and
+        /// project approvals cannot be saved until it is fixed.
+        pub fn with_project_store(mut self, path: std::path::PathBuf) -> Self {
+            match read_project_approvals(&path) {
+                Ok(rules) => {
+                    self.project_rules = rules.iter().map(project_rule).collect();
+                    self.project_store = Some(path);
+                }
+                Err(error) => tracing::warn!(%error, "Ignoring saved project permission approvals"),
+            }
+            self
+        }
+
+        /// Save "always allow everywhere" approvals to `path` instead of the
+        /// global settings file in the claurst home.
+        pub fn with_global_settings_path(mut self, path: std::path::PathBuf) -> Self {
+            self.global_settings_path = path;
+            self
+        }
+
+        /// Every rule: global, then project, then session.
         fn rules(&self) -> impl Iterator<Item = &PermissionRule> {
-            self.persistent_rules.iter().chain(self.session_rules.iter())
+            self.persistent_rules
+                .iter()
+                .chain(self.project_rules.iter())
+                .chain(self.session_rules.iter())
+        }
+
+        /// Allow rules for `tool_name` restricted to `pattern` (all uses when
+        /// `None`). A path glob whose directory prefix goes through a symlink
+        /// also gets a rule with the canonical prefix resolved now (#415);
+        /// shell patterns are used as given.
+        fn allow_rules(
+            tool_name: &str,
+            pattern: Option<&str>,
+            scope: PermissionScope,
+        ) -> Vec<PermissionRule> {
+            let patterns: Vec<Option<String>> = match pattern {
+                None => vec![None],
+                Some(p) if is_shell_tool(tool_name) => vec![Some(p.to_string())],
+                Some(p) => std::iter::once(p.to_string())
+                    .chain(canonical_prefix_pattern(p))
+                    .map(Some)
+                    .collect(),
+            };
+            patterns
+                .into_iter()
+                .map(|path_pattern| PermissionRule {
+                    tool_name: Some(tool_name.to_string()),
+                    path_pattern,
+                    action: PermissionAction::Allow,
+                    scope: scope.clone(),
+                })
+                .collect()
+        }
+
+        /// Save an "always allow" approval for `tool_name` (restricted to
+        /// `pattern`, or every use when `None`) in `scope` and apply it now.
+        /// The store is re-read before writing so approvals saved by another
+        /// session are kept.
+        pub fn save_allow(
+            &mut self,
+            scope: ApprovalScope,
+            tool_name: &str,
+            pattern: Option<&str>,
+        ) -> crate::error::Result<()> {
+            use crate::error::ClaudeError;
+            match scope {
+                ApprovalScope::Project => {
+                    let path = self.project_store.as_deref().ok_or_else(|| {
+                        ClaudeError::Config("No project approval store is available".to_string())
+                    })?;
+                    let mut saved = read_project_approvals(path).map_err(ClaudeError::Config)?;
+                    for rule in Self::allow_rules(tool_name, pattern, PermissionScope::Project) {
+                        let rule = SerializedPermissionRule::from(&rule);
+                        if !saved.contains(&rule) {
+                            saved.push(rule);
+                        }
+                    }
+                    let rules = saved.iter().map(project_rule).collect();
+                    write_project_approvals(path, saved)
+                        .map_err(|e| ClaudeError::Config(e.to_string()))?;
+                    self.project_rules = rules;
+                    Ok(())
+                }
+                ApprovalScope::Global => {
+                    let path = &self.global_settings_path;
+                    let mut settings = crate::config::Settings::load_from_path_sync(path)
+                        .map_err(|e| ClaudeError::Config(e.to_string()))?;
+                    for rule in Self::allow_rules(tool_name, pattern, PermissionScope::Persistent) {
+                        let rule = SerializedPermissionRule::from(&rule);
+                        if !settings.permission_rules.contains(&rule) {
+                            settings.permission_rules.push(rule);
+                        }
+                    }
+                    settings
+                        .save_to_path_sync(path)
+                        .map_err(|e| ClaudeError::Config(e.to_string()))?;
+                    self.persistent_rules = global_rules(&settings);
+                    Ok(())
+                }
+            }
         }
 
         /// Explicit-rule decision for a non-shell tool: any matching deny
@@ -3371,17 +3550,14 @@ pub mod permissions {
             match rule.scope {
                 PermissionScope::Session => self.session_rules.push(rule),
                 PermissionScope::Persistent => self.persistent_rules.push(rule),
+                PermissionScope::Project => self.project_rules.push(rule),
             }
         }
 
         /// Allow `tool_name` for the rest of this session.
         pub fn add_session_allow(&mut self, tool_name: &str) {
-            self.session_rules.push(PermissionRule {
-                tool_name: Some(tool_name.to_string()),
-                path_pattern: None,
-                action: PermissionAction::Allow,
-                scope: PermissionScope::Session,
-            });
+            self.session_rules
+                .extend(Self::allow_rules(tool_name, None, PermissionScope::Session));
         }
 
         /// Allow `tool_name` on `path` (glob) for the rest of this session.
@@ -3390,15 +3566,8 @@ pub mod permissions {
         /// rule with the canonical prefix (resolved now) is added so the rule
         /// also covers the real path tools re-check after opening (#415).
         pub fn add_session_allow_path(&mut self, tool_name: &str, path: &str) {
-            let canonical = canonical_prefix_pattern(path);
-            for pattern in std::iter::once(path.to_string()).chain(canonical) {
-                self.session_rules.push(PermissionRule {
-                    tool_name: Some(tool_name.to_string()),
-                    path_pattern: Some(pattern),
-                    action: PermissionAction::Allow,
-                    scope: PermissionScope::Session,
-                });
-            }
+            self.session_rules
+                .extend(Self::allow_rules(tool_name, Some(path), PermissionScope::Session));
         }
 
         /// Allow exactly the shell `command` for the rest of this session:
@@ -3419,58 +3588,6 @@ pub mod permissions {
                     scope: PermissionScope::Session,
                 });
             }
-        }
-
-        /// Allow `tool_name` persistently and save to settings.
-        pub fn add_persistent_allow(
-            &mut self,
-            tool_name: &str,
-            settings: &mut crate::config::Settings,
-        ) -> crate::error::Result<()> {
-            let rule = PermissionRule {
-                tool_name: Some(tool_name.to_string()),
-                path_pattern: None,
-                action: PermissionAction::Allow,
-                scope: PermissionScope::Persistent,
-            };
-            let serialized = SerializedPermissionRule::from(&rule);
-            settings.permission_rules.push(serialized);
-            settings
-                .save_sync()
-                .map_err(|e| crate::error::ClaudeError::Config(e.to_string()))?;
-            self.persistent_rules.push(rule);
-            Ok(())
-        }
-
-        /// Allow `tool_name` persistently on `path` and save settings.
-        ///
-        /// Like [`Self::add_session_allow_path`], a glob whose directory
-        /// prefix goes through a symlink is also stored with the canonical
-        /// prefix resolved now (#415).
-        pub fn add_persistent_allow_path(
-            &mut self,
-            tool_name: &str,
-            path: &str,
-            settings: &mut crate::config::Settings,
-        ) -> crate::error::Result<()> {
-            let canonical = canonical_prefix_pattern(path);
-            let rules: Vec<PermissionRule> = std::iter::once(path.to_string())
-                .chain(canonical)
-                .map(|pattern| PermissionRule {
-                    tool_name: Some(tool_name.to_string()),
-                    path_pattern: Some(pattern),
-                    action: PermissionAction::Allow,
-                    scope: PermissionScope::Persistent,
-                })
-                .collect();
-            settings
-                .permission_rules
-                .extend(rules.iter().map(SerializedPermissionRule::from));
-            settings
-                .save_sync()
-                .map_err(|e| crate::error::ClaudeError::Config(e.to_string()))?;
-            self.persistent_rules.extend(rules);
-            Ok(())
         }
 
         /// Remove a persistent rule by index and save settings.
@@ -4016,6 +4133,87 @@ pub mod permissions {
             assert_eq!(bash(&m, "git push && git commit -m \"fix bug\""), PermissionDecision::Allow);
             assert!(is_ask(bash(&m, "git push --force")));
             assert!(is_ask(bash(&m, "git commit -m other")));
+        }
+
+        fn open_project(
+            home: &std::path::Path,
+            root: &std::path::Path,
+            settings: &Settings,
+        ) -> PermissionManager {
+            PermissionManager::new(PermissionMode::Default, settings)
+                .with_project_store(project_approvals_path(home, root))
+                .with_global_settings_path(home.join("settings.json"))
+        }
+
+        /// #445: "always allow in this project" is stored under the claurst
+        /// home for that project only; "everywhere" goes to the global
+        /// settings file and applies to every project.
+        #[test]
+        fn project_and_global_approvals_persist_separately() {
+            let home = tempfile::tempdir().unwrap();
+            let project_a = tempfile::tempdir().unwrap();
+            let project_b = tempfile::tempdir().unwrap();
+            let defaults = Settings::default();
+
+            let mut a = open_project(home.path(), project_a.path(), &defaults);
+            a.save_allow(ApprovalScope::Project, "Bash", Some("cargo test *")).unwrap();
+            a.save_allow(ApprovalScope::Project, "Read", None).unwrap();
+            assert_eq!(bash(&a, "cargo test -p core"), PermissionDecision::Allow);
+
+            // Stored under the home, never inside the project.
+            let stored = project_approvals_path(home.path(), project_a.path());
+            assert!(stored.starts_with(home.path()));
+            assert!(stored.is_file());
+            assert_eq!(std::fs::read_dir(project_a.path()).unwrap().count(), 0);
+            assert!(!home.path().join("settings.json").exists());
+
+            // A later session in the same project sees it; another project does not.
+            let a_again = open_project(home.path(), project_a.path(), &defaults);
+            assert_eq!(bash(&a_again, "cargo test"), PermissionDecision::Allow);
+            assert_eq!(a_again.project_rules.len(), 2);
+            let b = open_project(home.path(), project_b.path(), &defaults);
+            assert!(is_ask(bash(&b, "cargo test")));
+
+            // Saving again keeps what another session saved meanwhile.
+            let mut a_other = open_project(home.path(), project_a.path(), &defaults);
+            a.save_allow(ApprovalScope::Project, "Bash", Some("git diff *")).unwrap();
+            a_other.save_allow(ApprovalScope::Project, "Bash", Some("ls *")).unwrap();
+            let merged = open_project(home.path(), project_a.path(), &defaults);
+            assert_eq!(bash(&merged, "git diff && ls && cargo test"), PermissionDecision::Allow);
+
+            // "Everywhere" is written to the global settings file.
+            a.save_allow(ApprovalScope::Global, "Bash", Some("git status *")).unwrap();
+            assert_eq!(bash(&a, "git status"), PermissionDecision::Allow);
+            let global =
+                Settings::load_from_path_sync(&home.path().join("settings.json")).unwrap();
+            assert_eq!(global.permission_rules.len(), 1);
+            let b = open_project(home.path(), project_b.path(), &global);
+            assert_eq!(bash(&b, "git status -s"), PermissionDecision::Allow);
+            assert!(is_ask(bash(&b, "cargo test")));
+        }
+
+        #[test]
+        fn configured_deny_beats_project_approval() {
+            let home = tempfile::tempdir().unwrap();
+            let project = tempfile::tempdir().unwrap();
+            let mut m = open_project(home.path(), project.path(), &Settings::default());
+            m.save_allow(ApprovalScope::Project, "Bash", Some("git *")).unwrap();
+            m.add_rule(bash_rule(Some("git push *"), PermissionAction::Deny));
+            assert_eq!(bash(&m, "git status"), PermissionDecision::Allow);
+            assert_eq!(bash(&m, "git push --force"), PermissionDecision::Deny);
+        }
+
+        #[test]
+        fn malformed_project_store_is_not_overwritten() {
+            let home = tempfile::tempdir().unwrap();
+            let project = tempfile::tempdir().unwrap();
+            let path = project_approvals_path(home.path(), project.path());
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "{ not json").unwrap();
+            let mut m = open_project(home.path(), project.path(), &Settings::default());
+            assert!(m.project_rules.is_empty());
+            assert!(m.save_allow(ApprovalScope::Project, "Bash", Some("ls *")).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ not json");
         }
 
         #[test]
