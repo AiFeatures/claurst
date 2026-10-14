@@ -3418,8 +3418,13 @@ pub mod permissions {
         let mut rest = Vec::new();
         let mut current = path;
         loop {
+            // Nothing above resolves (e.g. a lexical root on Windows): keep
+            // the lexical path, compared against roots resolved the same way.
+            let Some(parent) = current.parent() else {
+                return Some(path.to_path_buf());
+            };
             rest.push(current.file_name()?);
-            current = current.parent()?;
+            current = parent;
             if let Ok(mut resolved) = std::fs::canonicalize(current) {
                 resolved.extend(rest.iter().rev());
                 return Some(resolved);
@@ -3439,12 +3444,12 @@ pub mod permissions {
 
         let mut roots: Vec<std::path::PathBuf> = Vec::new();
         if let Some(root) = working_dir {
-            roots.push(std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf()));
+            roots.push(canonicalize_lenient(root).unwrap_or_else(|| root.to_path_buf()));
         }
         roots.extend(
             allowed_roots
                 .iter()
-                .map(|root| std::fs::canonicalize(root).unwrap_or_else(|_| root.clone())),
+                .map(|root| canonicalize_lenient(root).unwrap_or_else(|| root.clone())),
         );
 
         roots.iter().any(|root| canonical_path.starts_with(root))
