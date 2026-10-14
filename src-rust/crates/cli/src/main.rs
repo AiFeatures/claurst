@@ -82,8 +82,8 @@ struct Cli {
     #[arg(long = "resume", num_args(0..=1), default_missing_value("__last__"))]
     resume: Option<String>,
 
-    /// Maximum number of agentic turns
-    #[arg(long = "max-turns", default_value_t = 10)]
+    /// Maximum number of agentic turns; reaching it ends a headless run with exit code 2
+    #[arg(long = "max-turns", default_value_t = claurst_core::constants::MAX_TURNS_DEFAULT)]
     max_turns: u32,
 
     /// Custom system prompt

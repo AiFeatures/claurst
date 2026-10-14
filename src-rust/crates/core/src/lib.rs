@@ -2707,7 +2707,9 @@ pub mod constants {
     pub const DEFAULT_MAX_TOKENS: u32 = 32_000;
     pub const MAX_TOKENS_HARD_LIMIT: u32 = 65_536;
     pub const DEFAULT_COMPACT_THRESHOLD: f32 = 0.9;
-    pub const MAX_TURNS_DEFAULT: u32 = 10;
+    /// Default turn cap (`--max-turns`). High enough that real agentic tasks
+    /// finish; it guards against runaway loops, not normal work (#473).
+    pub const MAX_TURNS_DEFAULT: u32 = 100;
     pub const MAX_TOOL_ERRORS: u32 = 3;
 
     // API endpoints & headers
