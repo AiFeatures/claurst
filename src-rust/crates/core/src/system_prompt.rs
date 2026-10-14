@@ -180,19 +180,47 @@ impl SystemPromptPrefix {
         Self::Cli
     }
 
-    /// The opening attribution string for this prefix variant.
+    /// The opening attribution string for this prefix variant. It names no
+    /// model vendor: the same prompt is sent to every provider.
     pub fn attribution_text(self) -> &'static str {
         match self {
             Self::Cli | Self::Vertex | Self::Bedrock | Self::Remote => {
-                "You are Claurst, Anthropic's official CLI for Claude."
+                "You are Claurst, a coding agent that runs in the user's terminal. \
+                You help by reading files, running commands, editing code, and writing new files."
             }
             Self::SdkPreset => {
-                "You are Claurst, Anthropic's official CLI for Claude, \
-                running within the Claude Agent SDK."
+                "You are Claurst, a coding agent running within the Claude Agent SDK. \
+                You help by reading files, running commands, editing code, and writing new files."
             }
             Self::Sdk => {
                 "You are a Claude agent, built on Anthropic's Claude Agent SDK."
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Platform
+// ---------------------------------------------------------------------------
+
+/// The platform the session runs on. It selects the single platform block in
+/// the stable section, so the model gets one consistent shell-syntax rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptPlatform {
+    Linux,
+    MacOs,
+    Windows,
+}
+
+impl PromptPlatform {
+    /// The platform this binary was built for.
+    pub fn current() -> Self {
+        if cfg!(target_os = "windows") {
+            Self::Windows
+        } else if cfg!(target_os = "macos") {
+            Self::MacOs
+        } else {
+            Self::Linux
         }
     }
 }
@@ -217,9 +245,12 @@ pub struct SystemPromptOptions {
     pub custom_output_style_prompt: Option<String>,
     /// Absolute path to the working directory (injected as dynamic section).
     pub working_directory: Option<String>,
+    /// Extra workspace roots (`/add-dir`), listed in `<environment_context>`
+    /// after the working directory.
+    pub additional_dirs: Vec<String>,
     /// Pre-built memory content from memdir (injected as dynamic section).
     pub memory_content: String,
-    /// Session context gathered at startup (date, git status, IDE context).
+    /// Session context gathered at startup (git status, IDE context).
     /// Injected in the dynamic section so it never invalidates the cached
     /// stable prefix.
     pub session_context: Option<String>,
@@ -245,7 +276,12 @@ pub struct SystemPromptOptions {
     /// all per-tool guidance is emitted — preserving the previous behaviour
     /// for callers that don't yet thread the tool list through.
     pub enabled_tools: Option<Vec<String>>,
-    /// Sandbox state line from `claurst_core::sandbox::render_sandbox_state`
+    /// Platform for the platform block; `None` means [`PromptPlatform::current`].
+    pub platform: Option<PromptPlatform>,
+    /// Current permission mode. It can change mid-session (/yolo, Shift+Tab),
+    /// so its sentence goes in the dynamic section; `None` omits it.
+    pub permission_mode: Option<crate::config::PermissionMode>,
+    /// Sandbox state from `claurst_core::sandbox::render_sandbox_state`
     /// (#470), injected in the dynamic section; `None` when unsandboxed.
     pub sandbox_state: Option<String>,
 }
@@ -280,17 +316,26 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
     // ------------------------------------------------------------------ //
     // CACHEABLE sections (before the dynamic boundary)                   //
     // ------------------------------------------------------------------ //
+    let enabled_tools = opts.enabled_tools.as_deref();
     let mut parts: Vec<String> = vec![
         // 1. Attribution header
         prefix.attribution_text().to_string(),
-        // 2. Core capabilities
-        CORE_CAPABILITIES.to_string(),
+        // 2. Capabilities: one line per declared tool, then how to approach tasks
+        build_capabilities_section(enabled_tools),
+        TASK_APPROACH.to_string(),
         // 3. Tool use guidelines (per-tool blocks are conditional on the enabled set)
-        build_tool_use_guidelines(opts.enabled_tools.as_deref()),
+        build_tool_use_guidelines(enabled_tools),
+        // 3b. Platform: one shell-syntax rule for the session's platform
+        build_platform_section(
+            opts.platform.unwrap_or_else(PromptPlatform::current),
+            enabled_tools,
+        ),
         // 4. Executing actions with care
         ACTIONS_SECTION.to_string(),
-        // 5. Safety guidelines
-        SAFETY_GUIDELINES.to_string(),
+        // 5. Permissions and approvals (the mode itself is in the dynamic section)
+        PERMISSIONS_SECTION.to_string(),
+        // 5b. Working in the repository, validating, and the final message
+        WORKING_STYLE_SECTION.to_string(),
         // 6. Cyber-risk instruction (owned by safeguards — do not edit)
         CYBER_RISK_INSTRUCTION.to_string(),
     ];
@@ -308,6 +353,12 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
         ));
     }
 
+    // Sections start with a newline; drop their trailing newlines so the
+    // "\n" join leaves exactly one blank line between stable sections.
+    for part in &mut parts {
+        part.truncate(part.trim_end_matches('\n').len());
+    }
+
     // Dynamic boundary marker
     parts.push(SYSTEM_PROMPT_DYNAMIC_BOUNDARY.to_string());
 
@@ -317,9 +368,12 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
     // the block above stays byte-identical for the prompt cache.         //
     // ------------------------------------------------------------------ //
 
-    // 9. Environment info (platform, OS version, shell)
+    // 9. <environment_context>: cwd, shell, platform, date, timezone, git,
+    //    workspace roots and permission mode. Its bytes only change when one
+    //    of those values changes (a mode switch, /add-dir, the date rolling
+    //    over), so later turns reuse the cached message prefix.
     if !opts.skip_env_info {
-        parts.push(build_env_info_section(opts.working_directory.as_deref()));
+        parts.push(build_environment_context(opts));
     }
 
     // 9b. Shell sandbox state (#470)
@@ -327,12 +381,12 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
         parts.push(format!("\n{}", sandbox));
     }
 
-    // 10. Working directory (legacy XML tag)
-    if let Some(cwd) = &opts.working_directory {
-        parts.push(format!("\n<working_directory>{}</working_directory>", cwd));
+    // 10b. Current permission mode (changes with /yolo and Shift+Tab)
+    if let Some(mode) = &opts.permission_mode {
+        parts.push(format!("\n{}", permission_mode_sentence(mode)));
     }
 
-    // 11. Session context: date, git status, IDE context
+    // 11. Session context: git status, IDE context
     if let Some(context) = opts.session_context.as_deref().filter(|c| !c.trim().is_empty()) {
         parts.push(format!("\n{}", context));
     }
@@ -370,9 +424,9 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
     parts.join("\n")
 }
 
-/// Build the dynamic environment-info section injected after the boundary.
-/// Mirrors `computeEnvInfo()` + `getUnameSR()` from `src/constants/prompts.ts`.
-fn build_env_info_section(working_dir: Option<&str>) -> String {
+/// Build the `<environment_context>` block injected after the boundary.
+fn build_environment_context(opts: &SystemPromptOptions) -> String {
+    let working_dir = opts.working_directory.as_deref();
     // Platform string
     let platform = if cfg!(target_os = "windows") {
         "win32"
@@ -430,77 +484,154 @@ fn build_env_info_section(working_dir: Option<&str>) -> String {
         &shell_env
     };
 
-    // Shell line: on Windows add Unix syntax note
-    let shell_line = if cfg!(target_os = "windows") {
-        format!("Shell: {} (use Unix shell syntax, not Windows — e.g., /dev/null not NUL, forward slashes in paths)", shell_name)
-    } else {
-        format!("Shell: {}", shell_name)
-    };
-
     // Is git repo?
     let is_git = working_dir
         .map(|d| std::path::Path::new(d).join(".git").exists())
         .unwrap_or(false);
 
-    // Build the section
-    let cwd_line = working_dir
-        .map(|d| format!("\nWorking directory: {}", d))
-        .unwrap_or_default();
+    let now = chrono::Local::now();
+    let timezone = std::env::var("TZ")
+        .ok()
+        .filter(|tz| !tz.is_empty())
+        .unwrap_or_else(|| now.format("UTC%:z").to_string());
+    let workspace_roots = working_dir
+        .into_iter()
+        .chain(opts.additional_dirs.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join(", ");
 
-    // Platform-specific guidance so the model uses the right commands.
-    let os_note = if cfg!(target_os = "windows") {
-        format!(
-            "\nIMPORTANT: The user is on Windows ({}). Use Windows-compatible commands \
-             (e.g., `dir` not `ls`, `type` not `cat`, backslashes in native paths). \
-             When the shell is bash/git-bash, Unix syntax is acceptable.",
-            os_version
-        )
-    } else if cfg!(target_os = "macos") {
-        format!(
-            "\nThe user is on macOS ({}). Use macOS-compatible commands. \
-             BSD variants of tools apply (e.g., `sed -i ''` not `sed -i`).",
-            os_version
-        )
-    } else {
-        format!(
-            "\nThe user is on Linux ({}). Use Linux-compatible commands.",
-            os_version
-        )
+    let mut lines = vec!["\n<environment_context>".to_string()];
+    if let Some(cwd) = working_dir {
+        lines.push(format!("  <cwd>{cwd}</cwd>"));
+    }
+    lines.push(format!("  <shell>{shell_name}</shell>"));
+    lines.push(format!("  <platform>{platform} ({os_version})</platform>"));
+    lines.push(format!("  <current_date>{}</current_date>", now.format("%Y-%m-%d")));
+    lines.push(format!("  <timezone>{timezone}</timezone>"));
+    lines.push(format!("  <git_repo>{is_git}</git_repo>"));
+    if !workspace_roots.is_empty() {
+        lines.push(format!("  <workspace_roots>{workspace_roots}</workspace_roots>"));
+    }
+    if let Some(mode) = &opts.permission_mode {
+        lines.push(format!("  <permission_mode>{}</permission_mode>", permission_mode_name(mode)));
+    }
+    lines.push("</environment_context>".to_string());
+    lines.join("\n")
+}
+
+/// The settings name of a permission mode (`PermissionMode`'s serde name).
+fn permission_mode_name(mode: &crate::config::PermissionMode) -> &'static str {
+    use crate::config::PermissionMode;
+    match mode {
+        PermissionMode::Default => "default",
+        PermissionMode::AcceptEdits => "acceptEdits",
+        PermissionMode::Plan => "plan",
+        PermissionMode::BypassPermissions => "bypassPermissions",
+    }
+}
+
+/// Injected as a user message after the user interrupts a turn (Ctrl+C), so
+/// the next turn knows the previous one stopped on purpose and may have left
+/// work half done.
+pub const TURN_ABORTED_MESSAGE: &str = "<system-reminder>\n<turn_aborted>\n\
+The user interrupted the previous turn on purpose. Any background Bash commands may still be running. \
+If any tools or commands were aborted, they may have partially executed.\n\
+</turn_aborted>\n</system-reminder>";
+
+/// Build the platform block for the stable section. Exactly one shell-syntax
+/// rule is emitted. On Windows the Bash tool runs commands through `cmd.exe`
+/// (see `run_windows_fallback` in the tools crate), so Windows syntax applies.
+fn build_platform_section(platform: PromptPlatform, enabled: Option<&[String]>) -> String {
+    let rule = match platform {
+        PromptPlatform::Linux => {
+            "The user is on Linux. Shell commands run in a Unix shell: use POSIX shell \
+             syntax and the GNU variants of tools."
+        }
+        PromptPlatform::MacOs => {
+            "The user is on macOS. Shell commands run in a Unix shell: use POSIX shell \
+             syntax; the BSD variants of tools apply (e.g., `sed -i ''` not `sed -i`)."
+        }
+        PromptPlatform::Windows => {
+            "The user is on Windows. The Bash tool runs commands through cmd.exe, not a \
+             Unix shell: use Windows syntax (`dir` not `ls`, `type` not `cat`, `NUL` not \
+             `/dev/null`, backslashes in native paths)."
+        }
     };
-
-    format!(
-        "\n<env>{}\nIs directory a git repo: {}\nPlatform: {}\nOS Version: {}\n{}{}\n</env>",
-        cwd_line,
-        if is_git { "Yes" } else { "No" },
-        platform,
-        os_version,
-        shell_line,
-        os_note,
-    )
+    let powershell = platform == PromptPlatform::Windows
+        && enabled.is_none_or(|names| names.iter().any(|n| n == "PowerShell"));
+    let powershell_line = if powershell {
+        "\nUse the PowerShell tool for PowerShell syntax and cmdlets."
+    } else {
+        ""
+    };
+    format!("\n## Platform\n\n{rule}{powershell_line}\n")
 }
 
 // ---------------------------------------------------------------------------
 // Static system prompt sections
 // ---------------------------------------------------------------------------
 
-const CORE_CAPABILITIES: &str = r#"
-## Capabilities
+/// Tools that get a one-line entry in the capabilities list, in display order,
+/// with the summary shown for each. A declared tool not in this table is
+/// still usable; its own definition describes it.
+const CAPABILITY_SUMMARIES: &[(&str, &str)] = &[
+    ("Read", "Read file contents"),
+    ("Write", "Create or overwrite files"),
+    ("Edit", "Make precise edits with exact text replacement"),
+    ("BatchEdit", "Apply several exact text replacements in one atomic call"),
+    ("ApplyPatch", "Apply a unified diff to one or more files"),
+    ("Glob", "Find files by name pattern"),
+    ("Grep", "Search file contents with regular expressions"),
+    ("Bash", "Run shell commands"),
+    ("PowerShell", "Run PowerShell commands"),
+    ("LSP", "Query a configured language server (definitions, references, diagnostics)"),
+    ("WebSearch", "Search the web"),
+    ("WebFetch", "Fetch and read a URL"),
+    ("Agent", "Delegate a bounded task to a sub-agent"),
+    ("TodoWrite", "Track a multi-step plan"),
+    ("NotebookEdit", "Edit Jupyter notebook cells"),
+    ("Skill", "Run a skill"),
+    ("AskUserQuestion", "Ask the user to choose between options"),
+    ("ToolSearch", "Find a tool by describing the capability you need"),
+];
 
-You have access to powerful tools for software engineering tasks:
-- **Read/Write files**: Read any file, write new files, edit existing files with precise diffs
-- **Execute commands**: Run bash commands, PowerShell scripts, background processes
-- **Search**: Glob patterns, regex grep, web search, file content search
-- **Web**: Fetch URLs, search the internet
-- **Agents**: Spawn parallel sub-agents for complex multi-step work
-- **Memory**: Persistent notes across sessions via the memory system
-- **MCP servers**: Connect to external tools and APIs via Model Context Protocol
-- **Jupyter notebooks**: Read and edit notebook cells
+/// Build the "Capabilities" section: one line per declared tool that has a
+/// summary in [`CAPABILITY_SUMMARIES`]. With an unknown tool set (`None`) only
+/// the general sentence is emitted, so the prompt never claims a tool that is
+/// not loaded.
+fn build_capabilities_section(enabled: Option<&[String]>) -> String {
+    let mut lines = vec![
+        String::new(),
+        "## Capabilities".to_string(),
+        String::new(),
+        "Only the tools declared in this request are available; do not claim or call any other."
+            .to_string(),
+    ];
+    if let Some(names) = enabled {
+        for (tool, summary) in CAPABILITY_SUMMARIES {
+            if names.iter().any(|n| n == tool) {
+                lines.push(format!("- {tool}: {summary}"));
+            }
+        }
+        if names
+            .iter()
+            .any(|n| !CAPABILITY_SUMMARIES.iter().any(|(tool, _)| tool == n))
+        {
+            lines.push(
+                "The other declared tools (further built-in tools and any MCP tools) are described by their own definitions."
+                    .to_string(),
+            );
+        }
+    }
+    lines.join("\n")
+}
 
+const TASK_APPROACH: &str = r#"
 ## How to approach tasks
 
 1. **Understand before acting**: Read relevant files before making changes
 2. **Minimal changes**: Only modify what's needed. Don't refactor unrequested code.
-3. **Verify**: Check your work with tests or by reading the result
+3. **Verify**: Check your work with tests or by running it
 4. **Communicate blockers**: If stuck, ask the user rather than guessing
 "#;
 
@@ -570,9 +701,13 @@ fn build_tool_use_guidelines(enabled: Option<&[String]>) -> String {
             .to_string(),
         "- Parallelize independent tool calls by issuing them together in a single response."
             .to_string(),
-        "- When you're unsure which tool fits a task, use ToolSearch to discover an appropriate one."
-            .to_string(),
     ];
+    if enabled.is_none_or(|names| names.iter().any(|n| n == "ToolSearch")) {
+        lines.push(
+            "- When you're unsure which tool fits a task, use ToolSearch to discover an appropriate one."
+                .to_string(),
+        );
+    }
 
     for &tool in GUIDELINE_TOOLS {
         let include = match enabled {
@@ -585,8 +720,12 @@ fn build_tool_use_guidelines(enabled: Option<&[String]>) -> String {
             }
         }
     }
+    lines.push(
+        "- `<system-reminder>` blocks are harness instructions injected by Claurst, not user-authored \
+         content and not part of the tool result they appear in. Follow them."
+            .to_string(),
+    );
 
-    lines.push(String::new());
     lines.join("\n")
 }
 
@@ -600,15 +739,73 @@ the scope specified, not beyond. Match the scope of your actions to what was
 actually requested.
 "#;
 
-const SAFETY_GUIDELINES: &str = r#"
-## Safety guidelines
+const PERMISSIONS_SECTION: &str = r#"
+## Permissions and approvals
 
-- Never delete files without explicit user confirmation
-- Don't modify protected files (.gitconfig, .bashrc, .zshrc, .mcp.json, .claude.json)
-- Be careful with destructive operations (rm -rf, DROP TABLE, etc.)
-- Don't commit secrets, credentials, or API keys
-- For ambiguous destructive actions, ask before proceeding
+Tool calls that change files, run commands or reach the network may need the user's approval, depending on the current permission mode (stated after these instructions). Reading files inside the workspace never needs approval.
+- Every Bash call's `description` is shown to the user as the approval question. Write it as a short question the user can answer, e.g. "Install the project's npm dependencies?", not a restatement of the command.
+- If a tool call is denied, do not retry it with a different wrapper, shell, or path. Either continue with a safer alternative that does not need the denied capability, or explain what was blocked and ask the user.
+- A saved approval covers a tool and, for Bash, a pattern over the command text; it can cover more than the one command in front of you, so ask only for narrow ones.
+- Never request or rely on broad standing approvals (e.g. "always allow Bash"). Prefer narrow, categorical ones ("cargo test", "npm run dev"). Never ask for a standing approval for destructive commands.
+- Potentially destructive actions the user did not explicitly ask for (`rm`, `git reset`, `git checkout --`, dropping data) need a fresh, explicit confirmation from the user, even in a mode that does not prompt.
+- Bash commands rated critical risk (e.g. `rm -rf /`, `mkfs`, a download piped into a shell) are refused in every mode.
+- Commands run with the user's privileges; there is no OS-level sandbox.
+- Do not modify the user's shell or tool configuration (.gitconfig, .bashrc, .zshrc, .mcp.json, .claude.json) unless asked, and never commit secrets, credentials, or API keys.
 "#;
+
+const WORKING_STYLE_SECTION: &str = r#"
+## Working in the repository
+
+- You may be in a dirty git worktree. NEVER revert changes you did not make unless explicitly asked; if unrelated changes exist in files you are editing, work with them rather than undoing them. If you notice unexpected changes you did not make, stop and ask the user how to proceed.
+- Never use destructive git commands (`git reset --hard`, `git checkout --`, force pushes) unless specifically requested or approved. Prefer non-interactive git commands.
+- Do not commit or create branches unless asked. Do not amend commits unless asked.
+- Do not re-read a file after Edit, Write or another editing tool to check it; the tool fails loudly if it did not apply.
+- Fix problems at the root cause; keep changes minimal and in the codebase's style; do not fix unrelated bugs or add tests to codebases that have none (mention them instead).
+- Prefer editing existing files over creating new ones.
+- Treat unfamiliar files or changes as potential user work and investigate before deleting or overwriting them.
+- Keep changes consistent with the structure, naming, style, and patterns of the surrounding code.
+- By default, match the surrounding comment density: where the code has none, add none. Use comments only where behaviour is not obvious from the code. User or project instructions take precedence.
+
+## Validating your work
+
+- Start with the most specific test for the code you changed, then broaden. Iterate on formatting at most 3 times; if it still fails, say so.
+- In an interactive session that asks before running commands, hold off on long test or lint runs until the user is ready to finalize; suggest them instead. When the task is itself about tests (adding, fixing, reproducing), run them. In non-interactive runs or `bypassPermissions` mode, run them proactively.
+
+## Final message
+
+- Write plain text for a terminal: short paragraphs by default; bullets only when they aid scanning; flat lists; headers only when they genuinely help (short, Title Case, bold).
+- Lead with what changed and why; reference files as clickable paths (`src/app.ts:42`), one path per reference, no line ranges.
+- Do not paste large files you wrote; the user is on the same machine. Never tell the user to "save" or "copy" a file.
+- Brevity is the default: small change, 2-5 sentences; medium, at most 6 bullets; large, 1-2 bullets per file. Offer natural next steps (tests, commit) in one line; do not end with "If you want...".
+- If you could not do something (e.g. run tests), say so.
+"#;
+
+/// The dynamic-section sentence describing what the current permission mode
+/// means. Mirrors `PermissionManager::evaluate`.
+fn permission_mode_sentence(mode: &crate::config::PermissionMode) -> &'static str {
+    use crate::config::PermissionMode;
+    match mode {
+        PermissionMode::Default => {
+            "Current permission mode: `default`. Reading files inside the workspace is allowed; \
+             edits, writes, shell commands and network access ask the user first unless a \
+             saved approval covers them (in non-interactive runs, where no one can answer, \
+             they are denied)."
+        }
+        PermissionMode::AcceptEdits => {
+            "Current permission mode: `acceptEdits`. Edit calls are approved automatically; \
+             writes, shell commands and network access still ask the user first unless a \
+             saved approval covers them."
+        }
+        PermissionMode::Plan => {
+            "Current permission mode: `plan`. Read-only: investigate and propose a plan; \
+             tools that write, execute commands or reach the network are denied."
+        }
+        PermissionMode::BypassPermissions => {
+            "Current permission mode: `bypassPermissions`. Tool calls run without approval \
+             prompts, so exercise the caution the user has delegated to you."
+        }
+    }
+}
 
 /// Security / cyber-risk instruction.
 /// No security guardrails injected.
@@ -676,6 +873,14 @@ mod tests {
     fn test_default_prompt_contains_attribution() {
         let prompt = build_system_prompt(&default_opts());
         assert!(prompt.contains("Claurst"), "Default prompt must contain attribution");
+    }
+
+    #[test]
+    fn cli_identity_is_provider_neutral() {
+        let identity = SystemPromptPrefix::Cli.attribution_text();
+        assert!(identity.starts_with("You are Claurst, a coding agent"));
+        assert!(!identity.contains("Anthropic"));
+        assert!(!identity.contains("Claude"));
     }
 
     #[test]
@@ -857,6 +1062,208 @@ mod tests {
         assert!(prompt.contains("Parallelize independent tool calls"));
         assert!(!prompt.contains("Bash commands time out"));
         assert!(!prompt.contains("Read a file with the Read tool"));
+    }
+
+    fn stable_block(opts: &SystemPromptOptions) -> String {
+        let prompt = build_system_prompt(opts);
+        split_at_dynamic_boundary(&prompt).0.to_string()
+    }
+
+    #[test]
+    fn capabilities_list_only_declared_tools() {
+        let opts = SystemPromptOptions {
+            enabled_tools: Some(vec!["Read".to_string(), "Bash".to_string()]),
+            ..Default::default()
+        };
+        let stable = stable_block(&opts);
+        assert!(stable.contains("- Read: Read file contents"));
+        assert!(stable.contains("- Bash: Run shell commands"));
+        for absent in ["- WebSearch:", "- Agent:", "- NotebookEdit:", "Jupyter", "MCP servers", "Memory"] {
+            assert!(!stable.contains(absent), "{absent} must not be claimed");
+        }
+        assert!(!stable.contains("The other declared tools"));
+        assert!(!stable.contains("ToolSearch"));
+    }
+
+    #[test]
+    fn capabilities_mention_undescribed_tools_and_tool_search_when_declared() {
+        let opts = SystemPromptOptions {
+            enabled_tools: Some(vec!["ToolSearch".to_string(), "github_list_issues".to_string()]),
+            ..Default::default()
+        };
+        let stable = stable_block(&opts);
+        assert!(stable.contains("- ToolSearch: Find a tool"));
+        assert!(stable.contains("use ToolSearch to discover"));
+        assert!(stable.contains("The other declared tools (further built-in tools and any MCP tools)"));
+    }
+
+    #[test]
+    fn platform_block_has_one_shell_rule() {
+        let unix = stable_block(&SystemPromptOptions {
+            platform: Some(PromptPlatform::Linux),
+            enabled_tools: Some(vec!["Bash".to_string(), "PowerShell".to_string()]),
+            ..Default::default()
+        });
+        assert_eq!(unix.matches("## Platform").count(), 1);
+        assert!(unix.contains("use POSIX shell syntax"));
+        assert!(!unix.contains("cmd.exe"));
+        assert!(!unix.contains("PowerShell tool for"));
+
+        let windows = stable_block(&SystemPromptOptions {
+            platform: Some(PromptPlatform::Windows),
+            enabled_tools: Some(vec!["Bash".to_string(), "PowerShell".to_string()]),
+            ..Default::default()
+        });
+        assert_eq!(windows.matches("## Platform").count(), 1);
+        assert!(windows.contains("through cmd.exe"));
+        assert!(windows.contains("PowerShell tool for"));
+        assert!(!windows.contains("Unix shell syntax"));
+        assert!(!windows.contains("POSIX"));
+
+        let windows_no_ps = stable_block(&SystemPromptOptions {
+            platform: Some(PromptPlatform::Windows),
+            enabled_tools: Some(vec!["Bash".to_string()]),
+            ..Default::default()
+        });
+        assert!(!windows_no_ps.contains("PowerShell tool for"));
+    }
+
+    #[test]
+    fn permission_mode_sentence_is_dynamic_and_stable_block_is_unchanged() {
+        use crate::config::PermissionMode;
+        let build = |mode: PermissionMode| {
+            build_system_prompt(&SystemPromptOptions {
+                permission_mode: Some(mode),
+                enabled_tools: Some(vec!["Bash".to_string(), "Read".to_string()]),
+                platform: Some(PromptPlatform::Linux),
+                skip_env_info: true,
+                ..Default::default()
+            })
+        };
+        let default_prompt = build(PermissionMode::Default);
+        let yolo_prompt = build(PermissionMode::BypassPermissions);
+        let (default_stable, default_dynamic) = split_at_dynamic_boundary(&default_prompt);
+        let (yolo_stable, yolo_dynamic) = split_at_dynamic_boundary(&yolo_prompt);
+
+        assert_eq!(default_stable, yolo_stable, "the stable block must not depend on the mode");
+        assert!(default_stable.contains("## Permissions and approvals"));
+        assert!(!default_stable.contains("Current permission mode"));
+        assert!(default_dynamic.contains("Current permission mode: `default`"));
+        assert!(yolo_dynamic.contains("Current permission mode: `bypassPermissions`"));
+        assert_ne!(default_dynamic, yolo_dynamic);
+    }
+
+    #[test]
+    fn working_style_and_final_message_rules_are_stable() {
+        let stable = stable_block(&default_opts());
+        for heading in ["## Working in the repository", "## Validating your work", "## Final message"] {
+            assert_eq!(stable.matches(heading).count(), 1, "{heading}");
+        }
+        assert!(stable.contains("NEVER revert changes you did not make"));
+        assert!(stable.contains("Do not re-read a file after Edit"));
+        assert!(stable.contains("do not end with \"If you want...\""));
+        assert!(!stable.contains("by reading the result"));
+    }
+
+    #[test]
+    fn environment_context_is_dynamic_and_complete() {
+        use crate::config::PermissionMode;
+        let opts = SystemPromptOptions {
+            working_directory: Some("/work/repo".to_string()),
+            additional_dirs: vec!["/work/shared".to_string()],
+            permission_mode: Some(PermissionMode::AcceptEdits),
+            ..Default::default()
+        };
+        let prompt = build_system_prompt(&opts);
+        let (stable, dynamic) = split_at_dynamic_boundary(&prompt);
+        assert!(!stable.contains("<environment_context>"));
+        assert_eq!(dynamic.matches("<environment_context>").count(), 1);
+        for tag in ["<cwd>/work/repo</cwd>", "<shell>", "<platform>", "<current_date>", "<timezone>", "<git_repo>"] {
+            assert!(dynamic.contains(tag), "{tag}");
+        }
+        assert!(dynamic.contains("<workspace_roots>/work/repo, /work/shared</workspace_roots>"));
+        assert!(dynamic.contains("<permission_mode>acceptEdits</permission_mode>"));
+        assert!(!dynamic.contains("<working_directory>"));
+        assert!(!dynamic.contains("<env>"));
+    }
+
+    #[test]
+    fn harness_semantics_are_stable() {
+        let stable = stable_block(&default_opts());
+        assert!(stable.contains("`<system-reminder>` blocks are harness instructions"));
+        assert!(stable.contains("Treat unfamiliar files or changes as potential user work"));
+        assert!(stable.contains("match the surrounding comment density"));
+        assert!(stable.contains("patterns of the surrounding code"));
+        assert!(stable.contains("Prefer editing existing files over creating new ones"));
+        assert!(!stable.contains("\n\n\n"), "one blank line between sections");
+        assert!(TURN_ABORTED_MESSAGE.starts_with("<system-reminder>\n<turn_aborted>"));
+        assert!(TURN_ABORTED_MESSAGE.ends_with("</turn_aborted>\n</system-reminder>"));
+    }
+
+    /// Compare the stable block for `platform` and `tools` against the golden
+    /// file `tests/snapshots/<name>.txt`. Set `UPDATE_PROMPT_SNAPSHOTS=1` to
+    /// rewrite the file. The prefix is pinned so cloud-provider env vars on
+    /// the test host cannot change the identity line.
+    fn assert_stable_snapshot(name: &str, platform: PromptPlatform, tools: &[&str]) {
+        let stable = stable_block(&SystemPromptOptions {
+            prefix: Some(SystemPromptPrefix::Cli),
+            platform: Some(platform),
+            enabled_tools: Some(tools.iter().map(|t| t.to_string()).collect()),
+            ..Default::default()
+        });
+
+        assert_eq!(stable.matches("You are ").count(), 1, "identity line must appear once");
+        for (tool, _) in CAPABILITY_SUMMARIES {
+            let line = format!("- {tool}: ");
+            assert_eq!(
+                stable.contains(&line),
+                tools.contains(tool),
+                "capability line for {tool} must match the declared tool set"
+            );
+        }
+
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/snapshots")
+            .join(format!("{name}.txt"));
+        if std::env::var_os("UPDATE_PROMPT_SNAPSHOTS").is_some() {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, format!("{stable}\n")).unwrap();
+            return;
+        }
+        let expected = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+            .replace("\r\n", "\n");
+        assert_eq!(
+            format!("{stable}\n"),
+            expected,
+            "stable block changed; rerun with UPDATE_PROMPT_SNAPSHOTS=1 and review the diff"
+        );
+    }
+
+    const CORE_TOOLS: &[&str] = &["Read", "Edit", "Write", "Glob", "Grep", "Bash"];
+    const FULL_TOOLS: &[&str] = &[
+        "Read", "Edit", "Write", "BatchEdit", "Glob", "Grep", "Bash", "PowerShell", "WebSearch",
+        "WebFetch", "Agent", "TodoWrite", "Skill", "AskUserQuestion", "ToolSearch", "github_list_issues",
+    ];
+
+    #[test]
+    fn stable_block_snapshot_linux_core_tools() {
+        assert_stable_snapshot("stable_linux_core", PromptPlatform::Linux, CORE_TOOLS);
+    }
+
+    #[test]
+    fn stable_block_snapshot_windows_core_tools() {
+        assert_stable_snapshot("stable_windows_core", PromptPlatform::Windows, CORE_TOOLS);
+    }
+
+    #[test]
+    fn stable_block_snapshot_linux_full_tools() {
+        assert_stable_snapshot("stable_linux_full", PromptPlatform::Linux, FULL_TOOLS);
+    }
+
+    #[test]
+    fn stable_block_snapshot_windows_full_tools() {
+        assert_stable_snapshot("stable_windows_full", PromptPlatform::Windows, FULL_TOOLS);
     }
 
     #[test]
