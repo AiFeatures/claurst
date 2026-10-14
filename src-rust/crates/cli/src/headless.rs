@@ -1044,4 +1044,40 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&home);
     }
+
+    #[tokio::test]
+    async fn permission_ask_is_rejected_with_a_reason_and_the_run_continues() {
+        let workspace = std::env::temp_dir().join(format!("claurst-headless-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let target = workspace.join("out.txt");
+        let manager = claurst_core::permissions::PermissionManager::new(
+            claurst_core::config::PermissionMode::Default,
+            &claurst_core::config::Settings::default(),
+        );
+        let handler = claurst_core::permissions::AutoPermissionHandler::with_manager(Arc::new(
+            std::sync::Mutex::new(manager),
+        ));
+        let args = serde_json::json!({"file_path": target.display().to_string(), "content": "x"});
+        let run = run_with(
+            CliOutputFormat::StreamJson,
+            scripted_config(vec![Step::Stream(tool_turn("call-w", "Write", &args.to_string()))]),
+            vec![Box::new(claurst_tools::FileWriteTool)],
+            context(workspace.clone(), Arc::new(handler)),
+            vec![Message::user("start")],
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+
+        assert!(!target.exists(), "the rejected write must not run");
+        let events = lines(&run.stdout);
+        let rejection = &events[2]["message"]["content"][0];
+        assert_eq!(rejection["tool_use_id"], "call-w");
+        assert_eq!(rejection["is_error"], true);
+        let text = rejection["content"].as_str().unwrap();
+        assert!(text.contains("Permission denied for tool 'Write'"), "{text}");
+        assert!(text.contains("non-interactive"), "the model is told why: {text}");
+        assert_eq!(events.last().unwrap()["subtype"], "success", "the run continues to its end");
+        assert_eq!(run.result.result, "final answer");
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
 }
