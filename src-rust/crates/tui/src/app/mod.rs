@@ -18,6 +18,7 @@ pub use types::{
     RecentSession, SystemAnnotation, SystemMessageStyle, ToolStatus,
     ToolUseBlock, TurnMetadata, recent_session_label,
 };
+pub use messages::rewind_cut_index;
 
 use std::cell::{Cell, RefCell};
 use std::sync::{Arc, Mutex};
@@ -237,12 +238,13 @@ pub struct App {
     pub message_selector: MessageSelectorOverlay,
     /// Multi-step rewind flow overlay.
     pub rewind_flow: RewindFlowOverlay,
-    /// Number of compaction-archived messages listed ahead of the live ones
-    /// in the open rewind flow (issue #449).
+    /// Number of compaction-archived messages listed ahead of the displayed
+    /// ones in the open rewind flow (issue #449).
     pub rewind_archive_len: usize,
-    /// A confirmed rewind into the compaction archive: a position in the
-    /// session's rewind timeline for the caller to apply with
-    /// `ConversationSession::rewind_to`.
+    /// Position confirmed in the rewind flow, waiting for the host loop to
+    /// apply it. Below `rewind_archive_len` it is a position in a compaction's
+    /// replaced head (`ConversationSession::rewind_to`); from there on it is
+    /// `rewind_archive_len` plus a display index (see `rewind_cut_index`).
     pub pending_rewind: Option<usize>,
     /// Bridge connection state.
     pub bridge_state: BridgeConnectionState,

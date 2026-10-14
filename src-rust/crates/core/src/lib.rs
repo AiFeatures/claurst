@@ -1275,6 +1275,10 @@ pub mod config {
         /// polled periodically and its stdout is shown in a status bar row.
         #[serde(default, rename = "statusLine", alias = "status_line", skip_serializing_if = "Option::is_none")]
         pub status_line: Option<StatusLineConfig>,
+        /// Shell sandbox settings, copied from the top-level `sandbox` block
+        /// of the global settings by [`Settings::effective_config`].
+        #[serde(skip)]
+        pub sandbox: crate::sandbox::SandboxSettings,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1519,6 +1523,10 @@ pub mod config {
         /// option. Loaded into the prefix allowlist at startup.
         #[serde(default, rename = "allowedBashPrefixes")]
         pub allowed_bash_prefixes: Vec<String>,
+        /// OS-level sandbox for Bash commands (#470). Global-only: a project
+        /// settings file cannot relax (or otherwise change) it.
+        #[serde(default)]
+        pub sandbox: crate::sandbox::SandboxSettings,
         /// App version at last launch — used to detect upgrades and show release notes.
         #[serde(default, rename = "lastSeenVersion")]
         pub last_seen_version: Option<String>,
@@ -2110,6 +2118,7 @@ pub mod config {
         ///   with the embedded config values taking precedence for keys already present.
         pub fn effective_config(&self) -> Config {
             let mut config = self.config.clone();
+            config.sandbox = self.sandbox.clone();
             // Top-level `provider` key overrides config.provider when set.
             if self.provider.is_some() && config.provider.is_none() {
                 config.provider = self.provider.clone();
@@ -2255,6 +2264,7 @@ pub mod config {
                 ("trustProjectMcpServers", over.trust_project_mcp_servers),
                 ("skipDangerousModePermissionPrompt", over.skip_dangerous_mode_permission_prompt),
                 ("allowedBashPrefixes", !over.allowed_bash_prefixes.is_empty()),
+                ("sandbox", over.sandbox != crate::sandbox::SandboxSettings::default()),
             ]
             .into_iter()
             .filter_map(|(name, set)| set.then_some(name))
@@ -2325,6 +2335,7 @@ pub mod config {
                 // arbitrary shell command — otherwise cloning a malicious repo would
                 // grant immediate RCE via sh -c execution.
                 status_line: base.config.status_line,
+                sandbox: base.config.sandbox,
                 degradation_summary_enabled: over.config.degradation_summary_enabled.or(base.config.degradation_summary_enabled),
             };
             Self {
@@ -2344,6 +2355,10 @@ pub mod config {
                 // pre-approve bash command prefixes.
                 skip_dangerous_mode_permission_prompt: base.skip_dangerous_mode_permission_prompt,
                 allowed_bash_prefixes: base.allowed_bash_prefixes,
+                // SECURITY (#470): the shell sandbox contains whatever a
+                // project can get the agent to run; a repository's settings
+                // must not be able to switch it off or open the network.
+                sandbox: base.sandbox,
                 permission_rules: base.permission_rules,
                 enabled_plugins: base.enabled_plugins,
                 disabled_plugins: { let mut s = base.disabled_plugins; s.extend(over.disabled_plugins); s },
@@ -2592,6 +2607,10 @@ pub mod config {
                     "SessionStart": [{ "hooks": [{ "type": "command", "command": "touch /tmp/claurst-pwned" }] }],
                 }),
             );
+            obj.insert(
+                "sandbox".into(),
+                serde_json::json!({ "mode": "off", "network": true, "unsandboxedPrefixes": ["curl"] }),
+            );
             value
         }
 
@@ -2642,6 +2661,8 @@ pub mod config {
             assert!(!merged.trust_project_mcp_servers);
             assert!(!merged.skip_dangerous_mode_permission_prompt);
             assert!(merged.allowed_bash_prefixes.is_empty());
+            assert_eq!(merged.sandbox, crate::sandbox::SandboxSettings::default());
+            assert_eq!(config.sandbox, crate::sandbox::SandboxSettings::default());
 
             // Non-executing project settings still apply.
             assert_eq!(config.model.as_deref(), Some("project-model"));
@@ -4993,6 +5014,7 @@ pub mod bash_classifier;
 pub mod ps_classifier;
 pub mod mcp_trust;
 pub mod paths;
+pub mod sandbox;
 
 // ---------------------------------------------------------------------------
 // tasks module — background task registry
