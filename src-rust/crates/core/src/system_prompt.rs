@@ -245,6 +245,9 @@ pub struct SystemPromptOptions {
     /// all per-tool guidance is emitted — preserving the previous behaviour
     /// for callers that don't yet thread the tool list through.
     pub enabled_tools: Option<Vec<String>>,
+    /// Sandbox state line from `claurst_core::sandbox::render_sandbox_state`
+    /// (#470), injected in the dynamic section; `None` when unsandboxed.
+    pub sandbox_state: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -317,6 +320,11 @@ pub fn build_system_prompt(opts: &SystemPromptOptions) -> String {
     // 9. Environment info (platform, OS version, shell)
     if !opts.skip_env_info {
         parts.push(build_env_info_section(opts.working_directory.as_deref()));
+    }
+
+    // 9b. Shell sandbox state (#470)
+    if let Some(sandbox) = &opts.sandbox_state {
+        parts.push(format!("\n{}", sandbox));
     }
 
     // 10. Working directory (legacy XML tag)
@@ -649,6 +657,19 @@ mod tests {
         assert!(dynamic.contains("/home/user/project"));
         assert!(!stable.contains("/home/user/project"));
         assert_eq!(split_at_dynamic_boundary("no marker"), ("no marker", ""));
+    }
+
+    #[test]
+    fn sandbox_state_is_in_the_dynamic_section() {
+        let opts = SystemPromptOptions {
+            sandbox_state: Some("# Sandbox\nBash commands run in a sandbox.".to_string()),
+            ..default_opts()
+        };
+        let prompt = build_system_prompt(&opts);
+        let (stable, dynamic) = split_at_dynamic_boundary(&prompt);
+        assert!(!stable.contains("# Sandbox"));
+        assert!(dynamic.contains("# Sandbox\nBash commands run in a sandbox."));
+        assert!(!build_system_prompt(&default_opts()).contains("# Sandbox"));
     }
 
     #[test]

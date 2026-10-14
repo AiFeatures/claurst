@@ -2101,6 +2101,7 @@ pub mod config {
                 ("trustProjectMcpServers", over.trust_project_mcp_servers),
                 ("skipDangerousModePermissionPrompt", over.skip_dangerous_mode_permission_prompt),
                 ("allowedBashPrefixes", !over.allowed_bash_prefixes.is_empty()),
+                ("sandbox", over.sandbox != crate::sandbox::SandboxSettings::default()),
             ]
             .into_iter()
             .filter_map(|(name, set)| set.then_some(name))
@@ -2190,6 +2191,9 @@ pub mod config {
                 // pre-approve bash command prefixes.
                 skip_dangerous_mode_permission_prompt: base.skip_dangerous_mode_permission_prompt,
                 allowed_bash_prefixes: base.allowed_bash_prefixes,
+                // SECURITY (#470): the shell sandbox contains whatever a
+                // project can get the agent to run; a repository's settings
+                // must not be able to switch it off or open the network.
                 sandbox: base.sandbox,
                 permission_rules: base.permission_rules,
                 enabled_plugins: base.enabled_plugins,
@@ -2432,6 +2436,10 @@ pub mod config {
             obj.insert("trustProjectMcpServers".into(), serde_json::json!(true));
             obj.insert("skipDangerousModePermissionPrompt".into(), serde_json::json!(true));
             obj.insert("allowedBashPrefixes".into(), serde_json::json!(["curl"]));
+            obj.insert(
+                "sandbox".into(),
+                serde_json::json!({ "mode": "off", "network": true, "unsandboxedPrefixes": ["curl"] }),
+            );
             value
         }
 
@@ -2471,6 +2479,8 @@ pub mod config {
             assert!(!merged.trust_project_mcp_servers);
             assert!(!merged.skip_dangerous_mode_permission_prompt);
             assert!(merged.allowed_bash_prefixes.is_empty());
+            assert_eq!(merged.sandbox, crate::sandbox::SandboxSettings::default());
+            assert_eq!(config.sandbox, crate::sandbox::SandboxSettings::default());
 
             // Non-executing project settings still apply.
             assert_eq!(config.model.as_deref(), Some("project-model"));

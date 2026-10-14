@@ -67,6 +67,35 @@ impl SandboxSettings {
     }
 }
 
+/// One line for the dynamic system prompt describing the sandbox the
+/// model's Bash commands run in, or `None` when they run unsandboxed.
+pub fn render_sandbox_state(settings: &SandboxSettings) -> Option<String> {
+    let writes = match settings.effective_mode() {
+        SandboxMode::Off => return None,
+        SandboxMode::WorkspaceWrite => {
+            "can write only inside the workspace, --add-dir directories and the temp \
+             directories (.git and .claurst stay read-only)"
+        }
+        SandboxMode::ReadOnly => "cannot write files",
+    };
+    let network = if settings.network { "on" } else { "off" };
+    Some(format!(
+        "# Sandbox\nBash commands run in a macOS Seatbelt sandbox ({}): they can read any file but {writes}; network access is {network}. A command the sandbox blocks fails with \"Operation not permitted\"; say so instead of working around it, so the user can approve a rerun outside the sandbox.",
+        settings.mode.as_str()
+    ))
+}
+
+/// Short footer badge for the active sandbox, or `None` when commands run
+/// unsandboxed.
+pub fn status_label(settings: &SandboxSettings) -> Option<String> {
+    let mode = settings.effective_mode();
+    if mode == SandboxMode::Off {
+        return None;
+    }
+    let network = if settings.network { " +net" } else { "" };
+    Some(format!("sandbox: {}{network}", mode.as_str()))
+}
+
 /// Whether this host can run commands under Seatbelt.
 pub fn seatbelt_available() -> bool {
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
@@ -92,6 +121,39 @@ mod tests {
             let json = serde_json::to_string(&mode).unwrap();
             assert_eq!(json, format!("\"{}\"", mode.as_str()));
         }
+    }
+
+    #[test]
+    fn prompt_line_and_badge_follow_the_effective_mode() {
+        let off = SandboxSettings {
+            mode: SandboxMode::Off,
+            ..SandboxSettings::default()
+        };
+        assert_eq!(render_sandbox_state(&off), None);
+        assert_eq!(status_label(&off), None);
+
+        let write = SandboxSettings::default();
+        let read_only = SandboxSettings {
+            mode: SandboxMode::ReadOnly,
+            network: true,
+            ..SandboxSettings::default()
+        };
+        if !seatbelt_available() {
+            assert_eq!(render_sandbox_state(&write), None);
+            assert_eq!(status_label(&read_only), None);
+            return;
+        }
+        let line = render_sandbox_state(&write).unwrap();
+        assert!(line.starts_with("# Sandbox\n"));
+        assert_eq!(line.lines().count(), 2);
+        assert!(line.contains("(workspace-write)"));
+        assert!(line.contains("network access is off"));
+        assert_eq!(status_label(&write).as_deref(), Some("sandbox: workspace-write"));
+
+        let line = render_sandbox_state(&read_only).unwrap();
+        assert!(line.contains("cannot write files"));
+        assert!(line.contains("network access is on"));
+        assert_eq!(status_label(&read_only).as_deref(), Some("sandbox: read-only +net"));
     }
 
     #[test]

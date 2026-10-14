@@ -178,6 +178,9 @@ pub struct QueryConfig {
     /// goal's guards allow, injecting the goal continuation message as the next
     /// user turn — instead of the CLI REPL re-dispatching a fresh turn.
     pub continuation: crate::continuation::ContinuationMode,
+    /// Sandbox line for the dynamic system prompt (#470). Always filled by
+    /// `run_query_loop` from the tool context's sandbox settings.
+    pub sandbox_state: Option<String>,
 }
 
 impl Default for QueryConfig {
@@ -209,6 +212,7 @@ impl Default for QueryConfig {
             managed_agents: None,
             enabled_tools: None,
             continuation: crate::continuation::ContinuationMode::Default,
+            sandbox_state: None,
         }
     }
 }
@@ -694,6 +698,8 @@ pub async fn run_query_loop(
                 patched.enabled_tools =
                     Some(tools.iter().map(|t| t.name().to_string()).collect());
             }
+            patched.sandbox_state =
+                claurst_core::sandbox::render_sandbox_state(&tool_ctx.config.sandbox);
 
             // Apply agent system-prompt prefix: prepend before the main system prompt.
             if let Some(ref agent) = config.agent_definition {
@@ -2255,6 +2261,7 @@ mod tests {
             managed_agents: None,
             enabled_tools: None,
             continuation: crate::continuation::ContinuationMode::Default,
+            sandbox_state: None,
         }
     }
 
