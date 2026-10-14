@@ -606,6 +606,39 @@ impl ToolContext {
         self.request_permission_inner(request)
     }
 
+    /// Check one write call that touches several files (BatchEdit,
+    /// ApplyPatch). The call is allowed without asking when every file is
+    /// allowed on its own (AcceptEdits inside the workspace, or path rules
+    /// covering each file) and refused when any file is refused; otherwise
+    /// the user is asked once for the whole call.
+    pub fn check_permission_for_paths(
+        &self,
+        tool_name: &str,
+        description: &str,
+        paths: &[PathBuf],
+    ) -> Result<(), claurst_core::error::ClaudeError> {
+        let mut all_allowed = !paths.is_empty();
+        for path in paths {
+            let request =
+                self.build_permission_request(tool_name, description, None, false, Some(path.clone()));
+            match self.permission_handler.check_permission(&request) {
+                PermissionDecision::Allow | PermissionDecision::AllowPermanently => {}
+                PermissionDecision::Ask { .. } => all_allowed = false,
+                _ => {
+                    return Err(claurst_core::error::ClaudeError::PermissionDenied(format!(
+                        "Permission denied for tool '{}': {}",
+                        tool_name,
+                        path.display()
+                    )))
+                }
+            }
+        }
+        if all_allowed {
+            return Ok(());
+        }
+        self.check_permission(tool_name, description, false)
+    }
+
     /// Bind a path-scoped permission check to the file that was actually
     /// opened (#415).
     ///

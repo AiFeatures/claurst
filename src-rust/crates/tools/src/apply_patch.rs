@@ -305,10 +305,12 @@ impl Tool for ApplyPatchTool {
 
         // Permission check.
         if !params.dry_run {
-            if let Err(e) = ctx.check_permission(
+            let targets: Vec<std::path::PathBuf> =
+                file_patches.iter().map(|fp| ctx.resolve_path(&fp.path)).collect();
+            if let Err(e) = ctx.check_permission_for_paths(
                 self.name(),
                 &format!("ApplyPatch to {} file(s)", file_patches.len()),
-                false,
+                &targets,
             ) {
                 return ToolResult::error(e.to_string());
             }

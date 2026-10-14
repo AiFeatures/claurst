@@ -2928,7 +2928,7 @@ pub mod permissions {
         pub fn for_tool(tool_name: &str) -> Self {
             match tool_name {
                 "Bash" | "bash" => Self::Execute,
-                "Write" | "Edit" | "NotebookEdit" => Self::Write,
+                _ if is_edit_tool(tool_name) => Self::Write,
                 "WebFetch" => Self::Network,
                 _ => Self::Read,
             }
@@ -3275,14 +3275,35 @@ pub mod permissions {
     // PermissionManager
     // -----------------------------------------------------------------------
 
+    /// Canonicalize `path`; for a path that does not exist yet (a file about
+    /// to be created) the longest existing ancestor is canonicalized and the
+    /// rest appended. `None` when the unresolved rest contains `..`, which
+    /// could climb out of the resolved directory.
+    fn canonicalize_lenient(path: &std::path::Path) -> Option<std::path::PathBuf> {
+        if let Ok(canonical) = std::fs::canonicalize(path) {
+            return Some(canonical);
+        }
+        let mut rest = Vec::new();
+        let mut current = path;
+        loop {
+            rest.push(current.file_name()?);
+            current = current.parent()?;
+            if let Ok(mut resolved) = std::fs::canonicalize(current) {
+                resolved.extend(rest.iter().rev());
+                return Some(resolved);
+            }
+        }
+    }
+
     /// Returns true when `path` falls under the active workspace roots.
     fn is_path_within_allowed_roots(
         path: &str,
         working_dir: Option<&std::path::Path>,
         allowed_roots: &[std::path::PathBuf],
     ) -> bool {
-        let canonical_path = std::fs::canonicalize(path)
-            .unwrap_or_else(|_| std::path::PathBuf::from(path));
+        let Some(canonical_path) = canonicalize_lenient(std::path::Path::new(path)) else {
+            return false;
+        };
 
         let mut roots: Vec<std::path::PathBuf> = Vec::new();
         if let Some(root) = working_dir {
@@ -3295,6 +3316,23 @@ pub mod permissions {
         );
 
         roots.iter().any(|root| canonical_path.starts_with(root))
+    }
+
+    /// Whether `tool_name` edits or writes files. `AcceptEdits` auto-allows
+    /// these for targets inside the workspace roots.
+    pub fn is_edit_tool(tool_name: &str) -> bool {
+        use crate::constants::{
+            TOOL_NAME_APPLY_PATCH, TOOL_NAME_BATCH_EDIT, TOOL_NAME_FILE_EDIT, TOOL_NAME_FILE_WRITE,
+            TOOL_NAME_NOTEBOOK_EDIT,
+        };
+        matches!(
+            tool_name,
+            TOOL_NAME_FILE_EDIT
+                | TOOL_NAME_FILE_WRITE
+                | TOOL_NAME_NOTEBOOK_EDIT
+                | TOOL_NAME_BATCH_EDIT
+                | TOOL_NAME_APPLY_PATCH
+        )
     }
 
     /// Whether `tool_name` runs shell command lines, whose rules are matched
@@ -3582,7 +3620,8 @@ pub mod permissions {
         /// 3. Check allow rules → if any matched, Allow. For a shell tool
         ///    `path` is the command line and rules match per simple command
         ///    (see `shell_rule_decision`).
-        /// 4. AcceptEdits → Allow (auto-accept file edits).
+        /// 4. AcceptEdits → Allow edits and writes (Edit, Write, NotebookEdit,
+        ///    BatchEdit, ApplyPatch) to targets inside the workspace roots.
         /// 5. Plan mode → Allow reads; deny everything else.
         /// 6. Default → derive from tool danger level.
         pub fn evaluate(
@@ -3636,8 +3675,15 @@ pub mod permissions {
                 _ => false,
             };
 
-            // Step 4 — AcceptEdits: only auto-allow Edit; everything else keeps normal checks.
-            if self.mode == PermissionMode::AcceptEdits && tool_name == "Edit" {
+            // Step 4 — AcceptEdits: auto-allow file edits and writes whose
+            // target lies inside the workspace roots. Writes outside the
+            // workspace, and everything else, keep the normal checks.
+            if self.mode == PermissionMode::AcceptEdits
+                && is_edit_tool(tool_name)
+                && path.is_some_and(|target| {
+                    is_path_within_allowed_roots(target, working_dir, allowed_roots)
+                })
+            {
                 return PermissionDecision::Allow;
             }
 
@@ -3808,13 +3854,21 @@ pub mod permissions {
             use crate::config::PermissionMode;
             match self.mode {
                 PermissionMode::BypassPermissions => PermissionDecision::Allow,
-                    PermissionMode::AcceptEdits => {
-                        if request.tool_name == "Edit" || request.is_read_only {
-                            PermissionDecision::Allow
-                        } else {
-                            PermissionDecision::Deny
-                        }
+                PermissionMode::AcceptEdits => {
+                    let workspace_edit = is_edit_tool(&request.tool_name)
+                        && request.path.as_deref().is_some_and(|target| {
+                            is_path_within_allowed_roots(
+                                target,
+                                request.working_dir.as_deref(),
+                                &request.allowed_roots,
+                            )
+                        });
+                    if workspace_edit || request.is_read_only {
+                        PermissionDecision::Allow
+                    } else {
+                        PermissionDecision::Deny
                     }
+                }
                 PermissionMode::Plan => {
                     if request.is_read_only {
                         PermissionDecision::Allow
@@ -4080,16 +4134,95 @@ pub mod permissions {
             );
         }
 
+        /// #445: AcceptEdits auto-allows every edit/write tool for targets
+        /// inside the workspace (existing files, new files, extra roots) and
+        /// still asks outside it; other tools keep their normal checks.
         #[test]
-        fn accept_edits_only_allows_edit() {
-            let m = mgr(PermissionMode::AcceptEdits);
+        fn accept_edits_matrix() {
+            let ws = tempfile::tempdir().unwrap();
+            let root = std::fs::canonicalize(ws.path()).unwrap();
+            std::fs::create_dir(root.join("src")).unwrap();
+            std::fs::write(root.join("src/lib.rs"), "").unwrap();
+            let extra = tempfile::tempdir().unwrap();
+            let extra_root = std::fs::canonicalize(extra.path()).unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let outside_root = std::fs::canonicalize(outside.path()).unwrap();
+            let roots = vec![extra_root.clone()];
+
+            let inside = [
+                root.join("src/lib.rs"),
+                root.join("src/new_file.rs"),
+                root.join("new/dir/file.txt"),
+                extra_root.join("notes.md"),
+            ];
+            let not_inside = [
+                outside_root.join("x.txt"),
+                root.join("../escape.txt"),
+                root.join("missing/../../escape.txt"),
+            ];
+            let accept = mgr(PermissionMode::AcceptEdits);
+            let default = mgr(PermissionMode::Default);
+            let eval = |m: &PermissionManager, tool: &str, target: Option<&std::path::Path>| {
+                let target = target.map(|p| p.display().to_string());
+                m.evaluate(tool, "write", target.as_deref(), Some(root.as_path()), &roots)
+            };
+            for tool in ["Edit", "Write", "NotebookEdit", "BatchEdit", "ApplyPatch"] {
+                for target in &inside {
+                    assert_eq!(eval(&accept, tool, Some(target)), PermissionDecision::Allow, "{tool} {target:?}");
+                    assert!(is_ask(eval(&default, tool, Some(target))), "default {tool} {target:?}");
+                }
+                for target in &not_inside {
+                    assert!(is_ask(eval(&accept, tool, Some(target))), "{tool} {target:?}");
+                }
+                assert!(is_ask(eval(&accept, tool, None)), "{tool} without a target");
+            }
+            // Plan mode still refuses writes; other tools are unaffected.
             assert_eq!(
-                m.evaluate("Edit", "edit file", Some("/workspace/src/lib.rs"), None, &[]),
-                PermissionDecision::Allow
+                eval(&mgr(PermissionMode::Plan), "Write", Some(&root.join("a.txt"))),
+                PermissionDecision::Deny
             );
-            match m.evaluate("Bash", "rm -rf /tmp", None, None, &[]) {
-                PermissionDecision::Ask { .. } => {}
-                other => panic!("Expected Ask, got {:?}", other),
+            assert!(is_ask(accept.evaluate("Bash", "run", Some("touch a.txt"), Some(root.as_path()), &[])));
+            assert!(is_ask(eval(&accept, "WebFetch", None)));
+        }
+
+        /// A symlink inside the workspace that points outside is judged by
+        /// where it leads.
+        #[cfg(unix)]
+        #[test]
+        fn accept_edits_follows_symlinks_out_of_the_workspace() {
+            let ws = tempfile::tempdir().unwrap();
+            let root = std::fs::canonicalize(ws.path()).unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            std::os::unix::fs::symlink(outside.path(), root.join("link")).unwrap();
+            let m = mgr(PermissionMode::AcceptEdits);
+            let target = root.join("link/new.txt").display().to_string();
+            assert!(is_ask(m.evaluate("Write", "write", Some(&target), Some(root.as_path()), &[])));
+        }
+
+        #[test]
+        fn auto_handler_accept_edits_covers_workspace_writes_only() {
+            let ws = tempfile::tempdir().unwrap();
+            let root = std::fs::canonicalize(ws.path()).unwrap();
+            let handler = AutoPermissionHandler { mode: PermissionMode::AcceptEdits };
+            let request = |tool: &str, path: std::path::PathBuf| PermissionRequest {
+                tool_name: tool.to_string(),
+                description: "write".to_string(),
+                details: None,
+                is_read_only: false,
+                path: Some(path.display().to_string()),
+                working_dir: Some(root.clone()),
+                allowed_roots: Vec::new(),
+                context_description: None,
+            };
+            for tool in ["Write", "ApplyPatch", "BatchEdit", "NotebookEdit", "Edit"] {
+                assert_eq!(
+                    handler.check_permission(&request(tool, root.join("a.txt"))),
+                    PermissionDecision::Allow
+                );
+                assert_eq!(
+                    handler.check_permission(&request(tool, root.join("../a.txt"))),
+                    PermissionDecision::Deny
+                );
             }
         }
 
