@@ -2776,9 +2776,15 @@ pub mod context {
             self
         }
 
-        /// System context (git status, platform, IDE, etc.)
+        /// System context (date, platform, git status, IDE). Changes between
+        /// sessions, so it belongs in the dynamic system block.
         pub async fn build_system_context(&self) -> String {
             let mut parts = vec![];
+
+            let date = chrono::Local::now()
+                .format("%A, %B %d, %Y")
+                .to_string();
+            parts.push(format!("Today's date is {}.", date));
 
             // Platform information
             parts.push(format!("Platform: {}", std::env::consts::OS));
@@ -2800,22 +2806,13 @@ pub mod context {
             parts.join("\n\n")
         }
 
-        /// User context (date, AGENTS.md memories, etc.)
+        /// User context (AGENTS.md memories). Stable within a project, so it
+        /// belongs in the cached system block.
         pub async fn build_user_context(&self) -> String {
-            let mut parts = vec![];
-
-            let date = chrono::Local::now()
-                .format("%A, %B %d, %Y")
-                .to_string();
-            parts.push(format!("Today's date is {}.", date));
-
-            if !self.disable_claude_mds {
-                if let Some(claude_md) = self.find_and_read_claude_md().await {
-                    parts.push(claude_md);
-                }
+            if self.disable_claude_mds {
+                return String::new();
             }
-
-            parts.join("\n\n")
+            self.find_and_read_claude_md().await.unwrap_or_default()
         }
 
         /// Gather short git status + recent log.
@@ -3912,6 +3909,37 @@ pub mod history {
         pub snapshot: Vec<Message>,
     }
 
+    /// What started a compaction of the session history.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum CompactionTrigger {
+        /// The projected context crossed the auto-compact threshold.
+        Threshold,
+        /// The provider rejected a request for exceeding the context window.
+        Overflow,
+        /// The user ran `/compact`.
+        Manual,
+    }
+
+    /// One compaction of the session history (issue #441). The head of the
+    /// history was replaced by the summary message whose uuid is
+    /// `summary_uuid`; this entry records when, why and how much it saved.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct CompactionRecord {
+        pub at: chrono::DateTime<chrono::Utc>,
+        pub trigger: CompactionTrigger,
+        /// uuid of the summary message now at the head of the history.
+        pub summary_uuid: String,
+        pub messages_before: usize,
+        pub messages_after: usize,
+        /// Estimated context tokens before and after (chars / 4 heuristic).
+        pub tokens_before: u64,
+        pub tokens_after: u64,
+        /// `false` when the summariser failed and the head was dropped to
+        /// recover from a context-window error, keeping only the untouched tail.
+        pub summarised: bool,
+    }
+
     /// A single persisted conversation session.
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct ConversationSession {
@@ -3949,6 +3977,9 @@ pub mod history {
         /// Message index in the parent session at which this fork was created.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub fork_point_message_index: Option<usize>,
+        /// Compactions applied to `messages`, oldest first.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub compactions: Vec<CompactionRecord>,
     }
 
     impl ConversationSession {
@@ -3971,6 +4002,7 @@ pub mod history {
                 checkpoints: vec![],
                 parent_session_id: None,
                 fork_point_message_index: None,
+                compactions: vec![],
             }
         }
 
@@ -4152,6 +4184,7 @@ pub mod history {
             checkpoints: vec![],
             parent_session_id: None,
             fork_point_message_index: None,
+            compactions: vec![],
         };
         save_session(&branched).await?;
         Ok(branched)
@@ -4887,6 +4920,10 @@ pub mod paths;
 // tasks module — background task registry
 // ---------------------------------------------------------------------------
 pub mod tasks {
+    use crate::truncate::{
+        bound_head_tail, head_window, join_head_tail, tail_window, OUTPUT_WINDOW_BYTES,
+        OUTPUT_WINDOW_LINES,
+    };
     use chrono::{DateTime, Utc};
     use dashmap::DashMap;
     use once_cell::sync::Lazy;
@@ -4928,8 +4965,17 @@ pub mod tasks {
         pub started_at: DateTime<Utc>,
         /// When the task finished (completed, failed, or cancelled).
         pub completed_at: Option<DateTime<Utc>>,
-        /// Lines of output produced by the task.
+        /// Lines of output produced by the task: the first
+        /// [`OUTPUT_WINDOW_LINES`] lines followed by a rolling tail. Lines
+        /// dropped in between are counted in `omitted_output_lines` (#442).
         pub output: Vec<String>,
+        /// Lines dropped from the middle of `output` to keep memory bounded.
+        #[serde(default)]
+        pub omitted_output_lines: u64,
+        /// File holding the task's full output when it outgrew the in-memory
+        /// windows (#442).
+        #[serde(default)]
+        pub output_file: Option<std::path::PathBuf>,
         /// OS process ID, if applicable.
         pub pid: Option<u32>,
         /// Cancellation token for the task's in-process work loop. Signalling it
@@ -4949,9 +4995,39 @@ pub mod tasks {
                 started_at: Utc::now(),
                 completed_at: None,
                 output: Vec::new(),
+                omitted_output_lines: 0,
+                output_file: None,
                 pid: None,
                 cancel_token: None,
             }
+        }
+
+        /// Total lines the task has produced, including omitted ones.
+        pub fn output_line_count(&self) -> u64 {
+            self.output.len() as u64 + self.omitted_output_lines
+        }
+
+        /// The task's output bounded for the model: a head window and a tail
+        /// window (lines and bytes) around a note naming what was left out,
+        /// plus `Full output: <path>` once the full output was spilled (#442).
+        pub fn render_output(&self) -> String {
+            let mut text = if self.omitted_output_lines == 0 {
+                let text = self.output.join("\n");
+                bound_head_tail(&text).unwrap_or(text)
+            } else {
+                let split = OUTPUT_WINDOW_LINES.min(self.output.len());
+                let head = self.output[..split].join("\n");
+                let tail = self.output[split..].join("\n");
+                join_head_tail(
+                    head_window(&head, OUTPUT_WINDOW_LINES, OUTPUT_WINDOW_BYTES),
+                    tail_window(&tail, OUTPUT_WINDOW_LINES, OUTPUT_WINDOW_BYTES),
+                    &format!("{} lines", self.omitted_output_lines),
+                )
+            };
+            if let Some(path) = &self.output_file {
+                text.push_str(&format!("\n\nFull output: {}", path.display()));
+            }
+            text
         }
 
         /// Return `true` if the task is still running.
@@ -4992,9 +5068,18 @@ pub mod tasks {
         }
 
         /// Append a line of output to an existing task.  No-op if unknown.
+        ///
+        /// Memory stays bounded (#442): the first [`OUTPUT_WINDOW_LINES`] lines
+        /// are kept, and once the buffer holds two further tail windows the
+        /// middle is dropped back down to one (amortised O(1) per line).
         pub fn append_output(&self, id: &str, line: &str) {
             if let Some(mut entry) = self.tasks.get_mut(id) {
                 entry.output.push(line.to_string());
+                if entry.output.len() > 3 * OUTPUT_WINDOW_LINES {
+                    let end = entry.output.len() - OUTPUT_WINDOW_LINES;
+                    entry.output.drain(OUTPUT_WINDOW_LINES..end);
+                    entry.omitted_output_lines += (end - OUTPUT_WINDOW_LINES) as u64;
+                }
             }
         }
 
@@ -5038,6 +5123,13 @@ pub mod tasks {
             self.update_status(id, TaskStatus::Cancelled);
         }
 
+        /// Record the file holding a task's full output.  No-op if unknown.
+        pub fn set_output_file(&self, id: &str, path: std::path::PathBuf) {
+            if let Some(mut entry) = self.tasks.get_mut(id) {
+                entry.output_file = Some(path);
+            }
+        }
+
         /// Set the OS process ID for a task.  No-op if unknown.
         pub fn set_pid(&self, id: &str, pid: u32) {
             if let Some(mut entry) = self.tasks.get_mut(id) {
@@ -5058,6 +5150,46 @@ pub mod tasks {
     /// Return a reference to the process-global `TaskRegistry`.
     pub fn global_registry() -> &'static TaskRegistry {
         &GLOBAL_REGISTRY
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// #442: a chatty background task keeps a head window plus a rolling
+        /// tail instead of every line, and renders a bounded result.
+        #[test]
+        fn task_output_is_bounded_head_plus_tail() {
+            let registry = TaskRegistry::new();
+            let id = registry.register(BackgroundTask::new("chatty"));
+            for i in 0..100_000 {
+                registry.append_output(&id, &format!("line {i}"));
+            }
+            let task = registry.get(&id).unwrap();
+            assert!(task.output.len() <= 3 * OUTPUT_WINDOW_LINES);
+            assert_eq!(task.output_line_count(), 100_000);
+            assert_eq!(task.output[0], "line 0");
+            assert_eq!(task.output.last().unwrap(), "line 99999");
+
+            let rendered = task.render_output();
+            assert!(rendered.starts_with("line 0\n"));
+            assert!(rendered.ends_with("line 99999"));
+            assert!(rendered.contains("lines omitted"));
+            assert!(rendered.len() <= 2 * OUTPUT_WINDOW_BYTES + 100);
+
+            registry.set_output_file(&id, std::path::PathBuf::from("/spill/x.txt"));
+            let rendered = registry.get(&id).unwrap().render_output();
+            assert!(rendered.ends_with("line 99999\n\nFull output: /spill/x.txt"));
+        }
+
+        #[test]
+        fn small_task_output_renders_whole() {
+            let registry = TaskRegistry::new();
+            let id = registry.register(BackgroundTask::new("quiet"));
+            registry.append_output(&id, "a");
+            registry.append_output(&id, "b");
+            assert_eq!(registry.get(&id).unwrap().render_output(), "a\nb");
+        }
     }
 }
 

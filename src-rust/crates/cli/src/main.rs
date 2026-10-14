@@ -43,73 +43,12 @@ use claurst_core::{
     cost::CostTracker,
     permissions::{AutoPermissionHandler, InteractivePermissionHandler, PermissionManager},
 };
-use async_trait::async_trait;
-use claurst_core::types::ToolDefinition;
-use claurst_tools::{PermissionLevel, Tool, ToolContext, ToolResult};
+use claurst_tools::ToolContext;
 use clap::{ArgAction, Parser, ValueEnum};
 use parking_lot::Mutex as ParkingMutex;
 use std::{path::PathBuf, sync::Arc};
 use tracing::{debug, info, warn};
 use tracing_subscriber::{fmt::writer::BoxMakeWriter, EnvFilter};
-
-// ---------------------------------------------------------------------------
-// MCP tool wrapper: makes MCP server tools look like native cc-tools.
-// ---------------------------------------------------------------------------
-
-struct McpToolWrapper {
-    tool_def: ToolDefinition,
-    server_name: String,
-    manager: Arc<claurst_mcp::McpManager>,
-}
-
-#[async_trait]
-impl Tool for McpToolWrapper {
-    fn name(&self) -> &str {
-        &self.tool_def.name
-    }
-
-    fn description(&self) -> &str {
-        &self.tool_def.description
-    }
-
-    fn permission_level(&self) -> PermissionLevel {
-        // MCP tools run external processes – treat as Execute.
-        PermissionLevel::Execute
-    }
-
-    fn input_schema(&self) -> serde_json::Value {
-        self.tool_def.input_schema.clone()
-    }
-
-    async fn execute(&self, input: serde_json::Value, ctx: &ToolContext) -> ToolResult {
-        let desc = format!("Run MCP tool {}", self.tool_def.name);
-        if let Err(e) = ctx.check_permission(self.name(), &desc, false) {
-            return ToolResult::error(e.to_string());
-        }
-
-        // Strip the server-name prefix to get the bare tool name.
-        let prefix = format!("{}_", self.server_name);
-        let bare_name = self
-            .tool_def
-            .name
-            .strip_prefix(&prefix)
-            .unwrap_or(&self.tool_def.name);
-
-        let args = if input.is_null() { None } else { Some(input) };
-
-        match self.manager.call_tool(&self.tool_def.name, args).await {
-            Ok(result) => {
-                let text = claurst_mcp::mcp_result_to_string(&result);
-                if result.is_error {
-                    ToolResult::error(text)
-                } else {
-                    ToolResult::success(text)
-                }
-            }
-            Err(e) => ToolResult::error(format!("MCP tool '{}' failed: {}", bare_name, e)),
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // CLI argument definition (matches TypeScript main.tsx flags)
@@ -610,20 +549,19 @@ async fn main() -> anyhow::Result<()> {
     let system_ctx = ctx_builder.build_system_context().await;
     let user_ctx = ctx_builder.build_user_context().await;
 
-    // Build system prompt
-    let mut system_parts = vec![
-        include_str!("system_prompt.txt").to_string(),
-        system_ctx,
-        user_ctx,
-    ];
-    if let Some(ref custom) = config.custom_system_prompt {
-        // replace base system prompt
-        system_parts[0] = custom.clone();
-    }
-    if let Some(ref append) = config.append_system_prompt {
-        system_parts.push(append.clone());
-    }
-    let system_prompt = system_parts.join("\n\n");
+    // Build system prompt. Only session-stable text goes here (it lands in
+    // the cached system block); `system_ctx` (date, git status, IDE context)
+    // is passed separately as `session_context` and sent in the dynamic block.
+    let base_prompt = config
+        .custom_system_prompt
+        .clone()
+        .unwrap_or_else(|| include_str!("system_prompt.txt").to_string());
+    let system_prompt = [Some(base_prompt), Some(user_ctx), config.append_system_prompt.clone()]
+        .into_iter()
+        .flatten()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
 
     // Initialize API client.
     // Try config/env first; fall back to saved OAuth tokens.
@@ -853,6 +791,7 @@ async fn main() -> anyhow::Result<()> {
     query_config.max_turns = cli.max_turns;
     query_config.system_prompt = Some(system_prompt);
     query_config.append_system_prompt = None;
+    query_config.session_context = Some(system_ctx);
     query_config.working_directory = Some(cwd.display().to_string());
     if let Some(tokens) = cli.thinking {
         query_config.thinking_budget = Some(tokens);
@@ -870,6 +809,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(ref fb) = cli.fallback_model {
         query_config.fallback_model = Some(fb.clone());
     }
+    query_config.auto_compact = !cli.no_auto_compact;
     // Wire in the provider registry so non-Anthropic providers can be dispatched.
     let provider_registry = std::sync::Arc::new(provider_registry);
     query_config.provider_registry = Some(provider_registry.clone());
@@ -969,14 +909,7 @@ fn build_tools_with_mcp(
     v.push(Box::new(claurst_query::AgentTool));
 
     if let Some(ref manager_arc) = mcp_manager {
-        for (server_name, tool_def) in manager_arc.all_tool_definitions() {
-            let wrapper = McpToolWrapper {
-                tool_def,
-                server_name,
-                manager: manager_arc.clone(),
-            };
-            v.push(Box::new(wrapper));
-        }
+        v.extend(claurst_tools::mcp_tools(manager_arc));
         debug!(total_tools = v.len(), "MCP tools registered");
     }
 
@@ -2031,7 +1964,6 @@ async fn run_interactive(
     }
     app.provider_registry = base_query_config.provider_registry.clone();
     app.refresh_context_window_size();
-    app.auto_compact_enabled = live_config.auto_compact;
 
     // Background: keep the model registry fresh from models.dev for the whole
     // TUI session (opencode-style: refresh now, then every ~60 min, gated by a
@@ -2668,6 +2600,20 @@ async fn run_interactive(
                                         if removed == 1 { "" } else { "s" }
                                     ));
                                 }
+                                Some(CommandResult::Compacted {
+                                    messages: new_msgs,
+                                    record,
+                                    report,
+                                }) => {
+                                    messages = new_msgs.clone();
+                                    app.replace_messages(new_msgs);
+                                    app.context_used_tokens = record.tokens_after;
+                                    session.messages = messages.clone();
+                                    session.compactions.push(record);
+                                    session.updated_at = chrono::Utc::now();
+                                    let _ = claurst_core::history::save_session(&session).await;
+                                    app.status_message = Some(report);
+                                }
                                 Some(CommandResult::OpenRewindOverlay) => {
                                     app.replace_messages(messages.clone());
                                     app.open_rewind_flow();
@@ -3161,7 +3107,6 @@ async fn run_interactive(
                         qcfg.max_tokens = cmd_ctx.config.effective_max_tokens();
                         // Session-local /turns override wins over agent and config caps.
                         qcfg.max_turns_override = app.max_turns_override;
-                        qcfg.append_system_prompt = cmd_ctx.config.append_system_prompt.clone();
                         qcfg.system_prompt = base_query_config.system_prompt.clone();
                         qcfg.output_style = cmd_ctx.config.effective_output_style();
                         qcfg.output_style_prompt = cmd_ctx.config.resolve_output_style_prompt();
@@ -3408,6 +3353,10 @@ async fn run_interactive(
 
         // Drain query events — also forward relevant ones to the bridge as outbound.
         while let Ok(evt) = event_rx.try_recv() {
+            // Record loop compactions in the session (issue #441).
+            if let QueryEvent::Compacted(record) = &evt {
+                session.compactions.push(record.clone());
+            }
             // Forward to bridge before consuming (clone only what we need).
             if let Some(ref runtime) = bridge_runtime {
                 let outbound: Option<BridgeOutbound> = match &evt {
@@ -3483,72 +3432,6 @@ async fn run_interactive(
                 }
             }
             app.handle_query_event(evt);
-        }
-
-        // Auto-compact: when context usage hits 99% and no query is running,
-        // automatically submit a compact request.
-        if app.context_window_size > 0
-            && !app.is_streaming
-            && current_query.is_none()
-            && !app.auto_compact_running
-        {
-            let used_pct = (app.context_used_tokens as f64 / app.context_window_size as f64 * 100.0) as u64;
-            if used_pct >= 99 {
-                app.auto_compact_running = true;
-                let msg_count = messages.len();
-                let compact_msg = format!(
-                    "[Auto-compact triggered ({} messages, {}% context used). \
-                     Provide a detailed summary of our conversation so far, \
-                     preserving all key technical details, decisions made, \
-                     file paths mentioned, and current task status.]",
-                    msg_count, used_pct
-                );
-                app.status_message = Some("Context 99% full — auto-compacting…".to_string());
-                let user_msg = claurst_core::types::Message::user(compact_msg);
-                messages.push(user_msg.clone());
-                app.push_message(user_msg);
-                session.messages = messages.clone();
-                session.updated_at = chrono::Utc::now();
-
-                // Dispatch the compact query immediately.
-                let ct = CancellationToken::new();
-                cancel = Some(ct.clone());
-                let msgs_arc = Arc::new(tokio::sync::Mutex::new(messages.clone()));
-                let msgs_arc_clone = msgs_arc.clone();
-                let tools_arc_clone = tools_arc.clone();
-                let ctx_clone = tool_ctx.clone();
-                let mut qcfg = base_query_config.clone();
-                qcfg.model = claurst_api::effective_model_for_config(&cmd_ctx.config, &model_registry);
-                qcfg.max_tokens = cmd_ctx.config.effective_max_tokens();
-                // Session-local /turns override wins over agent and config caps.
-                qcfg.max_turns_override = app.max_turns_override;
-                // Auto-compact is a maintenance turn, not a goal turn: never let
-                // it trigger in-loop goal continuation.
-                qcfg.continuation = claurst_query::ContinuationMode::Default;
-                let tracker = cost_tracker.clone();
-                let tx = event_tx.clone();
-                let client_clone = client.clone();
-                app.is_streaming = true;
-
-                let handle = tokio::spawn(async move {
-                    let mut msgs = msgs_arc_clone.lock().await.clone();
-                    let outcome = claurst_query::run_query_loop(
-                        client_clone.as_ref(),
-                        &mut msgs,
-                        tools_arc_clone.as_slice(),
-                        &ctx_clone,
-                        &qcfg,
-                        tracker,
-                        Some(tx),
-                        ct,
-                        None,
-                    )
-                    .await;
-                    *msgs_arc_clone.lock().await = msgs;
-                    outcome
-                });
-                current_query = Some((handle, msgs_arc));
-            }
         }
 
         // Drain TUI-facing bridge events.
@@ -4266,12 +4149,6 @@ async fn run_interactive(
                     app.prompt_input.text = next;
                     app.prompt_input.cursor = app.prompt_input.text.len();
                     app.pending_auto_submit = true;
-                }
-                if app.auto_compact_running {
-                    app.auto_compact_running = false;
-                    // After auto-compact the context was summarised — reset usage.
-                    app.context_used_tokens = 0;
-                    app.status_message = Some("Auto-compact complete.".to_string());
                 }
 
                 // Save session to JSONL (primary storage)

@@ -50,7 +50,8 @@ pub use compact::{
     context_window_for_model, estimate_context_tokens, format_compact_summary, get_compact_prompt,
     group_messages_for_compact, micro_compact_if_needed, reactive_compact,
     resolve_context_window, should_auto_compact, should_auto_compact_for_window, should_compact,
-    should_context_collapse, snip_compact,
+    should_context_collapse, snip_compact, auto_compact_threshold, summary_token_budget, Compaction,
+    CompactionRecord, CompactionTrigger, UsageMark,
 };
 pub use session_memory::{
     ExtractedMemory, MemoryCategory, SessionMemoryExtractor, SessionMemoryState,
@@ -58,7 +59,7 @@ pub use session_memory::{
 
 use claurst_api::{
     ApiMessage, ApiToolDefinition, AnthropicStreamEvent, CreateMessageRequest, StreamAccumulator,
-    StreamHandler, SystemPrompt, ThinkingConfig,
+    StreamHandler, SystemBlock, SystemPrompt,
 };
 use claurst_core::config::Config;
 use claurst_core::cost::CostTracker;
@@ -106,15 +107,20 @@ pub struct QueryConfig {
     pub degradation_enabled: bool,
     pub system_prompt: Option<String>,
     pub append_system_prompt: Option<String>,
+    /// Session context gathered at startup (date, git status, IDE context).
+    /// Sent in the dynamic system block, after the cached stable block.
+    pub session_context: Option<String>,
     pub output_style: claurst_core::system_prompt::OutputStyle,
     pub output_style_prompt: Option<String>,
     pub working_directory: Option<String>,
     pub thinking_budget: Option<u32>,
     pub temperature: Option<f32>,
-    /// Maximum cumulative character count of all tool results in the message
-    /// history before older results are replaced with a truncation notice.
-    /// Mirrors the TS `applyToolResultBudget` mechanism.  Default: 50_000.
-    pub tool_result_budget: usize,
+    /// Per-item cap, in bytes, applied to each tool result when it is
+    /// appended to the history: longer output keeps its head and tail with a
+    /// note giving the omitted size (issue #441). History is never rewritten
+    /// afterwards, so the prompt prefix stays stable. `0` disables the cap.
+    /// Default: [`DEFAULT_TOOL_RESULT_MAX_BYTES`] (~16k tokens).
+    pub tool_result_max_bytes: usize,
     /// Optional effort level.  When set and `thinking_budget` is `None`,
     /// the effort level's `thinking_budget_tokens()` is used as the
     /// thinking budget.  Also provides a temperature override when the
@@ -178,6 +184,11 @@ pub struct QueryConfig {
     /// Retry policy for transient model-request failures (#439): HTTP
     /// 408/409/425/429/5xx, dropped connections, stalled or truncated streams.
     pub retry: claurst_api::RetryConfig,
+    /// Automatic compaction (issue #441): the pre-request threshold check and
+    /// compact-and-retry on a provider context-window error. `false` (from
+    /// `--no-auto-compact`) leaves the history alone and surfaces overflow
+    /// errors; `/compact` still works.
+    pub auto_compact: bool,
 }
 
 impl Default for QueryConfig {
@@ -190,12 +201,13 @@ impl Default for QueryConfig {
             degradation_enabled: true,
             system_prompt: None,
             append_system_prompt: None,
+            session_context: None,
             output_style: claurst_core::system_prompt::OutputStyle::Default,
             output_style_prompt: None,
             working_directory: None,
             thinking_budget: None,
             temperature: None,
-            tool_result_budget: 50_000,
+            tool_result_max_bytes: DEFAULT_TOOL_RESULT_MAX_BYTES,
             effort_level: None,
             command_queue: None,
             skill_index: None,
@@ -209,6 +221,7 @@ impl Default for QueryConfig {
             enabled_tools: None,
             continuation: crate::continuation::ContinuationMode::Default,
             retry: claurst_api::RetryConfig::default(),
+            auto_compact: true,
         }
     }
 }
@@ -280,6 +293,12 @@ pub enum QueryEvent {
     /// `delay_ms` (#439). `attempt` is 1-based and at most `max_attempts`.
     /// Output streamed by the failed attempt is discarded.
     Retry { attempt: u32, max_attempts: u32, delay_ms: u64, reason: String },
+    /// The loop compacted the history (issue #441). The caller records the
+    /// entry in the session; `tokens_after` is the new context estimate.
+    Compacted(CompactionRecord),
+    /// Provider-reported subscription usage (0-100 per window), e.g. the
+    /// Codex `x-codex-*` rate-limit headers.
+    RateLimits { primary_used_percent: Option<f32>, secondary_used_percent: Option<f32> },
 }
 
 // ---------------------------------------------------------------------------
@@ -289,6 +308,14 @@ pub enum QueryEvent {
 // ---------------------------------------------------------------------------
 // Query loop
 // ---------------------------------------------------------------------------
+
+/// Default per-item cap for tool results appended to the history: 64k bytes,
+/// roughly 16k tokens. It sits above the largest tool-native output window
+/// (Read's 50 KiB page and Bash's 50 KiB window, each plus a continuation
+/// trailer) so the loop never re-cuts output a tool already bounded; cutting
+/// the middle of a Read page would hide the gap behind an intact offset
+/// trailer. It only catches tools without their own bound.
+pub const DEFAULT_TOOL_RESULT_MAX_BYTES: usize = 64_000;
 
 /// Maximum number of max_tokens continuation attempts before surfacing the
 /// partial response.  Mirrors `MAX_OUTPUT_TOKENS_RECOVERY_LIMIT` in query.ts.
@@ -425,6 +452,12 @@ pub async fn run_query_loop(
 
     let mut turn = 0u32;
     let mut compact_state = compact::AutoCompactState::default();
+    // Prompt-token count reported for the last request, anchoring the
+    // pre-request context projection. Cleared whenever history is compacted.
+    let mut last_usage: Option<compact::UsageMark> = None;
+    // One-shot guard: a context-window error compacts and retries the request
+    // once; a second overflow on the same request surfaces the error.
+    let mut overflow_recovery_used = false;
     // Tracks how many consecutive max_tokens recoveries we've attempted so
     // we don't loop forever on a model that can't finish within any budget.
     let mut max_tokens_recovery_count: u32 = 0;
@@ -667,28 +700,60 @@ pub async fn run_query_loop(
             }
         }
 
-        // Apply tool-result budget: if the cumulative size of all tool results
-        // in the conversation exceeds the configured threshold, replace the
-        // oldest results with a placeholder until we're back under budget.
-        // This mirrors the TS `applyToolResultBudget` call in query.ts.
-        if config.tool_result_budget > 0 {
-            let (budgeted, truncated) =
-                apply_tool_result_budget(std::mem::take(messages), config.tool_result_budget);
-            *messages = budgeted;
-            if truncated > 0 {
-                info!(
-                    truncated,
-                    budget = config.tool_result_budget,
-                    "Tool-result budget exceeded: truncated {} result(s)",
-                    truncated
-                );
-                if let Some(ref tx) = event_tx {
-                    let _ = tx.send(QueryEvent::Status(format!(
-                        "[{} older tool result(s) truncated to save context]",
-                        truncated
-                    )));
-                }
+        // Resolve where this request goes once, up front, so the compaction
+        // check below summarises through the same provider the request uses.
+        let route = config.provider_registry.as_deref().map(|registry| {
+            resolve_provider_route(registry, config, tool_ctx, &effective_model, client)
+        });
+
+        // Pre-request compaction check point (issue #441). It runs before
+        // every request, including the one that follows each tool batch, so
+        // a large batch of tool results is measured before it is sent.
+        //
+        // The window comes from the models.dev-backed registry (correct for
+        // every provider — 1M Gemini/GPT windows, 32k local models) with the
+        // Claude-centric heuristic as fallback (#216). The numerator anchors
+        // on the real prompt-token count of the last request and estimates
+        // only what was appended since (#231).
+        let context_window = compact::resolve_context_window(
+            config.model_registry.as_deref(),
+            route.as_ref().map_or_else(
+                || tool_ctx.config.provider.as_deref().unwrap_or("anthropic"),
+                |route| route.provider_id.as_str(),
+            ),
+            &effective_model,
+        );
+        let context_tokens = compact::estimate_context_tokens(messages, last_usage);
+
+        // Emit token warning events when approaching context limits.
+        // Thresholds mirror TypeScript autoCompact.ts: 80% → Warning, 95% → Critical.
+        let warning_state =
+            compact::calculate_token_warning_state_for_window(context_tokens, context_window);
+        if warning_state != compact::TokenWarningState::Ok {
+            if let Some(ref tx) = event_tx {
+                let _ = tx.send(QueryEvent::TokenWarning {
+                    state: warning_state,
+                    pct_used: context_tokens as f64 / context_window as f64,
+                });
             }
+        }
+
+        if config.auto_compact
+            && compact_before_request(
+                messages,
+                route.as_ref(),
+                client,
+                &effective_model,
+                context_tokens,
+                context_window,
+                config.max_tokens,
+                &mut compact_state,
+                event_tx.as_ref(),
+                &cancel_token,
+            )
+            .await
+        {
+            last_usage = None;
         }
 
         // Request-boundary invariant pass (issue #229 / MI-2). Compaction,
@@ -723,8 +788,11 @@ pub async fn run_query_loop(
         let effective_effort_level =
             effective_effort_for_turn(config.effort_level, messages.as_slice());
 
-        // Verification nudge: if there are incomplete todos for this session
-        // and the conversation has more than 2 turns, append a reminder.
+        // Assemble the [stable, dynamic] system blocks. Everything that varies
+        // per turn (todo nudge, goal and ultracode addenda, the transient
+        // output-style persona) is routed into the dynamic block through
+        // `append_system_prompt` / `output_style`, so the stable block stays
+        // byte-identical across turns and keeps its prompt-cache entry.
         let system = {
             // Build a (possibly patched) config for system-prompt assembly.
             // Agent prompt prefix and todo nudge are both applied here.
@@ -766,7 +834,7 @@ pub async fn run_query_loop(
             if turn > 2 {
                 let nudge = build_todo_nudge(&tool_ctx.session_id);
                 if !nudge.is_empty() {
-                    patched.append_system_prompt = Some(match &config.append_system_prompt {
+                    patched.append_system_prompt = Some(match patched.append_system_prompt.take() {
                         Some(existing) => format!("{}\n\n{}", existing, nudge),
                         None => nudge,
                     });
@@ -833,12 +901,26 @@ pub async fn run_query_loop(
             effective_effort_level.and_then(|el| el.thinking_budget_tokens())
         });
 
-        if let Some(budget) = effective_thinking_budget {
-            req_builder = req_builder.thinking(ThinkingConfig::enabled(budget));
+        // Claude reasoning controls: adaptive thinking + `output_config.effort`
+        // on current models, `budget_tokens` on older ones (one table in
+        // `claurst_api::anthropic_reasoning`). Non-Claude models fall into the
+        // budget branch, which is the previous behaviour.
+        let anthropic_reasoning = claurst_api::anthropic_reasoning(
+            &effective_model,
+            effective_effort_level,
+            effective_thinking_budget,
+        );
+        let thinking_is_adaptive = anthropic_reasoning.is_adaptive();
+        if let Some(thinking) = anthropic_reasoning.thinking {
+            req_builder = req_builder.thinking(thinking);
+        }
+        if let Some(effort) = anthropic_reasoning.effort {
+            req_builder = req_builder.effort(effort);
         }
 
         // Apply temperature: explicit config value takes precedence, then agent override,
-        // then effort-level override.
+        // then effort-level override (not for adaptive-thinking models, which
+        // reject sampling parameters alongside thinking).
         let effective_temperature = config.temperature
             .or_else(|| {
                 config.agent_definition.as_ref()
@@ -846,13 +928,19 @@ pub async fn run_query_loop(
                     .map(|t| t as f32)
             })
             .or_else(|| {
-                effective_effort_level.and_then(|el| el.temperature())
+                effective_effort_level
+                    .filter(|_| !thinking_is_adaptive)
+                    .and_then(|el| el.temperature())
             });
         if let Some(t) = effective_temperature {
             req_builder = req_builder.temperature(t);
         }
 
-        let request = req_builder.build();
+        // `request` is only ever sent through the Anthropic client below (the
+        // provider dispatch path builds its own `ProviderRequest`), so the
+        // Anthropic prompt-cache breakpoints are placed here unconditionally.
+        let mut request = req_builder.build();
+        request.apply_cache_breakpoints();
 
         // Create a stream handler that forwards to the event channel
         let handler: Arc<dyn StreamHandler> = if let Some(ref tx) = event_tx {
@@ -862,132 +950,16 @@ pub async fn run_query_loop(
             Arc::new(claurst_api::streaming::NullStreamHandler)
         };
 
-        // Non-Anthropic provider dispatch: if the model is "provider/model"
-        // format and the registry has that provider, use it directly.
-        //
-        // Provider resolution priority:
-        //   1. Explicit "provider/model" format in the model string
-        //   2. config.provider setting (from --provider flag or settings.json)
-        //   3. Model registry lookup (e.g. "gemini-3-flash-preview" → google)
-        //   4. Default to "anthropic"
-        if let Some(ref registry) = config.provider_registry {
-            let (provider_id_str, model_id_str) = if let Some(p) = tool_ctx.config.provider.as_deref().filter(|p| *p != "anthropic") {
-                // Explicit non-Anthropic provider in config — use it.
-                // If the stored model is in canonical "provider/model" form,
-                // strip the top-level provider prefix before sending it to the
-                // provider adapter. If it contains an additional slash
-                // (e.g. "meta-llama/Llama-3.3..." on OpenRouter), preserve it.
-                let provider_prefix = format!("{}/", p);
-                let model_id = effective_model
-                    .strip_prefix(&provider_prefix)
-                    .unwrap_or(&effective_model)
-                    .to_string();
-                (p.to_string(), model_id)
-            } else if let Some((p, m)) = effective_model.split_once('/') {
-                // No explicit provider but model has "provider/model" format.
-                // Check whether `p` is a known provider or just a model
-                // namespace (e.g. "meta-llama/Llama-3" on OpenRouter).
-                let known_providers = [
-                    // Native (non-OpenAI-compat) providers
-                    "anthropic", "openai", "google", "azure", "amazon-bedrock",
-                    "github-copilot", "codex", "openai-codex", "cohere", "minimax",
-                    // Local / self-hosted
-                    "ollama",
-                    "lmstudio", "lm-studio",
-                    "llamacpp", "llama-cpp", "llama-server",
-                    // OpenAI-compat cloud providers
-                    "groq", "mistral", "deepseek", "xai", "perplexity", "cerebras",
-                    "openrouter", "togetherai", "together-ai", "deepinfra", "venice",
-                    "huggingface", "nvidia", "fireworks", "sambanova",
-                    // Additional OpenAI-compat providers
-                    "qwen", "alibaba", "siliconflow",
-                    "moonshot", "moonshotai",
-                    "zhipu", "zhipuai",
-                    "zai",
-                    "nebius", "novita", "ovhcloud", "scaleway",
-                    "vultr", "vultr-ai",
-                    "baseten", "friendli", "upstage", "stepfun",
-                ];
-                if known_providers.contains(&p) {
-                    (p.to_string(), m.to_string())
-                } else {
-                    // Treat the whole string as the model ID, fall through
-                    // to auto-detection below.
-                    let fallback_provider = tool_ctx.config.provider.as_deref().unwrap_or("anthropic");
-                    (fallback_provider.to_string(), effective_model.clone())
-                }
-            } else {
-                // No explicit provider set (or set to "anthropic"): try the
-                // model registry to auto-detect provider from the model name.
-                // Use the shared model registry from QueryConfig if available;
-                // otherwise construct a temporary one.
-                let temp_reg;
-                let model_reg: &claurst_api::ModelRegistry = if let Some(ref shared) = config.model_registry {
-                    shared
-                } else {
-                    temp_reg = {
-                        let mut r = claurst_api::ModelRegistry::new();
-                        if let Some(cache_dir) = dirs::cache_dir() {
-                            let cache_path = cache_dir.join("claurst").join("models_dev.json");
-                            r.load_cache(&cache_path);
-                        }
-                        r
-                    };
-                    &temp_reg
-                };
-                if let Some(detected_pid) = model_reg.find_provider_for_model(&effective_model) {
-                    let pid_str = detected_pid.to_string();
-                    if pid_str != "anthropic" {
-                        (pid_str, effective_model.clone())
-                    } else {
-                        ("anthropic".to_string(), effective_model.clone())
-                    }
-                } else {
-                    // Fall back to config.provider (may be "anthropic" or None→"anthropic")
-                    let p = tool_ctx.config.provider.as_deref().unwrap_or("anthropic");
-                    (p.to_string(), effective_model.clone())
-                }
-            };
-
-            // Dispatch through the provider path for non-Anthropic providers,
-            // AND for Anthropic when the pre-built client has no API key
-            // (user started without ANTHROPIC_API_KEY but added one via /connect).
-            let use_provider_dispatch = provider_id_str != "anthropic"
-                || client.api_key_is_empty();
-
+        // Non-Anthropic provider dispatch through the route resolved at the
+        // top of this iteration (see `resolve_provider_route`).
+        if let Some(route) = route {
+            let ProviderRoute {
+                provider_id: provider_id_str,
+                model_id: model_id_str,
+                use_provider_dispatch,
+                provider,
+            } = route;
             if use_provider_dispatch {
-                let pid = claurst_core::provider_id::ProviderId::new(&provider_id_str);
-
-                // Always prefer a fresh provider built from the auth_store so
-                // that keys added at runtime via /connect are picked up
-                // immediately — even when the provider was pre-registered at
-                // startup with a stale or missing key.
-                let runtime_provider =
-                    claurst_api::registry::runtime_provider_for(&provider_id_str);
-
-                let registry_provider = if runtime_provider.is_some() {
-                    // Fresh auth_store key available — use it instead of the
-                    // (possibly stale) registry entry.
-                    None
-                } else {
-                    registry.get(&pid).cloned()
-                };
-
-                let mut provider = runtime_provider.or(registry_provider);
-
-                // Rebuild providers using the unified base resolver so overrides
-                // from settings/env/defaults are applied consistently.
-                if claurst_api::registry::resolve_provider_api_base(
-                    &tool_ctx.config,
-                    &provider_id_str,
-                ).is_some() {
-                    if let Some(overridden) = claurst_api::registry::provider_from_config(
-                        &tool_ctx.config,
-                        &provider_id_str,
-                    ) {
-                        provider = Some(overridden);
-                    }
-                }
                 if let Some(provider) = provider {
                     debug!(provider = %provider_id_str, model = %model_id_str, "Dispatching to non-Anthropic provider");
 
@@ -1057,18 +1029,38 @@ pub async fn run_query_loop(
                         top_p: None,
                         top_k: None,
                         stop_sequences: vec![],
-                        thinking: if caps.thinking {
+                        thinking: if !caps.thinking {
+                            None
+                        } else if provider_id_str == "anthropic" {
+                            claurst_api::anthropic_reasoning(
+                                &model_id_str,
+                                effective_effort_level,
+                                effective_thinking_budget,
+                            )
+                            .thinking
+                        } else {
                             effective_thinking_budget
                                 .map(claurst_api::ThinkingConfig::enabled)
-                        } else {
-                            None
                         },
-                        provider_options: build_provider_options(
-                            &provider_id_str,
-                            &model_id_str,
-                            effective_effort_level,
-                            effective_thinking_budget,
-                        ),
+                        provider_options: {
+                            let mut options = build_provider_options(
+                                &provider_id_str,
+                                &model_id_str,
+                                effective_effort_level,
+                                effective_thinking_budget,
+                            );
+                            // ChatGPT routes its prompt cache on a stable
+                            // per-session key (official client: session id).
+                            if matches!(provider_id_str.as_str(), "codex" | "openai-codex") {
+                                if let Some(map) = options.as_object_mut() {
+                                    map.insert(
+                                        "prompt_cache_key".to_string(),
+                                        serde_json::json!(tool_ctx.session_id),
+                                    );
+                                }
+                            }
+                            options
+                        },
                     };
 
                     // Use create_message_stream so the TUI receives real-time
@@ -1080,6 +1072,27 @@ pub async fn run_query_loop(
                     let mut stream = match connect {
                         Ok(s) => s,
                         Err(e) => {
+                            // Context-window error: compact once and retry,
+                            // before the transient-retry policy (#441, #439).
+                            if config.auto_compact
+                                && !overflow_recovery_used
+                                && provider_error_is_overflow(&e)
+                            {
+                                overflow_recovery_used = true;
+                                if compact_after_overflow(
+                                    messages,
+                                    provider.as_ref(),
+                                    &model_id_str,
+                                    config.max_tokens,
+                                    event_tx.as_ref(),
+                                )
+                                .await
+                                {
+                                    last_usage = None;
+                                    turn -= 1;
+                                    continue;
+                                }
+                            }
                             if let claurst_api::RetryDecision::Retry { after } =
                                 claurst_api::retry::classify_provider_error(&e)
                             {
@@ -1095,6 +1108,9 @@ pub async fn run_query_loop(
                     // Accumulate reasoning/thinking content for providers like
                     // DeepSeek that require reasoning_content to be sent back.
                     let mut thinking_chunks: Vec<String> = Vec::new();
+                    // Opaque reasoning state (Codex `encrypted_content`)
+                    // that must be replayed on the next request.
+                    let mut redacted_thinking_blocks: Vec<ContentBlock> = Vec::new();
                     // tool_call_blocks: index → (id, name, accumulated_json, thought_signature)
                     // thought_signature carries Gemini's opaque per-call signature
                     // through stream assembly so it survives into the persisted
@@ -1116,8 +1132,12 @@ pub async fn run_query_loop(
                     // Set when the stream yields a mid-stream `Err`. The
                     // accumulated text/tool-calls are then incomplete and MUST
                     // NOT be assembled into a "completed" turn (issue #215).
-                    let mut provider_stream_error: Option<(String, claurst_api::RetryDecision)> =
-                        None;
+                    // The error is kept for the overflow check; the decision
+                    // drives the retry policy (#439).
+                    let mut provider_stream_error: Option<(
+                        claurst_api::ProviderError,
+                        claurst_api::RetryDecision,
+                    )> = None;
 
                     loop {
                         tokio::select! {
@@ -1134,10 +1154,8 @@ pub async fn run_query_loop(
                                     None => break,
                                     Some(Err(e)) => {
                                         error!(provider = %provider_id_str, error = %e, "Provider stream error");
-                                        provider_stream_error = Some((
-                                            e.to_string(),
-                                            claurst_api::retry::classify_provider_error(&e),
-                                        ));
+                                        let decision = claurst_api::retry::classify_provider_error(&e);
+                                        provider_stream_error = Some((e, decision));
                                         break;
                                     }
                                     Some(Ok(evt)) => {
@@ -1159,6 +1177,12 @@ pub async fn run_query_loop(
                                                 content_block: ContentBlock::ToolUse { id, name, thought_signature, .. },
                                             } => {
                                                 tool_call_blocks.insert(*index, (id.clone(), name.clone(), String::new(), thought_signature.clone()));
+                                            }
+                                            claurst_api::StreamEvent::ContentBlockStart {
+                                                content_block: block @ ContentBlock::RedactedThinking { .. },
+                                                ..
+                                            } => {
+                                                redacted_thinking_blocks.push(block.clone());
                                             }
                                             claurst_api::StreamEvent::TextDelta { text, .. } => {
                                                 text_chunks.push(text.clone());
@@ -1195,10 +1219,22 @@ pub async fn run_query_loop(
                                             claurst_api::StreamEvent::Error { error_type, message } => {
                                                 error!(provider = %provider_id_str, error_type, message, "Provider in-band stream error");
                                                 provider_stream_error = Some((
-                                                    format!("{error_type}: {message}"),
+                                                    claurst_api::ProviderError::StreamError {
+                                                        provider: provider.id().clone(),
+                                                        message: format!("{error_type}: {message}"),
+                                                        partial_response: None,
+                                                    },
                                                     claurst_api::retry::classify_stream_error(error_type, message),
                                                 ));
                                                 break;
+                                            }
+                                            claurst_api::StreamEvent::RateLimits { primary_used_percent, secondary_used_percent } => {
+                                                if let Some(ref tx) = event_tx {
+                                                    let _ = tx.send(QueryEvent::RateLimits {
+                                                        primary_used_percent: *primary_used_percent,
+                                                        secondary_used_percent: *secondary_used_percent,
+                                                    });
+                                                }
                                             }
                                             _ => {}
                                         }
@@ -1226,11 +1262,31 @@ pub async fn run_query_loop(
                     // tool-call JSON are incomplete/untrustworthy. Do NOT fall
                     // through to assemble and execute tools from a truncated
                     // stream (issue #215 — an Edit/Write could otherwise run
-                    // with empty `{}` args). Retry transient failures per the
-                    // shared policy; otherwise surface a QueryOutcome::Error.
+                    // with empty `{}` args). A context-window error compacts
+                    // once and retries; other failures follow the shared
+                    // retry policy, else surface a QueryOutcome::Error.
                     if let Some((err, decision)) = provider_stream_error {
+                        if config.auto_compact
+                            && !overflow_recovery_used
+                            && provider_error_is_overflow(&err)
+                        {
+                            overflow_recovery_used = true;
+                            if compact_after_overflow(
+                                messages,
+                                provider.as_ref(),
+                                &model_id_str,
+                                config.max_tokens,
+                                event_tx.as_ref(),
+                            )
+                            .await
+                            {
+                                last_usage = None;
+                                turn -= 1;
+                                continue;
+                            }
+                        }
                         if let claurst_api::RetryDecision::Retry { after } = decision {
-                            retry_turn!(err.clone(), after);
+                            retry_turn!(err.to_string(), after);
                         }
                         error!(
                             provider = %provider_id_str,
@@ -1266,6 +1322,7 @@ pub async fn run_query_loop(
                             signature: String::new(),
                         });
                     }
+                    content_blocks.append(&mut redacted_thinking_blocks);
 
                     let combined_text = text_chunks.join("");
                     if !combined_text.is_empty() {
@@ -1318,6 +1375,11 @@ pub async fn run_query_loop(
                         usage.cache_creation_input_tokens,
                         usage.cache_read_input_tokens,
                     );
+                    last_usage = Some(compact::UsageMark {
+                        prompt_tokens: usage.total_input(),
+                        message_count: messages.len(),
+                    });
+                    overflow_recovery_used = false;
 
                     messages.push(assistant_msg.clone());
 
@@ -1364,7 +1426,10 @@ pub async fn run_query_loop(
                             }
                             tool_results.push(ContentBlock::ToolResult {
                                 tool_use_id: tool_id,
-                                content: claurst_core::types::ToolResultContent::Text(result.content),
+                                content: tool_result_for_history(
+                                    result.content,
+                                    config.tool_result_max_bytes,
+                                ),
                                 is_error: Some(result.is_error),
                             });
                         }
@@ -1467,6 +1532,28 @@ pub async fn run_query_loop(
         let mut stream_rx = match connect {
             Ok(rx) => rx,
             Err(e) => {
+                // Context-window error: compact once and retry, before the
+                // transient-retry policy (#441, #439).
+                if config.auto_compact
+                    && !overflow_recovery_used
+                    && claude_error_is_overflow(&e)
+                {
+                    overflow_recovery_used = true;
+                    let summariser = anthropic_summariser(client);
+                    if compact_after_overflow(
+                        messages,
+                        &summariser,
+                        &effective_model,
+                        config.max_tokens,
+                        event_tx.as_ref(),
+                    )
+                    .await
+                    {
+                        last_usage = None;
+                        turn -= 1;
+                        continue;
+                    }
+                }
                 if let claurst_api::RetryDecision::Retry { after } =
                     claurst_api::retry::classify_claude_error(&e)
                 {
@@ -1514,6 +1601,8 @@ pub async fn run_query_loop(
         let mut saw_message_stop = false;
         let stall_deadline = tokio::time::sleep(STALL_TIMEOUT);
         tokio::pin!(stall_deadline);
+        // Set when the stream reports a context-window error event.
+        let mut stream_overflow = false;
 
         let stream_stalled = loop {
             tokio::select! {
@@ -1534,6 +1623,9 @@ pub async fn run_query_loop(
                                 AnthropicStreamEvent::Error { error_type, message } => {
                                     if error_type == "overloaded_error" {
                                         warn!(model = %effective_model, "API overloaded");
+                                    }
+                                    if claurst_api::is_context_overflow(message) {
+                                        stream_overflow = true;
                                     }
                                     error!(error_type, message, "Stream error");
                                     stream_error = Some((error_type.clone(), message.clone()));
@@ -1561,6 +1653,29 @@ pub async fn run_query_loop(
                 "Stream stalled (model '{}'): {}",
                 effective_model, reason
             )));
+        }
+        // A context-window error mid-stream: compact once and retry (before
+        // the transient-retry policy); if that is not possible, surface it
+        // rather than a partial turn.
+        if stream_overflow {
+            if config.auto_compact && !overflow_recovery_used {
+                overflow_recovery_used = true;
+                let summariser = anthropic_summariser(client);
+                if compact_after_overflow(
+                    messages,
+                    &summariser,
+                    &effective_model,
+                    config.max_tokens,
+                    event_tx.as_ref(),
+                )
+                .await
+                {
+                    last_usage = None;
+                    turn -= 1;
+                    continue;
+                }
+            }
+            return QueryOutcome::Error(ClaudeError::ContextWindowExceeded);
         }
         if let Some((error_type, message)) = stream_error {
             let decision = claurst_api::retry::classify_stream_error(&error_type, &message);
@@ -1593,6 +1708,11 @@ pub async fn run_query_loop(
             usage.cache_creation_input_tokens,
             usage.cache_read_input_tokens,
         );
+        last_usage = Some(compact::UsageMark {
+            prompt_tokens: usage.total_input(),
+            message_count: messages.len(),
+        });
+        overflow_recovery_used = false;
 
         // Budget guard: abort the loop if the configured USD cap is exceeded.
         if let Some(limit) = config.max_budget_usd {
@@ -1656,128 +1776,6 @@ pub async fn run_query_loop(
                 for err_msg in hook_result.blocking_errors {
                     debug!("PostModelTurn hook injecting error message");
                     messages.push(err_msg);
-                }
-            }
-        }
-
-        // Resolve the effective context window ONCE per turn for the active
-        // provider+model. Prefer the models.dev-backed registry value (correct
-        // for every provider — 1M Gemini/GPT windows, 32k local models) and
-        // fall back to the Claude-centric heuristic only when the registry has
-        // no usable entry. All threshold logic below keys off this. (#216)
-        let context_window = compact::resolve_context_window(
-            config.model_registry.as_deref(),
-            tool_ctx.config.provider.as_deref().unwrap_or("anthropic"),
-            &config.model,
-        );
-
-        // Numerator for every threshold below: prefer the REAL context-token
-        // count the provider just reported (input + cache-read + cache-creation
-        // = what the model actually saw) over the chars/4 estimate. With prompt
-        // caching the bare `input_tokens` field undercounts badly. Fall back to
-        // the estimate only before the first response / when usage is absent. (#231)
-        let real_usage = usage.total_input();
-        let context_tokens = compact::estimate_context_tokens(
-            messages,
-            (real_usage > 0).then_some(real_usage),
-        );
-
-        // Emit token warning events when approaching context limits.
-        // Thresholds mirror TypeScript autoCompact.ts: 80% → Warning, 95% → Critical.
-        {
-            let warning_state = compact::calculate_token_warning_state_for_window(
-                context_tokens,
-                context_window,
-            );
-            if warning_state != compact::TokenWarningState::Ok {
-                if let Some(ref tx) = event_tx {
-                    let pct_used = context_tokens as f64 / context_window as f64;
-                    let _ = tx.send(QueryEvent::TokenWarning {
-                        state: warning_state,
-                        pct_used,
-                    });
-                }
-            }
-        }
-
-        // Auto-compact: if context is near-full, summarise older messages now
-        // (before the next turn's API call would fail with prompt-too-long).
-        //
-        // Reactive compact (T1-1): when the CLAUDE_REACTIVE_COMPACT feature gate
-        // is enabled, we replace the proactive auto-compact path with reactive
-        // compact / context-collapse instead. This fires on every streaming turn
-        // so it can act before a prompt-too-long error is returned by the API.
-        //
-        // Feature gate check: CLAURST_FEATURE_REACTIVE_COMPACT=1
-        let reactive_compact_enabled =
-            claurst_core::feature_gates::is_feature_enabled("reactive_compact");
-
-        if reactive_compact_enabled {
-            // Reactive path: emergency collapse takes priority over normal compact.
-            let context_limit = context_window;
-            if compact::should_context_collapse(context_tokens, context_limit) {
-                if let Some(ref tx) = event_tx {
-                    let _ = tx.send(QueryEvent::Status(
-                        "Compacting context... (emergency collapse)".to_string(),
-                    ));
-                }
-                // Pass a clone so the live conversation survives a failed
-                // compaction; `*messages` is only overwritten on success (#213).
-                let outcome =
-                    compact::context_collapse(messages.clone(), client, config).await;
-                match apply_compact_result(messages, outcome) {
-                    Ok(tokens_freed) => {
-                        info!(tokens_freed, "Context-collapse complete");
-                    }
-                    Err(e) => {
-                        // `*messages` is left untouched — the conversation is intact.
-                        warn!(error = %e, "Context-collapse failed; conversation preserved");
-                    }
-                }
-            } else if compact::should_compact(context_tokens, context_limit) {
-                if let Some(ref tx) = event_tx {
-                    let _ = tx.send(QueryEvent::Status("Compacting context...".to_string()));
-                }
-                // Pass a clone so the live conversation survives a failed
-                // compaction; `*messages` is only overwritten on success (#213).
-                let outcome = compact::reactive_compact(
-                    messages.clone(),
-                    client,
-                    config,
-                    cancel_token.clone(),
-                    &[],
-                )
-                .await;
-                match apply_compact_result(messages, outcome) {
-                    Ok(tokens_freed) => {
-                        info!(tokens_freed, "Reactive compact complete");
-                    }
-                    // `*messages` is left untouched on both failure arms below.
-                    Err(claurst_core::error::ClaudeError::Cancelled) => {
-                        warn!("Reactive compact was cancelled; conversation preserved");
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "Reactive compact failed; conversation preserved");
-                    }
-                }
-            }
-        } else if stop == "end_turn" || stop == "tool_use" {
-            // Proactive auto-compact (original path, used when reactive compact is off).
-            if let Some(new_msgs) = compact::auto_compact_if_needed(
-                client,
-                messages,
-                context_tokens,
-                &config.model,
-                context_window,
-                &mut compact_state,
-            )
-            .await
-            {
-                *messages = new_msgs;
-                if let Some(ref tx) = event_tx {
-                    let _ = tx.send(QueryEvent::Status(
-                        "Context compacted to stay within limits.".to_string(),
-                    ));
                 }
             }
         }
@@ -2143,7 +2141,10 @@ pub async fn run_query_loop(
 
                     result_blocks.push(ContentBlock::ToolResult {
                         tool_use_id: p.id.clone(),
-                        content: ToolResultContent::Text(result.content),
+                        content: tool_result_for_history(
+                            result.content,
+                            config.tool_result_max_bytes,
+                        ),
                         is_error: if result.is_error { Some(true) } else { None },
                     });
                 }
@@ -2288,12 +2289,13 @@ mod tests {
             degradation_enabled: true,
             system_prompt: sys.map(String::from),
             append_system_prompt: append.map(String::from),
+            session_context: None,
             output_style: claurst_core::system_prompt::OutputStyle::Default,
             output_style_prompt: None,
             working_directory: None,
             thinking_budget: None,
             temperature: None,
-            tool_result_budget: 50_000,
+            tool_result_max_bytes: DEFAULT_TOOL_RESULT_MAX_BYTES,
             effort_level: None,
             command_queue: None,
             skill_index: None,
@@ -2307,6 +2309,7 @@ mod tests {
             enabled_tools: None,
             continuation: crate::continuation::ContinuationMode::Default,
             retry: claurst_api::RetryConfig::default(),
+            auto_compact: true,
         }
     }
 
@@ -2367,103 +2370,81 @@ mod tests {
 
     // ---- build_system_prompt tests ------------------------------------------
 
+    /// Unwrap the `[stable, dynamic]` system blocks and assert that the
+    /// internal boundary marker reaches neither of them.
+    fn prompt_halves(prompt: SystemPrompt) -> (String, String) {
+        let SystemPrompt::Blocks(blocks) = prompt else {
+            panic!("expected [stable, dynamic] system blocks");
+        };
+        assert_eq!(blocks.len(), 2, "expected exactly two system blocks");
+        for block in &blocks {
+            assert!(
+                !block.text.contains(claurst_core::system_prompt::SYSTEM_PROMPT_DYNAMIC_BOUNDARY),
+                "the boundary marker must never be sent to the model"
+            );
+        }
+        (blocks[0].text.clone(), blocks[1].text.clone())
+    }
+
     #[test]
     fn test_system_prompt_default_when_empty() {
         // The default prompt (no custom system prompt set) should include the
-        // Claurst attribution and standard sections.
+        // Claurst attribution and standard sections in the stable block.
         let cfg = make_config(None, None);
-        let prompt = build_system_prompt(&cfg);
-        if let SystemPrompt::Text(text) = prompt {
-            assert!(
-                text.contains("Claurst") || text.contains("Claude agent"),
-                "Default prompt should contain attribution: {}",
-                text
-            );
-            assert!(
-                text.contains(claurst_core::system_prompt::SYSTEM_PROMPT_DYNAMIC_BOUNDARY),
-                "Default prompt must contain the dynamic boundary marker"
-            );
-        } else {
-            panic!("Expected SystemPrompt::Text");
-        }
+        let (stable, _dynamic) = prompt_halves(build_system_prompt(&cfg));
+        assert!(
+            stable.contains("Claurst") || stable.contains("Claude agent"),
+            "Default prompt should contain attribution: {}",
+            stable
+        );
     }
 
     #[test]
     fn test_system_prompt_with_custom() {
-        // A custom system prompt is injected into the cacheable section as
+        // A custom system prompt is injected into the stable block as
         // <custom_instructions>; the default sections are still present.
         let cfg = make_config(Some("You are a code reviewer."), None);
-        let prompt = build_system_prompt(&cfg);
-        if let SystemPrompt::Text(text) = prompt {
-            assert!(
-                text.contains("You are a code reviewer."),
-                "Custom prompt text should appear in the output"
-            );
-            assert!(
-                text.contains("Claurst") || text.contains("Claude agent"),
-                "Default attribution should still be present"
-            );
-        } else {
-            panic!("Expected SystemPrompt::Text");
-        }
+        let (stable, _dynamic) = prompt_halves(build_system_prompt(&cfg));
+        assert!(
+            stable.contains("You are a code reviewer."),
+            "Custom prompt text should appear in the stable block"
+        );
+        assert!(
+            stable.contains("Claurst") || stable.contains("Claude agent"),
+            "Default attribution should still be present"
+        );
     }
 
     #[test]
     fn test_system_prompt_with_append() {
-        // Appended text lands after the dynamic boundary.
+        // Appended text lands in the dynamic block.
         let cfg = make_config(Some("Base prompt."), Some("Additional context."));
-        let prompt = build_system_prompt(&cfg);
-        if let SystemPrompt::Text(text) = prompt {
-            assert!(text.contains("Base prompt."));
-            assert!(text.contains("Additional context."));
-            // append_system_prompt appears after the boundary
-            let boundary_pos = text
-                .find(claurst_core::system_prompt::SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
-                .expect("boundary must exist");
-            let append_pos = text.find("Additional context.").unwrap();
-            assert!(
-                append_pos > boundary_pos,
-                "Appended text must appear after the dynamic boundary"
-            );
-        } else {
-            panic!("Expected SystemPrompt::Text");
-        }
+        let (stable, dynamic) = prompt_halves(build_system_prompt(&cfg));
+        assert!(stable.contains("Base prompt."));
+        assert!(!stable.contains("Additional context."));
+        assert!(dynamic.contains("Additional context."));
     }
 
     #[test]
     fn test_system_prompt_append_only() {
         // When only append is set, default sections are present plus the
-        // appended text after the dynamic boundary.
+        // appended text in the dynamic block.
         let cfg = make_config(None, Some("Appended text."));
-        let prompt = build_system_prompt(&cfg);
-        if let SystemPrompt::Text(text) = prompt {
-            assert!(
-                text.contains("Appended text."),
-                "Appended text must appear in the prompt"
-            );
-            let boundary_pos = text
-                .find(claurst_core::system_prompt::SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
-                .expect("boundary must exist");
-            let append_pos = text.find("Appended text.").unwrap();
-            assert!(
-                append_pos > boundary_pos,
-                "Appended text must appear after the dynamic boundary"
-            );
-        } else {
-            panic!("Expected SystemPrompt::Text");
-        }
+        let (stable, dynamic) = prompt_halves(build_system_prompt(&cfg));
+        assert!(!stable.contains("Appended text."));
+        assert!(
+            dynamic.contains("Appended text."),
+            "Appended text must appear in the dynamic block"
+        );
     }
 
     #[test]
     fn test_system_prompt_with_custom_output_style_prompt() {
         let mut cfg = make_config(None, None);
         cfg.output_style_prompt = Some("Answer like a pirate.".to_string());
-        let prompt = build_system_prompt(&cfg);
-        if let SystemPrompt::Text(text) = prompt {
-            assert!(text.contains("Answer like a pirate."));
-        } else {
-            panic!("Expected SystemPrompt::Text");
-        }
+        let (stable, dynamic) = prompt_halves(build_system_prompt(&cfg));
+        assert!(!stable.contains("Answer like a pirate."));
+        assert!(dynamic.contains("Answer like a pirate."));
     }
 
     // ---- QueryConfig tests --------------------------------------------------
@@ -2923,6 +2904,8 @@ mod tests {
         id: claurst_core::provider_id::ProviderId,
         /// One entry per request: `true` when its tool set was empty.
         tools_empty_per_request: Arc<StdMutex<Vec<bool>>>,
+        /// One entry per request: the system prompt it carried.
+        systems_per_request: Arc<StdMutex<Vec<Option<SystemPrompt>>>>,
         /// When true, always end the turn with text (ignores tools). Otherwise
         /// emit a `tool_use` while tools are present and end the turn once
         /// they're gone (so the degradation turn ends the loop).
@@ -2966,6 +2949,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(tools_empty);
+            self.systems_per_request
+                .lock()
+                .unwrap()
+                .push(request.system_prompt.clone());
 
             let msg_id = uuid::Uuid::new_v4().to_string();
             let emit_tool_use = !self.always_end_turn && !tools_empty;
@@ -3088,6 +3075,7 @@ mod tests {
         let provider = Arc::new(RecordingProvider {
             id: claurst_core::provider_id::ProviderId::new("mockprov"),
             tools_empty_per_request: recorded.clone(),
+            systems_per_request: Arc::new(StdMutex::new(Vec::new())),
             always_end_turn,
         });
         let mut registry = claurst_api::ProviderRegistry::new();
@@ -3141,6 +3129,73 @@ mod tests {
 
         let recorded = recorded.lock().unwrap().clone();
         (outcome, recorded, messages)
+    }
+
+    /// Issue #440: across a scripted multi-turn run the stable system block is
+    /// byte-identical on every request and never carries the boundary marker,
+    /// while per-session and per-turn content stays in the dynamic block.
+    #[tokio::test]
+    async fn stable_system_block_is_byte_identical_across_turns() {
+        let systems = Arc::new(StdMutex::new(Vec::new()));
+        let provider = Arc::new(RecordingProvider {
+            id: claurst_core::provider_id::ProviderId::new("mockprov"),
+            tools_empty_per_request: Arc::new(StdMutex::new(Vec::new())),
+            systems_per_request: systems.clone(),
+            always_end_turn: false,
+        });
+        let mut registry = claurst_api::ProviderRegistry::new();
+        registry.register(provider);
+
+        let client = claurst_api::AnthropicClient::new(claurst_api::client::ClientConfig {
+            api_key: "test-key".to_string(),
+            ..Default::default()
+        })
+        .expect("build test client");
+
+        let mut ctx = deny_all_context();
+        ctx.session_id = "cache-stability-test".to_string();
+        ctx.config.provider = Some("mockprov".to_string());
+
+        let mut config = make_config(Some("Project rules."), Some("Appended."));
+        config.model = "mock-model".to_string();
+        config.max_turns = 1;
+        config.session_context = Some("# Git Status\n## main".to_string());
+        config.output_style = claurst_core::system_prompt::OutputStyle::Concise;
+        config.provider_registry = Some(Arc::new(registry));
+
+        let mut messages = vec![Message::user("start")];
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_query_loop(
+                &client,
+                &mut messages,
+                &noop_tools(),
+                &ctx,
+                &config,
+                claurst_core::cost::CostTracker::new(),
+                None,
+                tokio_util::sync::CancellationToken::new(),
+                None,
+            ),
+        )
+        .await
+        .expect("loop must not hang");
+        assert!(matches!(outcome, QueryOutcome::EndTurn { .. }));
+
+        // Turn 1 uses a tool, turn 2 is the tool-less summary turn.
+        let systems = systems.lock().unwrap().clone();
+        assert_eq!(systems.len(), 2, "expected a two-turn run");
+        let halves: Vec<(String, String)> = systems
+            .into_iter()
+            .map(|system| prompt_halves(system.expect("system prompt sent")))
+            .collect();
+        let (stable, dynamic) = &halves[0];
+        assert_eq!(stable, &halves[1].0, "stable block changed between turns");
+        assert!(stable.contains("Project rules."));
+        for volatile in ["# Git Status", "maximally concise", "Appended."] {
+            assert!(!stable.contains(volatile), "{volatile:?} leaked into the stable block");
+            assert!(dynamic.contains(volatile), "{volatile:?} missing from the dynamic block");
+        }
     }
 
     /// (a) A non-goal turn that ends with `end_turn` stops after exactly one
@@ -3653,7 +3708,7 @@ mod tests {
         max_retries: u32,
         tools: Vec<Box<dyn Tool>>,
     ) -> ScriptedRun {
-        drive_scripted_with(steps, max_retries, tools, None, Vec::new()).await
+        drive_scripted_with(steps, max_retries, tools, None, Vec::new(), None).await
     }
 
     /// [`drive_scripted`] with an explicit turn cap and queued user messages
@@ -3664,6 +3719,7 @@ mod tests {
         tools: Vec<Box<dyn Tool>>,
         max_turns: Option<u32>,
         mut pending: Vec<String>,
+        history: Option<Vec<Message>>,
     ) -> ScriptedRun {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let provider = Arc::new(ScriptedProvider {
@@ -3697,7 +3753,7 @@ mod tests {
         }
 
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut messages = vec![Message::user("start")];
+        let mut messages = history.unwrap_or_else(|| vec![Message::user("start")]);
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(10),
             run_query_loop(
@@ -3947,6 +4003,7 @@ mod tests {
             noop_tools(),
             Some(0),
             vec!["typed during the attempt".to_string()],
+            None,
         )
         .await;
         assert!(matches!(run.outcome, QueryOutcome::EndTurn { .. }));
@@ -3957,5 +4014,351 @@ mod tests {
             .filter(|m| m.get_all_text() == MAX_STEPS_DEGRADATION_MSG)
             .count();
         assert_eq!(prompts, 1, "summary prompt must appear exactly once");
+    }
+
+    // ---- Issue #441: compaction check points --------------------------------
+
+    /// Scripted outcome for one main (non-summary) request.
+    #[derive(Clone, Copy)]
+    enum MainStep {
+        /// Fail with a provider context-window error.
+        Overflow,
+        /// End the turn with text.
+        Reply,
+    }
+
+    /// A provider double for compaction tests. Summarisation requests (the
+    /// summariser system prompt, no tools) get a canned summary; main requests
+    /// replay `script`. Every request is logged as `"summary"`, or as
+    /// `"main:compacted"` / `"main:plain"` depending on whether the history it
+    /// carried starts with a compaction summary.
+    struct CompactionProvider {
+        id: claurst_core::provider_id::ProviderId,
+        script: StdMutex<std::collections::VecDeque<MainStep>>,
+        log: Arc<StdMutex<Vec<String>>>,
+    }
+
+    fn scripted_text(
+        text: &str,
+    ) -> Vec<Result<claurst_api::StreamEvent, claurst_api::ProviderError>> {
+        use claurst_api::provider_types::StopReason;
+        use claurst_api::StreamEvent;
+        vec![
+            Ok(StreamEvent::MessageStart {
+                id: uuid::Uuid::new_v4().to_string(),
+                model: "mock-model".to_string(),
+                usage: UsageInfo::default(),
+            }),
+            Ok(StreamEvent::TextDelta { index: 0, text: text.to_string() }),
+            Ok(StreamEvent::MessageDelta {
+                stop_reason: Some(StopReason::EndTurn),
+                usage: Some(UsageInfo::default()),
+            }),
+            Ok(StreamEvent::MessageStop),
+        ]
+    }
+
+    #[async_trait::async_trait]
+    impl claurst_api::LlmProvider for CompactionProvider {
+        fn id(&self) -> &claurst_core::provider_id::ProviderId {
+            &self.id
+        }
+        fn name(&self) -> &str {
+            "compaction-mock"
+        }
+
+        async fn create_message(
+            &self,
+            _request: claurst_api::ProviderRequest,
+        ) -> Result<claurst_api::ProviderResponse, claurst_api::ProviderError> {
+            unimplemented!("compaction only uses create_message_stream")
+        }
+
+        async fn create_message_stream(
+            &self,
+            request: claurst_api::ProviderRequest,
+        ) -> Result<
+            std::pin::Pin<
+                Box<
+                    dyn futures::Stream<
+                            Item = Result<claurst_api::StreamEvent, claurst_api::ProviderError>,
+                        > + Send,
+                >,
+            >,
+            claurst_api::ProviderError,
+        > {
+            let is_summary = matches!(
+                &request.system_prompt,
+                Some(claurst_api::SystemPrompt::Text(text)) if text.contains("conversation summaries")
+            );
+            if is_summary {
+                self.log.lock().unwrap().push("summary".to_string());
+                return Ok(Box::pin(futures::stream::iter(scripted_text(
+                    "<summary>Earlier work, condensed.</summary>",
+                ))));
+            }
+
+            let compacted = request
+                .messages
+                .first()
+                .is_some_and(|m| m.get_all_text().contains("<compact-summary>"));
+            self.log.lock().unwrap().push(
+                if compacted { "main:compacted" } else { "main:plain" }.to_string(),
+            );
+            let step = self.script.lock().unwrap().pop_front().unwrap_or(MainStep::Reply);
+            match step {
+                MainStep::Overflow => Err(claurst_api::ProviderError::ContextOverflow {
+                    provider: self.id.clone(),
+                    message: "prompt is too long".to_string(),
+                    max_tokens: None,
+                }),
+                MainStep::Reply => Ok(Box::pin(futures::stream::iter(scripted_text("done")))),
+            }
+        }
+
+        async fn health_check(
+            &self,
+        ) -> Result<claurst_api::ProviderStatus, claurst_api::ProviderError> {
+            Ok(claurst_api::ProviderStatus::Healthy)
+        }
+
+        fn capabilities(&self) -> claurst_api::ProviderCapabilities {
+            claurst_api::ProviderCapabilities {
+                streaming: true,
+                tool_calling: true,
+                thinking: false,
+                image_input: false,
+                pdf_input: false,
+                audio_input: false,
+                video_input: false,
+                caching: false,
+                structured_output: false,
+                system_prompt_style: claurst_api::SystemPromptStyle::TopLevel,
+            }
+        }
+    }
+
+    /// `count` alternating user/assistant messages of `size` chars each,
+    /// starting and ending with a user message (`count` must be odd).
+    fn long_history(count: usize, size: usize) -> Vec<Message> {
+        (0..count)
+            .map(|i| {
+                let text = format!("turn {} {}", i, "x".repeat(size));
+                if i % 2 == 0 { Message::user(text) } else { Message::assistant(text) }
+            })
+            .collect()
+    }
+
+    /// Drive `run_query_loop` against [`CompactionProvider`] registered under
+    /// the non-Anthropic id `mockprov`. The mock model has no registry entry,
+    /// so the window falls back to the 100k heuristic and the threshold is
+    /// min(90k, 100k - min(32k, 25k)) = 75k tokens.
+    async fn drive_compaction_loop(
+        history: Vec<Message>,
+        script: Vec<MainStep>,
+        auto_compact: bool,
+    ) -> (QueryOutcome, Vec<String>, Vec<Message>) {
+        let log = Arc::new(StdMutex::new(Vec::new()));
+        let provider = Arc::new(CompactionProvider {
+            id: claurst_core::provider_id::ProviderId::new("mockprov"),
+            script: StdMutex::new(script.into()),
+            log: log.clone(),
+        });
+        let mut registry = claurst_api::ProviderRegistry::new();
+        registry.register(provider);
+
+        let client = claurst_api::AnthropicClient::new(claurst_api::client::ClientConfig {
+            api_key: "test-key".to_string(),
+            ..Default::default()
+        })
+        .expect("build test client");
+
+        let mut ctx = deny_all_context();
+        ctx.session_id = "compaction-test".to_string();
+        ctx.config.provider = Some("mockprov".to_string());
+
+        let mut config = make_config(None, None);
+        config.model = "mock-model".to_string();
+        config.provider_registry = Some(Arc::new(registry));
+        config.auto_compact = auto_compact;
+
+        let mut messages = history;
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_query_loop(
+                &client,
+                &mut messages,
+                &noop_tools(),
+                &ctx,
+                &config,
+                claurst_core::cost::CostTracker::new(),
+                None,
+                tokio_util::sync::CancellationToken::new(),
+                None,
+            ),
+        )
+        .await
+        .expect("loop must not hang");
+
+        let log = log.lock().unwrap().clone();
+        (outcome, log, messages)
+    }
+
+    /// Over the threshold, the history is compacted through the active
+    /// (non-Anthropic) provider before the request is sent.
+    #[tokio::test]
+    async fn compaction_triggers_at_threshold_before_request() {
+        // 11 × 30k chars ≈ 110k estimated tokens > 75k threshold.
+        let (outcome, log, msgs) =
+            drive_compaction_loop(long_history(11, 30_000), vec![MainStep::Reply], true).await;
+
+        assert!(matches!(outcome, QueryOutcome::EndTurn { .. }));
+        assert_eq!(log, vec!["summary", "main:compacted"]);
+        assert!(msgs[0].get_all_text().contains("Earlier work, condensed."));
+        assert!(msgs.len() < 11, "history must shrink, got {} messages", msgs.len());
+    }
+
+    #[tokio::test]
+    async fn no_compaction_below_threshold() {
+        let (_outcome, log, _msgs) =
+            drive_compaction_loop(long_history(3, 1_000), vec![MainStep::Reply], true).await;
+        assert_eq!(log, vec!["main:plain"]);
+    }
+
+    /// `--no-auto-compact` (auto_compact = false) leaves an over-threshold
+    /// history alone.
+    #[tokio::test]
+    async fn auto_compact_disabled_skips_threshold_compaction() {
+        let (_outcome, log, msgs) =
+            drive_compaction_loop(long_history(11, 30_000), vec![MainStep::Reply], false).await;
+        assert_eq!(log, vec!["main:plain"]);
+        assert_eq!(msgs.len(), 12, "history untouched plus the reply");
+    }
+
+    /// A context-window error compacts once and retries the request.
+    #[tokio::test]
+    async fn overflow_error_compacts_and_retries() {
+        // 7 × 20k chars ≈ 47k estimated tokens: under the threshold, so only
+        // the provider's overflow error triggers compaction.
+        let (outcome, log, msgs) = drive_compaction_loop(
+            long_history(7, 20_000),
+            vec![MainStep::Overflow, MainStep::Reply],
+            true,
+        )
+        .await;
+
+        assert!(matches!(outcome, QueryOutcome::EndTurn { .. }), "{:?}", outcome);
+        assert_eq!(log, vec!["main:plain", "summary", "main:compacted"]);
+        assert!(msgs[0].get_all_text().contains("<compact-summary>"));
+    }
+
+    /// A second overflow on the retried request surfaces the error.
+    #[tokio::test]
+    async fn repeated_overflow_surfaces_the_error() {
+        let (outcome, log, _msgs) = drive_compaction_loop(
+            long_history(7, 20_000),
+            vec![MainStep::Overflow, MainStep::Overflow],
+            true,
+        )
+        .await;
+
+        assert!(matches!(outcome, QueryOutcome::Error(_)), "{:?}", outcome);
+        assert_eq!(log, vec!["main:plain", "summary", "main:compacted"]);
+    }
+
+    #[tokio::test]
+    async fn overflow_with_auto_compact_disabled_surfaces_the_error() {
+        let (outcome, log, _msgs) = drive_compaction_loop(
+            long_history(7, 20_000),
+            vec![MainStep::Overflow],
+            false,
+        )
+        .await;
+
+        assert!(matches!(outcome, QueryOutcome::Error(_)), "{:?}", outcome);
+        assert_eq!(log, vec!["main:plain"]);
+    }
+
+    // ---- Issue #441: per-item tool-result cap -------------------------------
+
+    /// A read-only tool named like the one `RecordingProvider` calls, whose
+    /// output is far over the per-item cap.
+    struct BigOutputTool;
+
+    #[async_trait::async_trait]
+    impl Tool for BigOutputTool {
+        fn name(&self) -> &str { "noop_tool" }
+        fn description(&self) -> &str { "emits oversized output" }
+        fn permission_level(&self) -> PermissionLevel { PermissionLevel::ReadOnly }
+        fn input_schema(&self) -> Value { serde_json::json!({"type": "object"}) }
+        async fn execute(&self, _input: Value, _ctx: &ToolContext) -> ToolResult {
+            ToolResult::success(format!("FIRST LINE\n{}\nLAST LINE", "y".repeat(200_000)))
+        }
+    }
+
+    /// Each tool result is capped once, when appended: head and tail kept,
+    /// the omitted size noted.
+    #[tokio::test]
+    async fn tool_results_are_capped_head_and_tail_on_insert() {
+        let (_outcome, _recorded, msgs) = drive_loop_with_mock(
+            false,
+            1,
+            vec![Box::new(BigOutputTool)],
+            crate::continuation::ContinuationMode::Default,
+        )
+        .await;
+
+        let result = msgs
+            .iter()
+            .flat_map(|m| match &m.content {
+                claurst_core::types::MessageContent::Blocks(blocks) => blocks.as_slice(),
+                _ => &[],
+            })
+            .find_map(|b| match b {
+                ContentBlock::ToolResult { content: ToolResultContent::Text(t), .. } => Some(t),
+                _ => None,
+            })
+            .expect("tool result in history");
+        assert!(result.starts_with("FIRST LINE"));
+        assert!(result.ends_with("LAST LINE"));
+        assert!(result.contains("bytes omitted from the middle"));
+        assert!(result.len() <= DEFAULT_TOOL_RESULT_MAX_BYTES + 100, "{}", result.len());
+    }
+
+    /// #439 x #441: a context-window error compacts once and retries; it is
+    /// not treated as a transient failure (no `Retry` event, no back-off).
+    #[tokio::test]
+    async fn overflow_compacts_once_then_retries_without_a_retry_event() {
+        let overflow = claurst_api::ProviderError::ContextOverflow {
+            provider: pid_scripted(),
+            message: "prompt is too long".to_string(),
+            max_tokens: None,
+        };
+        // Request 1 overflows; request 2 is the summariser; request 3 succeeds.
+        let run = drive_scripted_with(
+            vec![
+                ScriptStep::Fail(overflow),
+                ScriptStep::Stream(text_turn("<summary>Earlier work, condensed.</summary>")),
+            ],
+            5,
+            noop_tools(),
+            None,
+            Vec::new(),
+            Some(long_history(7, 20_000)),
+        )
+        .await;
+        assert_eq!(run.calls, 3, "overflow, summary, retried request");
+        assert!(matches!(run.outcome, QueryOutcome::EndTurn { .. }), "{:?}", run.events);
+        assert!(
+            !run.events.iter().any(|e| matches!(e, QueryEvent::Retry { .. })),
+            "an overflow must not be reported as a transient retry: {:?}",
+            run.events
+        );
+        assert_eq!(
+            run.events.iter().filter(|e| matches!(e, QueryEvent::Compacted(_))).count(),
+            1,
+            "exactly one compaction: {:?}",
+            run.events
+        );
     }
 }

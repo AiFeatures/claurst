@@ -26,6 +26,7 @@ static OVERFLOW_PATTERNS: &[&str] = &[
     "exceeds the context window",
     "maximum context length",
     "input token count.*exceeds the maximum",
+    "exceeds the maximum number of tokens allowed",
     "maximum prompt length is",
     "reduce the length of the messages",
     "maximum context length is.*tokens",
@@ -62,6 +63,10 @@ static OVERFLOW_PATTERNS: &[&str] = &[
 /// simple substring matching is sufficient.
 pub fn is_context_overflow(message: &str) -> bool {
     let lower = message.to_lowercase();
+    // Rate limits ("too many tokens per minute") are transient, not overflow.
+    if lower.contains("rate limit") || lower.contains("rate_limit") || lower.contains("per minute") {
+        return false;
+    }
     OVERFLOW_PATTERNS
         .iter()
         .any(|pattern| lower.contains(&pattern.to_lowercase()))
@@ -245,6 +250,18 @@ mod tests {
     #[test]
     fn test_is_context_overflow_basic() {
         assert!(is_context_overflow("prompt is too long for this model"));
+        // Google Gemini.
+        assert!(is_context_overflow(
+            "The input token count (1200000) exceeds the maximum number of tokens allowed (1048576)."
+        ));
+        // OpenAI-compatible.
+        assert!(is_context_overflow(
+            "This model's maximum context length is 128000 tokens. However, your messages resulted in 130000 tokens."
+        ));
+        // A rate limit that mentions tokens is not an overflow.
+        assert!(!is_context_overflow(
+            "Rate limit reached: too many tokens per minute (TPM)"
+        ));
         assert!(is_context_overflow("This exceeds the context window"));
         assert!(is_context_overflow("Maximum context length exceeded"));
         assert!(!is_context_overflow("something else went wrong"));

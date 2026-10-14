@@ -353,12 +353,13 @@ impl Tool for AgentTool {
             max_turns_override: None,
             system_prompt: Some(system_prompt),
             append_system_prompt: None,
+            session_context: None,
             output_style: ctx.config.effective_output_style(),
             output_style_prompt: ctx.config.resolve_output_style_prompt(),
             working_directory: Some(working_dir_str),
             thinking_budget: None,
             temperature: None,
-            tool_result_budget: 50_000,
+            tool_result_max_bytes: crate::DEFAULT_TOOL_RESULT_MAX_BYTES,
             effort_level: None,
             command_queue: None,
             skill_index: None,
@@ -377,6 +378,7 @@ impl Tool for AgentTool {
             continuation: crate::continuation::ContinuationMode::Default,
             degradation_enabled: ctx.config.degradation_summary_enabled_or_default(),
             retry: claurst_api::RetryConfig::with_max_retries(ctx.config.max_retries),
+            auto_compact: true,
         };
         // -----------------------------------------------------------------------
         // Background mode: spawn and return agent_id immediately.
