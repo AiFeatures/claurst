@@ -286,6 +286,14 @@ fn load_with(dir: &Path, id: &str, skip_older_journal: bool) -> anyhow::Result<L
         return Ok(LoadedSession { session, replayed, rebuilt: false });
     }
 
+    if !snapshot_file.exists() && !journal_file.exists() {
+        // An `io::Error` so callers can tell "no such session" apart.
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("session {id} not found"),
+        )
+        .into());
+    }
     let mut entries = scan_journal(&journal_file)?.entries.into_iter();
     let Some((seq, Entry::Meta { session: meta })) = entries.next() else {
         anyhow::bail!("session {id} has no readable snapshot or journal");
@@ -1028,6 +1036,14 @@ mod tests {
             serde_json::to_value(&rebuilt).unwrap(),
             serde_json::to_value(&session).unwrap()
         );
+    }
+
+    #[test]
+    fn missing_session_is_an_io_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = load(dir.path(), "absent").err().unwrap();
+        let io = err.downcast_ref::<std::io::Error>().unwrap();
+        assert_eq!(io.kind(), std::io::ErrorKind::NotFound);
     }
 
     #[test]
