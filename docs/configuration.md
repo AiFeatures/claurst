@@ -49,6 +49,7 @@ project file sets them:
 | `trustProjectMcpServers` | Bypasses the project MCP server approval prompt |
 | `enabledPlugins` | Enables plugins, which can ship hooks and servers |
 | `remoteControlAtStartup` | Exposes the session over the remote-control bridge |
+| `sandbox` (every field) | Turning the shell sandbox off, opening its network or exempting commands removes the containment for everything a project can make the agent run |
 
 Project-defined MCP servers are still read from the project file, but they do
 not launch until you approve them for that project (or set
@@ -305,6 +306,91 @@ The permission mode can also be overridden per-session on the command line:
 claurst --permission-mode acceptEdits "refactor the auth module"
 claurst --dangerously-skip-permissions "..."  # equivalent to bypassPermissions
 ```
+
+---
+
+## Shell Sandbox
+
+On macOS, every Bash tool command (foreground and `run_in_background`) runs
+under Seatbelt: `/usr/bin/sandbox-exec -p <profile> -DWRITABLE_ROOT_0=... --
+bash -c <command>`. The sandbox applies in every permission mode, including
+`bypassPermissions`; the permission prompts decide *whether* a command runs,
+the sandbox limits *what it can touch*. Other platforms have no OS sandbox yet
+(Linux Landlock is planned), so commands there run unsandboxed whatever the
+setting says. Only the Bash tool is sandboxed; PowerShell, REPL and MCP
+servers are not.
+
+The settings are a top-level `sandbox` block in the **global** settings file.
+They are global-only: a project `.claurst/settings.json` cannot change them.
+
+```json
+{
+  "sandbox": {
+    "mode": "workspace-write",
+    "network": false,
+    "unsandboxedPrefixes": []
+  }
+}
+```
+
+| Key | Values | Default | Description |
+|-----|--------|---------|-------------|
+| `mode` | `off`, `workspace-write`, `read-only` | `workspace-write` | `off` runs commands with your full privileges. |
+| `network` | boolean | `false` | Allow network access (outbound and inbound) from sandboxed commands. |
+| `unsandboxedPrefixes` | array of strings | `[]` | First words of commands that always run outside the sandbox. Filled by the "always" choice of the denial prompt; only matches simple commands (no `;`, `&`, `\|`, redirections or substitutions). |
+
+What the profile allows (adapted from OpenAI Codex's Apache-2.0 Seatbelt
+policies):
+
+- Reading any file.
+- `workspace-write`: writing beneath the working directory, `workspace_paths`,
+  `additional_dirs` / `--add-dir` directories, `$TMPDIR` and `/tmp`. Inside
+  every writable root, `.git`, `.claurst`, `.ssh`, `.aws` and `.gnupg` stay
+  read-only, so a sandboxed command can run `git status` or `git diff` but not
+  `git commit`.
+- `read-only`: no writes (only `/dev/null` and the terminal).
+- Network only with `network: true`.
+- Everything else is denied (`(deny default)`), including XPC services.
+
+What the sandbox does not protect against:
+
+- Every file stays readable, including `~/.ssh`, `~/.aws`, keychains, other
+  repositories and `~/.claurst/settings.json` (API keys). With `network: true`
+  nothing stops a command from sending them elsewhere.
+- Any binary can be executed; the profile only limits what it can write and
+  reach.
+- Only Bash commands are sandboxed. The file tools (Write, Edit, ApplyPatch),
+  PowerShell, REPL, MCP servers, hooks and the status line are not.
+- `.git` is read-only, so `git add`, `git commit` and `git stash` go through
+  the rerun prompt.
+- If Claurst itself already runs under Seatbelt (a sandboxed terminal or
+  agent), every command fails with `sandbox-exec: sandbox_apply: Operation not
+  permitted` (exit 71); set `mode` to `off` there.
+- Apple marks `sandbox-exec` as deprecated, but it ships and works on macOS 15
+  and 26.
+- Linux and Windows run commands unsandboxed.
+
+When a sandboxed command fails with a non-zero exit (other than 2, 126 or 127)
+and its output contains a denial message such as `Operation not permitted`,
+`Permission denied` or `Read-only file system` (or, with `network: false`,
+`Could not resolve host`, `Couldn't connect to server` or `Network is
+unreachable`), it is treated as a likely sandbox denial:
+
+- In the interactive TUI a **Sandbox Denied** dialog offers to rerun it
+  outside the sandbox **once**, **for this session**, or **always for commands
+  starting with the same word** (saved to `sandbox.unsandboxedPrefixes`; not
+  offered for launchers such as `bash`, `sh`, `env`, `xargs` or `python3`). The
+  dialog is never answered by permission rules or `allowedBashPrefixes`.
+- In headless (`--print`) and ACP sessions nobody is asked: the failed result
+  is returned with a `[sandbox]` note so the caller can decide.
+
+`/sandbox-toggle` (alias `/sandbox`) shows and changes the setting:
+`/sandbox status`, `/sandbox off`, `/sandbox workspace-write` (or `on`),
+`/sandbox read-only`, `/sandbox network on|off`; with no argument it toggles
+between `off` and `workspace-write`. Changes are saved to the global settings
+and apply to the next command. While the sandbox is active the footer shows
+`sandbox: <mode>` (`+net` with network) and the system prompt says which
+sandbox the model's commands run in.
 
 ---
 

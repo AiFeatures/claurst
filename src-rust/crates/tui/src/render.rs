@@ -2600,6 +2600,14 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             ));
         }
 
+        // OS sandbox badge (#470): shown while Bash commands run sandboxed.
+        if let Some(label) = claurst_core::sandbox::status_label(&app.config.sandbox) {
+            if !spans.is_empty() {
+                spans.push(Span::raw("  "));
+            }
+            spans.push(Span::styled(label, Style::default().fg(Color::DarkGray)));
+        }
+
         spans
     };
 

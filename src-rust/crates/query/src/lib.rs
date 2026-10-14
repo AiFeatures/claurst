@@ -195,6 +195,9 @@ pub struct QueryConfig {
     /// Set for a sub-agent's loop: a finished turn fires `SubagentStop`
     /// hooks instead of `Stop` (#447).
     pub is_subagent: bool,
+    /// Sandbox line for the dynamic system prompt (#470). Always filled by
+    /// `run_query_loop` from the tool context's sandbox settings.
+    pub sandbox_state: Option<String>,
 }
 
 impl Default for QueryConfig {
@@ -232,6 +235,7 @@ impl Default for QueryConfig {
             retry: claurst_api::RetryConfig::default(),
             auto_compact: true,
             is_subagent: false,
+            sandbox_state: None,
         }
     }
 }
@@ -866,6 +870,8 @@ pub async fn run_query_loop(
                     .map(|dir| dir.display().to_string())
                     .collect();
             }
+            patched.sandbox_state =
+                claurst_core::sandbox::render_sandbox_state(&tool_ctx.config.sandbox);
 
             // Apply agent system-prompt prefix: prepend before the main system prompt.
             if let Some(ref agent) = config.agent_definition {
@@ -2298,6 +2304,7 @@ mod tests {
             retry: claurst_api::RetryConfig::default(),
             auto_compact: true,
             is_subagent: false,
+            sandbox_state: None,
         }
     }
 

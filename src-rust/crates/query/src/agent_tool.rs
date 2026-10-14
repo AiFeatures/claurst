@@ -385,6 +385,8 @@ impl Tool for AgentTool {
             retry: claurst_api::RetryConfig::with_max_retries(ctx.config.max_retries),
             auto_compact: true,
             is_subagent: true,
+            // Filled by `run_query_loop` from the sub-agent's tool context.
+            sandbox_state: None,
         };
         // -----------------------------------------------------------------------
         // Background mode: spawn and return agent_id immediately.
