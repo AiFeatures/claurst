@@ -145,7 +145,8 @@ impl RmcpClientBackend {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("MCP server '{}' has no URL configured", config.name))?;
 
-        let mut transport_config = StreamableHttpClientTransportConfig::with_uri(endpoint);
+        let mut transport_config = StreamableHttpClientTransportConfig::with_uri(endpoint)
+            .custom_headers(configured_headers(config)?);
         if let Some(token) = auth_token {
             transport_config = transport_config.auth_header(token);
         }
@@ -214,6 +215,25 @@ impl RmcpClientBackend {
     }
 }
 
+/// The server's configured `headers`, validated as HTTP header names/values.
+fn configured_headers(
+    config: &claurst_core::config::McpServerConfig,
+) -> anyhow::Result<HashMap<reqwest::header::HeaderName, reqwest::header::HeaderValue>> {
+    config
+        .headers
+        .iter()
+        .map(|(name, value)| {
+            let header_name = reqwest::header::HeaderName::from_bytes(name.as_bytes()).map_err(|e| {
+                anyhow::anyhow!("MCP server '{}': invalid header name '{}': {}", config.name, name, e)
+            })?;
+            let header_value = reqwest::header::HeaderValue::from_str(value).map_err(|e| {
+                anyhow::anyhow!("MCP server '{}': invalid value for header '{}': {}", config.name, name, e)
+            })?;
+            Ok((header_name, header_value))
+        })
+        .collect()
+}
+
 fn build_client_info(protocol_version: rmcp_model::ProtocolVersion) -> rmcp_model::ClientInfo {
     let mut client_info = rmcp_model::ClientInfo::default();
     client_info.protocol_version = protocol_version;
@@ -238,6 +258,7 @@ struct LegacySseRmcpTransport {
     sse_url: String,
     client: reqwest::Client,
     auth_token: Option<String>,
+    headers: HashMap<reqwest::header::HeaderName, reqwest::header::HeaderValue>,
     post_endpoint: Arc<StdMutex<Option<String>>>,
     incoming_tx: mpsc::UnboundedSender<rmcp::service::RxJsonRpcMessage<RoleClient>>,
     incoming_rx: Arc<Mutex<mpsc::UnboundedReceiver<rmcp::service::RxJsonRpcMessage<RoleClient>>>>,
@@ -260,6 +281,7 @@ impl LegacySseRmcpTransport {
             sse_url,
             client,
             auth_token,
+            headers: configured_headers(config)?,
             post_endpoint: Arc::new(StdMutex::new(None)),
             incoming_tx,
             incoming_rx: Arc::new(Mutex::new(incoming_rx)),
@@ -277,6 +299,9 @@ impl LegacySseRmcpTransport {
             .client
             .get(&self.sse_url)
             .header(reqwest::header::ACCEPT, "text/event-stream");
+        for (name, value) in &self.headers {
+            request = request.header(name, value);
+        }
         if let Some(token) = &self.auth_token {
             request = request.header(
                 reqwest::header::AUTHORIZATION,
@@ -382,6 +407,7 @@ impl rmcp::transport::Transport<RoleClient> for LegacySseRmcpTransport {
         let endpoint = lock_recover(&self.post_endpoint).clone();
         let client = self.client.clone();
         let auth_token = self.auth_token.clone();
+        let headers = self.headers.clone();
         let server_name = self.server_name.clone();
         let incoming_tx = self.incoming_tx.clone();
         let background_tasks = Arc::clone(&self.background_tasks);
@@ -397,6 +423,9 @@ impl rmcp::transport::Transport<RoleClient> for LegacySseRmcpTransport {
                 .post(endpoint)
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
                 .json(&item);
+            for (name, value) in headers {
+                request = request.header(name, value);
+            }
             if let Some(token) = &auth_token {
                 request = request.header(
                     reqwest::header::AUTHORIZATION,
@@ -914,6 +943,7 @@ mod tests {
             env: HashMap::new(),
             url: Some(url),
             server_type: "sse".to_string(),
+            headers: Default::default(),
             connect_timeout_ms: None,
             catalog_timeout_ms: None,
             origin: Default::default(),
@@ -1004,6 +1034,52 @@ mod tests {
         assert_eq!(endpoint.as_deref(), Some(expected.as_str()));
     }
 
+    #[test]
+    fn configured_headers_rejects_invalid_names() {
+        let mut config = test_sse_config("http://localhost/sse".to_string());
+        config.headers.insert("bad header".to_string(), "v".to_string());
+        let err = configured_headers(&config).expect_err("space is not a valid header name");
+        assert!(err.to_string().contains("invalid header name 'bad header'"), "{}", err);
+    }
+
+    #[tokio::test]
+    async fn legacy_sse_transport_sends_configured_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let (request_tx, request_rx) = oneshot::channel::<String>();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept test connection");
+            let mut buf = vec![0u8; 8192];
+            let n = stream.read(&mut buf).await.expect("read request");
+            let _ = request_tx.send(String::from_utf8_lossy(&buf[..n]).to_string());
+            let body = "event: endpoint\ndata: /messages\n\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write test response");
+            let _ = stream.shutdown().await;
+        });
+
+        let mut config = test_sse_config(format!("http://{addr}"));
+        config.headers.insert("X-Api-Key".to_string(), "secret-123".to_string());
+        LegacySseRmcpTransport::connect(&config, None)
+            .await
+            .expect("connect legacy sse transport");
+
+        let request = timeout(Duration::from_secs(1), request_rx)
+            .await
+            .expect("request timeout")
+            .expect("request captured")
+            .to_ascii_lowercase();
+        assert!(request.contains("x-api-key: secret-123"), "{}", request);
+    }
+
     #[tokio::test]
     async fn handle_legacy_sse_http_response_queues_json_message() {
         let response = fetch_response(
@@ -1061,6 +1137,7 @@ mod tests {
             sse_url: "http://localhost/sse".to_string(),
             client: reqwest::Client::new(),
             auth_token: None,
+            headers: HashMap::new(),
             post_endpoint: Arc::new(StdMutex::new(None)),
             incoming_tx: mpsc::unbounded_channel().0,
             incoming_rx: Arc::new(Mutex::new(mpsc::unbounded_channel().1)),

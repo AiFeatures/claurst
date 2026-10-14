@@ -86,6 +86,7 @@ fn fake_server(name: &str, mode: &str, extra_env: &[(&str, &str)]) -> McpServerC
         env,
         url: None,
         server_type: "stdio".to_string(),
+        headers: Default::default(),
         connect_timeout_ms: None,
         catalog_timeout_ms: None,
         origin: Default::default(),

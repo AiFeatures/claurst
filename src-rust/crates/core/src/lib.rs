@@ -1299,6 +1299,11 @@ pub mod config {
         pub url: Option<String>,
         #[serde(rename = "type", default = "default_mcp_type")]
         pub server_type: String,
+        /// Extra HTTP headers sent with every request to an `http`/`sse`
+        /// server. Values support `${VAR}` expansion. An `Authorization`
+        /// header here replaces the stored OAuth token.
+        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        pub headers: HashMap<String, String>,
         /// Bound on spawning/opening the transport and the `initialize`
         /// handshake, in milliseconds. `None` uses the 10 s default.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -5181,6 +5186,7 @@ mod tests {
             env: std::collections::HashMap::new(),
             url: None,
             server_type: "stdio".to_string(),
+            headers: Default::default(),
             connect_timeout_ms: None,
             catalog_timeout_ms: None,
             origin: McpServerOrigin::User,

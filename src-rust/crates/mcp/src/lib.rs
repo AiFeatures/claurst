@@ -102,6 +102,11 @@ pub fn expand_server_config(config: &McpServerConfig) -> McpServerConfig {
             .collect(),
         url: config.url.as_deref().map(expand_env_vars),
         server_type: config.server_type.clone(),
+        headers: config
+            .headers
+            .iter()
+            .map(|(k, v)| (k.clone(), expand_env_vars(v)))
+            .collect(),
         connect_timeout_ms: config.connect_timeout_ms,
         catalog_timeout_ms: config.catalog_timeout_ms,
         // Preserve origin: expansion must not launder a project server into
@@ -797,6 +802,13 @@ pub mod client {
             timeouts: McpTimeouts,
         ) -> anyhow::Result<Self> {
             let deadline = tokio::time::Instant::now() + timeouts.connect;
+            // An explicit `Authorization` header wins over the stored token.
+            let auth_token = auth_token.filter(|_| {
+                !config
+                    .headers
+                    .keys()
+                    .any(|name| name.eq_ignore_ascii_case("authorization"))
+            });
             match config.server_type.as_str() {
                 "stdio" => {
                     let backend = crate::rmcp_backend::RmcpClientBackend::connect_stdio(
@@ -1926,6 +1938,11 @@ mod tests {
             },
             url: None,
             server_type: "stdio".to_string(),
+            headers: {
+                let mut m = HashMap::new();
+                m.insert("X-Home".to_string(), "${_CC_TEST_HOME}".to_string());
+                m
+            },
             connect_timeout_ms: None,
             catalog_timeout_ms: None,
             origin: Default::default(),
@@ -1934,6 +1951,7 @@ mod tests {
         assert_eq!(expanded.command.as_deref(), Some("/home/user/bin/server"));
         assert_eq!(expanded.args[1], "/home/user");
         assert_eq!(expanded.env.get("PATH").map(|s| s.as_str()), Some("/home/user/bin"));
+        assert_eq!(expanded.headers.get("X-Home").map(|s| s.as_str()), Some("/home/user"));
         std::env::remove_var("_CC_TEST_HOME");
     }
 
@@ -2127,6 +2145,7 @@ mod tests {
             env: HashMap::new(),
             url: None,
             server_type: "carrier-pigeon".to_string(),
+            headers: Default::default(),
             connect_timeout_ms: None,
             catalog_timeout_ms: None,
             origin: Default::default(),
@@ -2294,6 +2313,7 @@ mod tests {
                 env: HashMap::new(),
                 url: Some("https://example.com/mcp".to_string()),
                 server_type: "http".to_string(),
+                headers: Default::default(),
                 connect_timeout_ms: None,
                 catalog_timeout_ms: None,
                 origin: Default::default(),

@@ -60,7 +60,8 @@ Each entry in the `mcpServers` / `mcp_servers` array (or the `config.mcp_servers
 | `args` | array of strings | No | Arguments passed to `command` |
 | `env` | object | No | Extra environment variables set for the child process |
 | `url` | string | HTTP only | Full URL of the SSE endpoint |
-| `type` | string | No | Transport type: `"stdio"` (default) or `"http"` |
+| `type` | string | No | Transport type: `"stdio"` (default), `"http"` (streamable HTTP) or `"sse"` (legacy SSE) |
+| `headers` | object | No | HTTP/SSE only: extra headers sent with every request, e.g. `{"X-Api-Key": "${MY_KEY}"}`. Values support variable expansion. An `Authorization` header replaces the stored OAuth token |
 | `connect_timeout_ms` | integer | No | Bound on starting the transport and the `initialize` handshake. Default `10000` |
 | `catalog_timeout_ms` | integer | No | Bound on each `tools/list`, `resources/list` and `prompts/list` request. Default `30000` |
 
@@ -68,7 +69,7 @@ Each entry in the `mcpServers` / `mcp_servers` array (or the `config.mcp_servers
 
 ## Environment Variable Expansion
 
-All string fields in `McpServerConfig` (`command`, `args`, `env` values, `url`) support shell-style variable expansion before the server is launched.
+All string fields in `McpServerConfig` (`command`, `args`, `env` values, `url`, `headers` values) support shell-style variable expansion before the server is launched.
 
 **Supported syntax:**
 

@@ -695,9 +695,10 @@ fn parse_mcp_servers(value: &Value) -> Result<Vec<McpServerConfig>> {
             env,
             url,
             server_type,
-            // Imported from a user-chosen config (e.g. Claude Desktop): trusted.
+            headers: Default::default(),
             connect_timeout_ms: None,
             catalog_timeout_ms: None,
+            // Imported from a user-chosen config (e.g. Claude Desktop): trusted.
             origin: Default::default(),
         });
     }
