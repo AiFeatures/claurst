@@ -1161,8 +1161,9 @@ pub mod config {
         /// Background sub-agents (Agent tool, `run_in_background`). Default on.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub subagents: Option<bool>,
-        /// Background Bash commands. Default off; a command started with
-        /// `notify: true` always notifies, `notify: false` never does.
+        /// Background Bash commands. Default off: only a command started with
+        /// `notify: true` notifies. `false` is a hard off, even for those;
+        /// with `true`, `notify: false` still opts a command out.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub shell: Option<bool>,
     }
@@ -1177,12 +1178,14 @@ pub mod config {
         }
 
         /// Whether a finished background Bash command should notify the
-        /// session. `requested` is the command's own `notify` argument, which
-        /// wins over the setting.
+        /// session. `requested` is the command's own `notify` argument. An
+        /// explicit `shell: false` is a hard off that the model cannot
+        /// override; otherwise `requested` wins over the setting.
         pub fn shell_completion_wakeups(&self, requested: Option<bool>) -> bool {
-            requested
-                .or_else(|| self.completion_wakeups.as_ref().and_then(|w| w.shell))
-                .unwrap_or(false)
+            match self.completion_wakeups.as_ref().and_then(|w| w.shell) {
+                Some(false) => false,
+                setting => requested.or(setting).unwrap_or(false),
+            }
         }
     }
 
@@ -2227,7 +2230,9 @@ pub mod config {
                 // grant immediate RCE via sh -c execution.
                 status_line: base.config.status_line,
                 degradation_summary_enabled: over.config.degradation_summary_enabled.or(base.config.degradation_summary_enabled),
-                completion_wakeups: over.config.completion_wakeups.or(base.config.completion_wakeups),
+                // Global-only: a project file must not be able to turn on
+                // autonomous wake-up turns.
+                completion_wakeups: base.config.completion_wakeups,
             };
             Self {
                 config: merged_config,
@@ -5417,7 +5422,22 @@ mod tests {
         let cfg: crate::config::Config = serde_json::from_value(value).unwrap();
         assert!(!cfg.subagent_completion_wakeups());
         assert!(cfg.shell_completion_wakeups(None));
-        assert!(!cfg.shell_completion_wakeups(Some(false)), "the command's own flag wins");
+        assert!(!cfg.shell_completion_wakeups(Some(false)), "a command can opt out");
+
+        // An explicit `shell: false` is a hard off the model cannot override.
+        let mut value = serde_json::to_value(crate::config::Config::default()).unwrap();
+        value["completionWakeups"] = serde_json::json!({ "shell": false });
+        let cfg: crate::config::Config = serde_json::from_value(value).unwrap();
+        assert!(!cfg.shell_completion_wakeups(Some(true)));
+
+        // Global-only: a project settings file cannot enable wake-ups.
+        let mut project = crate::config::Settings::default();
+        project.config.completion_wakeups = Some(crate::config::CompletionWakeups {
+            subagents: Some(true),
+            shell: Some(true),
+        });
+        let merged = crate::config::Settings::merge(crate::config::Settings::default(), project);
+        assert!(merged.config.completion_wakeups.is_none());
 
         let json = serde_json::to_string(&crate::config::Config::default()).unwrap();
         assert!(!json.contains("completionWakeups"));

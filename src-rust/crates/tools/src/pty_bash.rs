@@ -337,7 +337,7 @@ async fn run_in_background(
                 if task.status != claurst_core::tasks::TaskStatus::Cancelled {
                     let state = task.status.to_string();
                     notifier.notify(crate::completion_notice(
-                        "shell",
+                        "background-shell",
                         &[("id", &task.id), ("state", &state), ("command", &command_clone)],
                         &task.render_output(),
                     ));
@@ -1542,7 +1542,7 @@ mod tests {
     }
 
     /// #444: a background command started with a notifier reports back with
-    /// a `<shell>` notice carrying its state and output.
+    /// a `<background-shell>` notice carrying its state and output.
     #[tokio::test]
     async fn background_completion_sends_a_shell_notice() {
         let spill_dir = tempfile::tempdir().unwrap();
@@ -1563,10 +1563,10 @@ mod tests {
             .await
             .expect("notice within 30s")
             .expect("notifier called");
-        assert!(notice.starts_with("<shell id=\""), "{notice}");
+        assert!(notice.starts_with("<background-shell id=\""), "{notice}");
         assert!(notice.contains(" state=\"completed\""), "{notice}");
         assert!(notice.contains(" command=\"echo done-marker\">"), "{notice}");
-        assert!(notice.contains("\ndone-marker\n</shell>"), "{notice}");
+        assert!(notice.contains("\ndone-marker\n</background-shell>"), "{notice}");
     }
 
     /// #442 (Monitor path): a chatty background task keeps bounded windows in

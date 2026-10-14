@@ -4542,7 +4542,9 @@ mod tests {
         // the loop delivers it before its first request.
         let queue = CommandQueue::new();
         queue.push(
-            QueuedCommand::InjectUserMessage("<shell id=\"t1\" state=\"completed\">ok</shell>".into()),
+            QueuedCommand::InjectUserMessage(
+                "<background-shell id=\"t1\" state=\"completed\">ok</background-shell>".into(),
+            ),
             CommandPriority::Normal,
         );
         let history = vec![Message::user("start"), Message::assistant("started it")];
@@ -4561,7 +4563,7 @@ mod tests {
         assert!(queue.is_empty());
         let history = texts_of(&run.messages);
         assert_eq!(history[2].0, Role::User);
-        assert!(history[2].1.starts_with("<shell "), "{history:?}");
+        assert!(history[2].1.starts_with("<background-shell "), "{history:?}");
         assert_eq!(history[3], (Role::Assistant, "final answer".to_string()));
     }
 

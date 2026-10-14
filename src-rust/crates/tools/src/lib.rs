@@ -530,7 +530,7 @@ impl CompletionNotifier {
 
 /// The message a finished background task sends through its
 /// [`CompletionNotifier`] (#444): `<tag k="v" …>\nbody\n</tag>`, e.g.
-/// `<shell id="…" state="completed" command="…">`. Attribute values are
+/// `<background-shell id="…" state="completed" command="…">`. Attribute values are
 /// escaped and kept on one line.
 pub fn completion_notice(tag: &str, attrs: &[(&str, &str)], body: &str) -> String {
     let mut out = format!("<{tag}");
@@ -1370,13 +1370,13 @@ mod tests {
     #[test]
     fn completion_notice_escapes_attributes_and_wraps_the_body() {
         let notice = completion_notice(
-            "shell",
+            "background-shell",
             &[("id", "t1"), ("command", "echo \"a\" && cat <x\nmore")],
             "line 1\nline 2\n",
         );
         assert_eq!(
             notice,
-            "<shell id=\"t1\" command=\"echo &quot;a&quot; &amp;&amp; cat &lt;x more\">\nline 1\nline 2\n</shell>"
+            "<background-shell id=\"t1\" command=\"echo &quot;a&quot; &amp;&amp; cat &lt;x more\">\nline 1\nline 2\n</background-shell>"
         );
     }
 }
