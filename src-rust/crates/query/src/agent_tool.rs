@@ -357,12 +357,14 @@ impl Tool for AgentTool {
             output_style: ctx.config.effective_output_style(),
             output_style_prompt: ctx.config.resolve_output_style_prompt(),
             working_directory: Some(working_dir_str),
+            // Sub-agents get no skill listing; they can still call the Skill tool.
+            available_skills: Vec::new(),
+            instruction_files: Vec::new(),
             thinking_budget: None,
             temperature: None,
             tool_result_max_bytes: crate::DEFAULT_TOOL_RESULT_MAX_BYTES,
             effort_level: None,
             command_queue: None,
-            skill_index: None,
             max_budget_usd: None,
             fallback_model: None,
             provider_registry: Some(Arc::new(provider_registry)),
@@ -373,6 +375,9 @@ impl Tool for AgentTool {
             // Progressive tool disclosure (issue #233): the sub-agent's system
             // prompt only needs guideline blocks for the tools it actually has.
             enabled_tools: Some(agent_tools.iter().map(|t| t.name().to_string()).collect()),
+            // Filled from the sub-agent's tool context by the query loop.
+            permission_mode: None,
+            additional_dirs: Vec::new(),
             // Sub-agents run to their own completion and never drive goal
             // continuation — stop after one turn like every non-goal run.
             continuation: crate::continuation::ContinuationMode::Default,

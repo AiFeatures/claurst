@@ -495,17 +495,11 @@ SSH sessions work similarly: `claurst --ssh` enables a remote-accessible session
 
 ---
 
-## AGENTS.md hierarchical memory
+## Instruction files
 
-Claurst reads instruction files from the filesystem before every session and whenever a relevant file changes. The lookup order is:
+Claurst loads `AGENTS.md` / `CLAUDE.md` instruction files once at session start: the global `~/.claurst/` and `~/.claude/` directories first, then each directory from the git root down to the working directory (never above the git root; only the working directory when there is no `.git`). In each directory `AGENTS.override.md` replaces the other files; otherwise `AGENTS.md`, `CLAUDE.md`, `.claude/CLAUDE.md` and `.claurst/AGENTS.md` are loaded. `@include` lines are expanded within the project root, and all files share a 32 KiB budget. Each file is sent as an `Instructions from: <path>` block in the cached part of the system prompt.
 
-1. **Managed** — `/etc/claude-code/AGENTS.md` and `/etc/claude-code/CLAUDE.md` (administrator-controlled, always loaded).
-2. **User** — `~/.claurst/AGENTS.md` then `~/.claurst/CLAUDE.md` (personal global instructions).
-3. **Project** — `AGENTS.md`, `CLAUDE.md`, `.claurst/AGENTS.md`, and `.claurst/CLAUDE.md` in each directory from the filesystem root down to the current working directory. Files are loaded from the root toward the CWD so that parent-directory rules are visible when processing child-directory rules.
-
-`AGENTS.md` is preferred (universal cross-tool standard); `CLAUDE.md` is loaded next at every scope for compatibility with other Claude tooling. If both exist at the same scope, both are loaded.
-
-Files can `@include` other files using a frontmatter include directive. Included files are resolved relative to the including file.
+See [Instruction Files](configuration.md#instruction-files-agentsmd--claudemd) for the full rules.
 
 The `/memory` command opens the memory management UI for viewing, editing, and organising instruction files.
 

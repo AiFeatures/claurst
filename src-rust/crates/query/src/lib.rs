@@ -25,7 +25,6 @@ pub mod coordinator;
 pub mod cron_scheduler;
 pub mod sanitize;
 pub mod session_memory;
-pub mod skill_prefetch;
 
 mod runner;
 pub use runner::*;
@@ -38,9 +37,6 @@ pub use cron_scheduler::start_cron_scheduler;
 pub use goal_loop::{
     GoalContinuation, StopReason, check_and_continue_goal, decide_goal_continuation,
     mark_goal_complete,
-};
-pub use skill_prefetch::{
-    SkillDefinition, SkillIndex, SharedSkillIndex, prefetch_skills, format_skill_listing,
 };
 pub use sanitize::sanitize_history;
 pub use compact::{
@@ -107,12 +103,18 @@ pub struct QueryConfig {
     pub degradation_enabled: bool,
     pub system_prompt: Option<String>,
     pub append_system_prompt: Option<String>,
-    /// Session context gathered at startup (date, git status, IDE context).
+    /// Session context gathered at startup (git status, IDE context).
     /// Sent in the dynamic system block, after the cached stable block.
     pub session_context: Option<String>,
     pub output_style: claurst_core::system_prompt::OutputStyle,
     pub output_style_prompt: Option<String>,
     pub working_directory: Option<String>,
+    /// Skills listed to the model in the cached system block (name and
+    /// description), discovered once per session. Empty: no listing.
+    pub available_skills: Vec<claurst_core::system_prompt::SkillListing>,
+    /// AGENTS.md / CLAUDE.md instruction files loaded at session start, sent
+    /// in the cached system block. Empty: none.
+    pub instruction_files: Vec<claurst_core::claudemd::InstructionFile>,
     pub thinking_budget: Option<u32>,
     pub temperature: Option<f32>,
     /// Per-item cap, in bytes, applied to each tool result when it is
@@ -133,12 +135,6 @@ pub struct QueryConfig {
     /// shared (Arc-backed) so the TUI input thread can push commands while the
     /// loop is waiting for a model response.
     pub command_queue: Option<CommandQueue>,
-    /// T1-5: Optional shared skill index.
-    ///
-    /// When set, `prefetch_skills` is spawned once before the loop begins and
-    /// the resulting index is used to inject a skill listing attachment into
-    /// the conversation context.
-    pub skill_index: Option<SharedSkillIndex>,
     /// Optional USD spend cap. The query loop checks accumulated cost after
     /// each turn and aborts with `QueryOutcome::BudgetExceeded` when exceeded.
     pub max_budget_usd: Option<f64>,
@@ -174,6 +170,13 @@ pub struct QueryConfig {
     // both the tool vec and the config (e.g. sub-agents) may still set it
     // explicitly; the loop only fills an unset field.
     pub enabled_tools: Option<Vec<String>>,
+    /// Current permission mode, described in the dynamic system block. When
+    /// `None`, `run_query_loop` fills it from the live `ToolContext` config
+    /// each turn, so a mode change (/yolo, Shift+Tab) reaches the next request.
+    pub permission_mode: Option<claurst_core::config::PermissionMode>,
+    /// Extra workspace roots (`/add-dir`) for `<environment_context>`. When
+    /// empty, `run_query_loop` fills it from the live `ToolContext` config.
+    pub additional_dirs: Vec<String>,
     /// End-of-turn continuation policy (issue #230 / MI-3).
     ///
     /// `Default` stops after one turn (normal, non-goal behaviour). Goal-driven
@@ -208,12 +211,13 @@ impl Default for QueryConfig {
             output_style: claurst_core::system_prompt::OutputStyle::Default,
             output_style_prompt: None,
             working_directory: None,
+            available_skills: Vec::new(),
+            instruction_files: Vec::new(),
             thinking_budget: None,
             temperature: None,
             tool_result_max_bytes: DEFAULT_TOOL_RESULT_MAX_BYTES,
             effort_level: None,
             command_queue: None,
-            skill_index: None,
             max_budget_usd: None,
             fallback_model: None,
             provider_registry: None,
@@ -222,6 +226,8 @@ impl Default for QueryConfig {
             model_registry: None,
             managed_agents: None,
             enabled_tools: None,
+            permission_mode: None,
+            additional_dirs: Vec::new(),
             continuation: crate::continuation::ContinuationMode::Default,
             retry: claurst_api::RetryConfig::default(),
             auto_compact: true,
@@ -833,6 +839,17 @@ pub async fn run_query_loop(
             if patched.enabled_tools.is_none() {
                 patched.enabled_tools =
                     Some(tools.iter().map(|t| t.name().to_string()).collect());
+            }
+            if patched.permission_mode.is_none() {
+                patched.permission_mode = Some(tool_ctx.config.permission_mode.clone());
+            }
+            if patched.additional_dirs.is_empty() {
+                patched.additional_dirs = tool_ctx
+                    .config
+                    .additional_dirs
+                    .iter()
+                    .map(|dir| dir.display().to_string())
+                    .collect();
             }
 
             // Apply agent system-prompt prefix: prepend before the main system prompt.
@@ -2229,12 +2246,13 @@ mod tests {
             output_style: claurst_core::system_prompt::OutputStyle::Default,
             output_style_prompt: None,
             working_directory: None,
+            available_skills: Vec::new(),
+            instruction_files: Vec::new(),
             thinking_budget: None,
             temperature: None,
             tool_result_max_bytes: DEFAULT_TOOL_RESULT_MAX_BYTES,
             effort_level: None,
             command_queue: None,
-            skill_index: None,
             max_budget_usd: None,
             fallback_model: None,
             provider_registry: None,
@@ -2243,6 +2261,8 @@ mod tests {
             model_registry: None,
             managed_agents: None,
             enabled_tools: None,
+            permission_mode: None,
+            additional_dirs: Vec::new(),
             continuation: crate::continuation::ContinuationMode::Default,
             retry: claurst_api::RetryConfig::default(),
             auto_compact: true,
@@ -2382,6 +2402,22 @@ mod tests {
         let (stable, dynamic) = prompt_halves(build_system_prompt(&cfg));
         assert!(!stable.contains("Answer like a pirate."));
         assert!(dynamic.contains("Answer like a pirate."));
+    }
+
+    #[test]
+    fn permission_mode_change_only_touches_the_dynamic_block() {
+        use claurst_core::config::PermissionMode;
+        let mut cfg = make_config(Some("Project rules."), None);
+        cfg.enabled_tools = Some(vec!["Bash".to_string(), "Edit".to_string()]);
+        cfg.permission_mode = Some(PermissionMode::Default);
+        let (stable_default, dynamic_default) = prompt_halves(build_system_prompt(&cfg));
+        cfg.permission_mode = Some(PermissionMode::Plan);
+        let (stable_plan, dynamic_plan) = prompt_halves(build_system_prompt(&cfg));
+
+        assert_eq!(stable_default, stable_plan, "the cached block must stay byte-identical");
+        assert!(dynamic_default.contains("Current permission mode: `default`"));
+        assert!(dynamic_plan.contains("Current permission mode: `plan`"));
+        assert!(!dynamic_plan.contains("`default`"));
     }
 
     // ---- QueryConfig tests --------------------------------------------------
