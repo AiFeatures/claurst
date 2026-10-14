@@ -55,6 +55,7 @@ pub mod worktree;
 pub mod computer_use;
 pub mod mcp_auth_tool;
 pub mod repl_tool;
+pub mod sandbox;
 pub mod synthetic_output;
 pub mod team_tool;
 pub mod remote_trigger;
