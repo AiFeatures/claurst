@@ -2,8 +2,8 @@
 ///
 /// Ported from the TS "enabled plugins" concept in `pluginLoader.ts` and the
 /// app-state plugin arrays.
-use crate::hooks::{HookRegistry, register_plugin_hooks};
-use crate::plugin::{LoadedPlugin, PluginCommandDef, PluginError, ReloadDiff};
+use crate::plugin::{LoadedPlugin, PluginCommandDef, PluginError, PluginSource, ReloadDiff};
+use claurst_core::config::{HookMap, HookPluginSource};
 use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
@@ -166,21 +166,32 @@ impl PluginRegistry {
         paths
     }
 
-    /// Build the `HookRegistry` from all enabled plugins.
-    pub fn build_hook_registry(&self) -> HookRegistry {
-        let mut registry: HookRegistry = HashMap::new();
-        for plugin in self.enabled() {
-            if let Some(ref hooks_config) = plugin.hooks_config {
-                register_plugin_hooks(
-                    hooks_config,
-                    &plugin.path.to_string_lossy(),
-                    &plugin.name,
-                    &plugin.source_id,
-                    &mut registry,
-                );
+    /// The hooks of every enabled plugin, for the core hook engine. Each
+    /// hook carries its plugin's name and root. Project plugins are skipped
+    /// (see `set_global_hooks`). Plugins are visited in name order so the run
+    /// order of hooks across plugins is stable.
+    pub fn hook_map(&self) -> HookMap {
+        let mut plugins: Vec<&LoadedPlugin> = self
+            .enabled()
+            .into_iter()
+            .filter(|plugin| plugin.source != PluginSource::Project)
+            .collect();
+        plugins.sort_by(|a, b| a.name.cmp(&b.name));
+        let mut hooks = HookMap::new();
+        for plugin in plugins {
+            let Some(config) = &plugin.hooks_config else { continue };
+            let source = HookPluginSource { name: plugin.name.clone(), root: plugin.path.clone() };
+            for (event, groups) in &config.events {
+                hooks.entry(*event).or_default().extend(groups.iter().map(|group| {
+                    let mut group = group.clone();
+                    for hook in &mut group.hooks {
+                        hook.plugin = Some(source.clone());
+                    }
+                    group
+                }));
             }
         }
-        registry
+        hooks
     }
 
     /// Collect all MCP server configs contributed by enabled plugins.

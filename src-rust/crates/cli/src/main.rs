@@ -765,9 +765,10 @@ async fn main() -> anyhow::Result<()> {
     {
         let plugin_cmd_count = plugin_registry.all_command_defs().len();
         let plugin_hook_count = plugin_registry
-            .build_hook_registry()
+            .hook_map()
             .values()
-            .map(|v| v.len())
+            .flatten()
+            .map(|group| group.hooks.len())
             .sum::<usize>();
         info!(
             plugins = plugin_registry.enabled_count(),
@@ -789,6 +790,10 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
+    // Plugin hooks run through the core hook engine after settings hooks
+    // (#447); the registry is then shared with commands and tools.
+    claurst_plugins::set_global_hooks(&plugin_registry);
+    claurst_plugins::set_global_registry(plugin_registry);
 
     // Build model registry for dynamic model/provider resolution.
     // The registry is pre-populated with a hardcoded snapshot and enriched
@@ -5108,28 +5113,27 @@ mod bare_mode_tests {
         let registry = claurst_plugins::PluginRegistry::new();
         assert_eq!(registry.enabled_count(), 0, "no plugins enabled");
         assert!(registry.all_command_defs().is_empty(), "no plugin commands");
-        let hook_count: usize = registry
-            .build_hook_registry()
-            .values()
-            .map(|v| v.len())
-            .sum();
-        assert_eq!(hook_count, 0, "no plugin hooks");
+        assert!(registry.hook_map().is_empty(), "no plugin hooks");
         assert!(registry.all_mcp_servers().is_empty(), "no plugin MCP servers");
     }
 
     #[test]
     fn bare_mode_clears_hooks() {
-        use claurst_core::config::{HookEntry, HookEvent};
+        use claurst_core::config::{HookCommand, HookEvent, HookMap, HookMatcher, HookType};
         // Simulate settings-derived hooks, then apply the bare-mode clear that
-        // main() performs. Every `run_hooks` call site guards on
-        // `config.hooks.is_empty()`, so an empty map means nothing executes.
-        let mut hooks: std::collections::HashMap<HookEvent, Vec<HookEntry>> =
-            std::collections::HashMap::new();
+        // main() performs. Bare mode also registers no plugin hooks, so an
+        // empty map means `run_hooks` has nothing to execute.
+        let mut hooks = HookMap::new();
         hooks.insert(
             HookEvent::PreToolUse,
-            vec![HookEntry {
-                command: "echo untrusted".to_string(),
-                ..Default::default()
+            vec![HookMatcher {
+                matcher: None,
+                hooks: vec![HookCommand {
+                    kind: HookType::Command,
+                    command: "echo untrusted".to_string(),
+                    timeout: None,
+                    plugin: None,
+                }],
             }],
         );
         assert!(!hooks.is_empty(), "precondition: hooks are present");
