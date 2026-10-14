@@ -1164,9 +1164,13 @@ pub mod client {
             // network chunk boundary is never corrupted.
             let mut decoder = crate::SseByteDecoder::new();
             let mut byte_stream = resp.bytes_stream();
+            // Stream integrity (#439): only `message_stop` marks a complete
+            // response; anything else ending the byte stream is a truncation.
+            let mut saw_message_stop = false;
 
             while let Some(chunk_result) = byte_stream.next().await {
-                let chunk = chunk_result.map_err(|e| ClaudeError::Api(format!("HTTP error: {e}")))?;
+                let chunk = chunk_result
+                    .map_err(|e| ClaudeError::Api(format!("stream read error: {e}")))?;
 
                 for line in decoder.push(&chunk) {
                     let line = line.trim_end_matches('\r');
@@ -1174,6 +1178,8 @@ pub mod client {
                         if let Some(event) =
                             Self::frame_to_event(&frame.event, &frame.data)
                         {
+                            saw_message_stop |=
+                                matches!(event, streaming::AnthropicStreamEvent::MessageStop);
                             handler.on_event(&event);
                             if tx.send(event).await.is_err() {
                                 // Receiver dropped – stop reading.
@@ -1182,6 +1188,15 @@ pub mod client {
                         }
                     }
                 }
+            }
+
+            if !saw_message_stop {
+                let event = streaming::AnthropicStreamEvent::Error {
+                    error_type: "stream_incomplete".into(),
+                    message: "stream ended before message_stop".into(),
+                };
+                handler.on_event(&event);
+                let _ = tx.send(event).await;
             }
 
             Ok(())

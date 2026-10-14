@@ -554,4 +554,34 @@ mod tests {
         };
         assert_eq!(classify_provider_error(&err), RetryDecision::Fail, "{err}");
     }
+
+    #[tokio::test]
+    async fn http_stream_cut_before_finish_reason_is_a_retryable_error() {
+        use crate::provider::LlmProvider;
+        use futures::StreamExt;
+        let body = "data: {\"id\":\"x\",\"model\":\"m\",\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let base = serve_once(response).await;
+        let provider = crate::OpenAiCompatProvider::new("t", "T", base);
+        let mut stream = provider
+            .create_message_stream(tiny_request())
+            .await
+            .expect("200 response opens a stream");
+        let mut saw_stop = false;
+        let mut last_err = None;
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(crate::StreamEvent::MessageStop) => saw_stop = true,
+                Ok(_) => {}
+                Err(e) => last_err = Some(e),
+            }
+        }
+        assert!(!saw_stop, "a truncated stream must not report MessageStop");
+        let err = last_err.expect("a truncated stream must end with an error");
+        assert!(classify_provider_error(&err).is_retry(), "{err}");
+    }
 }

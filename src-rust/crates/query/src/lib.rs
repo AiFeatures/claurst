@@ -1105,6 +1105,9 @@ pub async fn run_query_loop(
                     let provider_stall = tokio::time::sleep(provider_stall_timeout);
                     tokio::pin!(provider_stall);
                     let mut provider_stream_stalled = false;
+                    // Stream integrity (#439): only `MessageStop` marks a
+                    // complete response; a stream that just ends is truncated.
+                    let mut saw_message_stop = false;
                     // Set when the stream yields a mid-stream `Err`. The
                     // accumulated text/tool-calls are then incomplete and MUST
                     // NOT be assembled into a "completed" turn (issue #215).
@@ -1180,7 +1183,18 @@ pub async fn run_query_loop(
                                                     merge_provider_stream_usage(&mut usage, u);
                                                 }
                                             }
-                                            claurst_api::StreamEvent::MessageStop => break,
+                                            claurst_api::StreamEvent::MessageStop => {
+                                                saw_message_stop = true;
+                                                break;
+                                            }
+                                            claurst_api::StreamEvent::Error { error_type, message } => {
+                                                error!(provider = %provider_id_str, error_type, message, "Provider in-band stream error");
+                                                provider_stream_error = Some((
+                                                    format!("{error_type}: {message}"),
+                                                    claurst_api::retry::classify_stream_error(error_type, message),
+                                                ));
+                                                break;
+                                            }
                                             _ => {}
                                         }
                                     }
@@ -1222,6 +1236,15 @@ pub async fn run_query_loop(
                         return QueryOutcome::Error(ClaudeError::Api(format!(
                             "Provider '{}' stream error (model '{}'): {}",
                             provider_id_str, model_id_str, err
+                        )));
+                    }
+                    // Ended without `MessageStop`: truncated, never a finished turn.
+                    if !saw_message_stop {
+                        let reason = "stream ended before completion".to_string();
+                        retry_turn!(reason.clone(), None);
+                        return QueryOutcome::Error(ClaudeError::Api(format!(
+                            "Provider '{}' {} (model '{}'); retries exhausted",
+                            provider_id_str, reason, model_id_str
                         )));
                     }
                     retry_attempt = 0;
@@ -1483,6 +1506,10 @@ pub async fn run_query_loop(
         // (some providers are slow; we don't want to give up too early).
         const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
         let mut accumulator = StreamAccumulator::new();
+        // Stream integrity (#439): an in-band `error` event or a stream that
+        // ends without `message_stop` is a failed attempt, never `end_turn`.
+        let mut stream_error: Option<(String, String)> = None;
+        let mut saw_message_stop = false;
         let stall_deadline = tokio::time::sleep(STALL_TIMEOUT);
         tokio::pin!(stall_deadline);
 
@@ -1507,8 +1534,13 @@ pub async fn run_query_loop(
                                         warn!(model = %effective_model, "API overloaded");
                                     }
                                     error!(error_type, message, "Stream error");
+                                    stream_error = Some((error_type.clone(), message.clone()));
+                                    break false;
                                 }
-                                AnthropicStreamEvent::MessageStop => break false,
+                                AnthropicStreamEvent::MessageStop => {
+                                    saw_message_stop = true;
+                                    break false;
+                                }
                                 _ => {}
                             }
                         }
@@ -1526,6 +1558,25 @@ pub async fn run_query_loop(
             return QueryOutcome::Error(ClaudeError::Api(format!(
                 "Stream stalled (model '{}'): {}",
                 effective_model, reason
+            )));
+        }
+        if let Some((error_type, message)) = stream_error {
+            let decision = claurst_api::retry::classify_stream_error(&error_type, &message);
+            let reason = format!("{error_type}: {message}");
+            if let claurst_api::RetryDecision::Retry { after } = decision {
+                retry_turn!(reason.clone(), after);
+            }
+            return QueryOutcome::Error(ClaudeError::Api(format!(
+                "Stream error (model '{}'): {}",
+                effective_model, reason
+            )));
+        }
+        if !saw_message_stop {
+            let reason = "stream ended before message_stop".to_string();
+            retry_turn!(reason.clone(), None);
+            return QueryOutcome::Error(ClaudeError::Api(format!(
+                "{} (model '{}'); retries exhausted",
+                reason, effective_model
             )));
         }
         retry_attempt = 0;
@@ -3734,6 +3785,30 @@ mod tests {
         assert!(
             !run.messages.iter().any(|m| m.get_all_text().contains("partial")),
             "output from the failed attempt must not be kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_stream_cut_without_message_stop_then_success() {
+        let mut cut = text_turn("half an ans");
+        cut.truncate(2); // MessageStart + one delta, then the stream just ends
+        let run = drive_scripted(vec![ScriptStep::Stream(cut)], 5, noop_tools()).await;
+        assert!(matches!(run.outcome, QueryOutcome::EndTurn { .. }));
+        assert_eq!(run.calls, 2, "a truncated stream must be retried");
+        assert!(
+            !run.messages.iter().any(|m| m.get_all_text().contains("half an ans")),
+            "the truncated attempt must not be kept as a finished turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn truncated_stream_with_no_retries_is_an_error_not_end_turn() {
+        let mut cut = text_turn("half");
+        cut.truncate(2);
+        let run = drive_scripted(vec![ScriptStep::Stream(cut)], 0, noop_tools()).await;
+        assert!(
+            matches!(run.outcome, QueryOutcome::Error(_)),
+            "a truncated stream must end the turn with a visible error"
         );
     }
 }

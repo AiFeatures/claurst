@@ -1026,12 +1026,20 @@ impl LlmProvider for OpenAiCompatProvider {
                 }
             }
 
-            // Byte stream ended: flush a trailing MessageStop if content began
-            // but no explicit `[DONE]` sentinel arrived.
+            // Byte stream ended without `[DONE]`: flush a trailing MessageStop
+            // when a finish_reason arrived; otherwise the response was
+            // truncated and must not be accepted as finished (#439).
             let mut tail = Vec::new();
             chat_decoder.finish(&mut tail);
             for event in tail {
                 yield Ok(event);
+            }
+            if !chat_decoder.is_complete() {
+                yield Err(ProviderError::StreamError {
+                    provider: provider_id.clone(),
+                    message: "stream ended before a finish_reason or [DONE]".to_string(),
+                    partial_response: None,
+                });
             }
         };
 

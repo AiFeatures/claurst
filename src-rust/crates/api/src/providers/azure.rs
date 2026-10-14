@@ -254,6 +254,7 @@ impl LlmProvider for AzureProvider {
             let mut decoder = crate::SseByteDecoder::new();
 
             let mut message_started = false;
+            let mut saw_finish = false;
             let mut message_id = String::from("unknown");
             let mut model_name = String::new();
             let mut tool_call_buffers: std::collections::HashMap<
@@ -407,6 +408,7 @@ impl LlmProvider for AzureProvider {
                         choice.get("finish_reason").and_then(|v| v.as_str())
                     {
                         if !finish_reason.is_empty() && finish_reason != "null" {
+                            saw_finish = true;
                             yield Ok(StreamEvent::ContentBlockStop { index: 0 });
                             let mut tc_indices: Vec<usize> =
                                 tool_call_buffers.keys().cloned().collect();
@@ -428,8 +430,18 @@ impl LlmProvider for AzureProvider {
                 }
             }
 
-            if message_started {
+            // Stream integrity (#439): without `[DONE]` (which returns above)
+            // only a `finish_reason` marks a complete response. A stream that
+            // just stops is truncated; surface it so the turn is retried
+            // instead of being accepted as finished.
+            if saw_finish {
                 yield Ok(StreamEvent::MessageStop);
+            } else {
+                yield Err(ProviderError::StreamError {
+                    provider: provider_id.clone(),
+                    message: "stream ended before a finish_reason or [DONE]".to_string(),
+                    partial_response: None,
+                });
             }
         };
 
