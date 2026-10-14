@@ -44,7 +44,7 @@ pub(crate) async fn pre_tool_use(name: &str, input: Value, tool_ctx: &ToolContex
                 result.reason_or_default()
             )))
         }
-        Some(HookDecision::Allow) => PreToolUse::Run { input, ctx: Some(hook_allowed_ctx(tool_ctx)) },
+        Some(HookDecision::Allow) => PreToolUse::Run { input, ctx: Some(hook_allowed_ctx(name, tool_ctx)) },
         Some(HookDecision::Ask) => {
             let mut ask_ctx = tool_ctx.clone();
             ask_ctx.permission_handler = Arc::new(HookAskPermissions {
@@ -53,27 +53,35 @@ pub(crate) async fn pre_tool_use(name: &str, input: Value, tool_ctx: &ToolContex
             });
             let description = synthesize_permission_description(name, &input);
             match ask_ctx.check_permission(name, &description, false) {
-                Ok(()) => PreToolUse::Run { input, ctx: Some(hook_allowed_ctx(tool_ctx)) },
+                Ok(()) => PreToolUse::Run { input, ctx: Some(hook_allowed_ctx(name, tool_ctx)) },
                 Err(e) => PreToolUse::Blocked(ToolResult::error(e.to_string())),
             }
         }
     }
 }
 
-fn hook_allowed_ctx(tool_ctx: &ToolContext) -> Box<ToolContext> {
+fn hook_allowed_ctx(tool: &str, tool_ctx: &ToolContext) -> Box<ToolContext> {
     let mut ctx = Box::new(tool_ctx.clone());
-    ctx.permission_handler = Arc::new(HookAllowedPermissions(tool_ctx.permission_handler.clone()));
+    ctx.permission_handler = Arc::new(HookAllowedPermissions {
+        inner: tool_ctx.permission_handler.clone(),
+        tool: tool.to_string(),
+    });
     ctx
 }
 
 /// Permissions for a call a PreToolUse hook allowed: what would have
-/// prompted is allowed; denials stand.
-struct HookAllowedPermissions(Arc<dyn PermissionHandler>);
+/// prompted for that tool is allowed; denials stand. Requests for other
+/// tools (a sub-agent started by an allowed `Agent` call, for one) are
+/// unchanged, so the approval never spreads beyond the allowed call.
+struct HookAllowedPermissions {
+    inner: Arc<dyn PermissionHandler>,
+    tool: String,
+}
 
 impl HookAllowedPermissions {
-    fn resolve(decision: PermissionDecision) -> PermissionDecision {
+    fn resolve(&self, request: &PermissionRequest, decision: PermissionDecision) -> PermissionDecision {
         match decision {
-            PermissionDecision::Ask { .. } => PermissionDecision::Allow,
+            PermissionDecision::Ask { .. } if request.tool_name == self.tool => PermissionDecision::Allow,
             other => other,
         }
     }
@@ -81,11 +89,11 @@ impl HookAllowedPermissions {
 
 impl PermissionHandler for HookAllowedPermissions {
     fn check_permission(&self, request: &PermissionRequest) -> PermissionDecision {
-        Self::resolve(self.0.check_permission(request))
+        self.resolve(request, self.inner.check_permission(request))
     }
 
     fn request_permission(&self, request: &PermissionRequest) -> PermissionDecision {
-        Self::resolve(self.0.request_permission(request))
+        self.resolve(request, self.inner.request_permission(request))
     }
 }
 

@@ -4455,9 +4455,12 @@ mod hook_loop_tests {
     }
 
     /// Records every input it runs with. Execute-level and not self-gating,
-    /// so the central permission backstop asks before it runs.
+    /// so the central permission backstop asks before it runs. With
+    /// `nested`, it also asks permission for that tool while running, the way
+    /// the Agent tool's sub-agent does, and records `{"nested_allowed": bool}`.
     struct RecTool {
         inputs: Arc<StdMutex<Vec<Value>>>,
+        nested: Option<&'static str>,
     }
 
     #[async_trait::async_trait]
@@ -4474,8 +4477,12 @@ mod hook_loop_tests {
         fn input_schema(&self) -> Value {
             serde_json::json!({"type": "object"})
         }
-        async fn execute(&self, input: Value, _ctx: &ToolContext) -> ToolResult {
+        async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
             self.inputs.lock().unwrap().push(input);
+            if let Some(nested) = self.nested {
+                let allowed = ctx.check_permission(nested, "nested call", false).is_ok();
+                self.inputs.lock().unwrap().push(serde_json::json!({ "nested_allowed": allowed }));
+            }
             ToolResult::success("rec ran")
         }
     }
@@ -4520,6 +4527,16 @@ mod hook_loop_tests {
     }
 
     async fn drive(hooks: HookMap, steps: Vec<Step>, permission: PermissionDecision, is_subagent: bool) -> Run {
+        drive_nested(hooks, steps, permission, is_subagent, None).await
+    }
+
+    async fn drive_nested(
+        hooks: HookMap,
+        steps: Vec<Step>,
+        permission: PermissionDecision,
+        is_subagent: bool,
+        nested: Option<&'static str>,
+    ) -> Run {
         let requests = Arc::new(StdMutex::new(0));
         let provider = Arc::new(ScriptedProvider {
             id: claurst_core::provider_id::ProviderId::new("mockprov"),
@@ -4564,7 +4581,7 @@ mod hook_loop_tests {
         };
 
         let inputs = Arc::new(StdMutex::new(Vec::new()));
-        let tools: Vec<Box<dyn Tool>> = vec![Box::new(RecTool { inputs: inputs.clone() })];
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(RecTool { inputs: inputs.clone(), nested })];
         let mut messages = vec![Message::user("start")];
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(30),
@@ -4715,6 +4732,24 @@ mod hook_loop_tests {
         // An explicit policy denial still wins.
         let run = drive(allow_hooks, vec![Step::Tool("{}"), Step::Text("ok")], PermissionDecision::Deny, false).await;
         assert!(run.tool_inputs.is_empty(), "allow must not override a denial");
+    }
+
+    /// A hook allowing a call (say, `Agent`) approves that call's own
+    /// prompts only, never prompts for other tools raised while it runs
+    /// (the sub-agent's Bash or Write calls).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hook_allow_does_not_approve_nested_tool_calls() {
+        let mut hooks = HookMap::new();
+        on(&mut hooks, HookEvent::PreToolUse, Some("rec_tool"), r#"echo '{"decision":"allow"}'"#.into());
+
+        let ask = PermissionDecision::Ask { reason: "policy asks".into() };
+        let run = drive_nested(hooks, vec![Step::Tool("{}"), Step::Text("ok")], ask, false, Some("Bash")).await;
+
+        assert_eq!(
+            run.tool_inputs,
+            vec![serde_json::json!({}), serde_json::json!({ "nested_allowed": false })],
+            "the allowed tool runs; its nested Bash prompt is still denied non-interactively"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
