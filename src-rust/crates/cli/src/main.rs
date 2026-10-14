@@ -2676,7 +2676,7 @@ async fn run_interactive(
                                     // when the user types /hooks in the TUI prompt, so
                                     // this branch only triggers when the command returns
                                     // the variant explicitly (e.g. from a non-prompt context).
-                                    app.hooks_config_menu.open();
+                                    app.hooks_config_menu.open(&app.config.hooks);
                                     app.status_message =
                                         Some("Hooks configuration browser".to_string());
                                 }
