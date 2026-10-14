@@ -704,6 +704,7 @@ dependencies = [
  "claurst-tui",
  "crossterm 0.29.0",
  "dirs",
+ "futures",
  "nix 0.29.0",
  "open",
  "parking_lot",

@@ -30,7 +30,8 @@ pub(crate) fn allow_all_context(working_dir: PathBuf) -> ToolContext {
 }
 
 /// Permission handler that runs the real `PermissionManager` (workspace fence
-/// included, `Ask` turned into `Deny` as in headless mode) and, right after
+/// included, `Ask` rejected by the non-interactive context as in headless
+/// mode) and, right after
 /// its first decision, replaces `link` with a symlink to `target`: the swap
 /// from #415, landed in the window between the permission check and the open.
 #[cfg(unix)]

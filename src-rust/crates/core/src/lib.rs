@@ -2718,7 +2718,9 @@ pub mod constants {
     pub const DEFAULT_MAX_TOKENS: u32 = 32_000;
     pub const MAX_TOKENS_HARD_LIMIT: u32 = 65_536;
     pub const DEFAULT_COMPACT_THRESHOLD: f32 = 0.9;
-    pub const MAX_TURNS_DEFAULT: u32 = 10;
+    /// Default turn cap (`--max-turns`). High enough that real agentic tasks
+    /// finish; it guards against runaway loops, not normal work (#473).
+    pub const MAX_TURNS_DEFAULT: u32 = 100;
     pub const MAX_TOOL_ERRORS: u32 = 3;
 
     // API endpoints & headers
@@ -3519,8 +3521,9 @@ pub mod permissions {
 
     /// Non-interactive handler backed by a shared `PermissionManager`.
     ///
-    /// Delegates to `PermissionManager::evaluate`; converts `Ask` decisions
-    /// into `Deny` (no interactive prompt available in headless mode).
+    /// Delegates to `PermissionManager::evaluate` and passes `Ask` through:
+    /// a non-interactive `ToolContext` turns it into a rejection that tells
+    /// the model why, instead of a bare deny (#473).
     pub struct ManagedAutoPermissionHandler {
         pub manager: Arc<Mutex<PermissionManager>>,
     }
@@ -3534,17 +3537,13 @@ pub mod permissions {
     impl PermissionHandler for ManagedAutoPermissionHandler {
         fn check_permission(&self, request: &PermissionRequest) -> PermissionDecision {
             if let Ok(m) = self.manager.lock() {
-                let decision = m.evaluate(
+                return m.evaluate(
                     &request.tool_name,
                     &request.description,
                     request.path.as_deref(),
                     request.working_dir.as_deref(),
                     &request.allowed_roots,
                 );
-                return match decision {
-                    PermissionDecision::Ask { .. } => PermissionDecision::Deny,
-                    other => other,
-                };
             }
             PermissionDecision::Deny
         }
