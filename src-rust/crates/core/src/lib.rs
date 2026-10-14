@@ -707,7 +707,7 @@ pub mod config {
         pub kind: HookType,
         /// Run with `sh -c` (`cmd /C` on Windows) in the session's directory.
         pub command: String,
-        /// Seconds before the hook is killed (default 60).
+        /// Seconds before the hook is killed (default 60; `0` means the default).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub timeout: Option<u64>,
         /// The plugin that registered this hook; `None` for settings hooks.

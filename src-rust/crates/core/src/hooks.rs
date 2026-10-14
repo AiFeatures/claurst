@@ -36,6 +36,10 @@ use tracing::{debug, warn};
 /// Seconds a hook may run before it is killed, unless it sets `timeout`.
 pub const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 60;
 
+/// Bytes of a hook's stdout (and of its stderr) that are kept; the rest is
+/// read and discarded.
+const MAX_HOOK_OUTPUT_BYTES: u64 = 1024 * 1024;
+
 /// How the session started: `SessionStart`'s `source` and matcher target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -310,7 +314,7 @@ fn parse_stdout(event: HookEvent, command: &str, stdout: &str) -> HookVerdict {
     if text.starts_with('{') {
         match serde_json::from_str::<HookOutput>(text) {
             Ok(output) => return output.into(),
-            Err(e) => warn!(command, error = %e, "Hook stdout is not valid hook JSON; treating it as text"),
+            Err(e) => debug!(command, error = %e, "Hook stdout is not valid hook JSON; treating it as text"),
         }
     }
     if matches!(event, HookEvent::UserPromptSubmit | HookEvent::SessionStart) {
@@ -422,7 +426,7 @@ pub fn notify(hooks: &HookMap, session_id: &str, cwd: &Path, message: &str) {
 
 /// Run one hook command with `input` on stdin and interpret its result.
 async fn run_command(hook: &HookCommand, event: HookEvent, input: &[u8], cwd: &Path) -> HookVerdict {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
 
     let (shell, flag) = if cfg!(windows) { ("cmd", "/C") } else { ("sh", "-c") };
     let mut command = tokio::process::Command::new(shell);
@@ -454,7 +458,9 @@ async fn run_command(hook: &HookCommand, event: HookEvent, input: &[u8], cwd: &P
     let stdin = child.stdin.take();
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    let timeout = Duration::from_secs(hook.timeout.unwrap_or(DEFAULT_HOOK_TIMEOUT_SECS));
+    // `timeout: 0` would kill every hook at once; treat it as unset.
+    let timeout_secs = hook.timeout.filter(|&secs| secs > 0).unwrap_or(DEFAULT_HOOK_TIMEOUT_SECS);
+    let timeout = Duration::from_secs(timeout_secs);
 
     let finished = tokio::time::timeout(timeout, async {
         let feed = async {
@@ -463,22 +469,11 @@ async fn run_command(hook: &HookCommand, event: HookEvent, input: &[u8], cwd: &P
                 let _ = stdin.write_all(input).await;
             }
         };
-        let read_stdout = async {
-            let mut buf = Vec::new();
-            if let Some(mut pipe) = stdout {
-                let _ = pipe.read_to_end(&mut buf).await;
-            }
-            buf
-        };
-        let read_stderr = async {
-            let mut buf = Vec::new();
-            if let Some(mut pipe) = stderr {
-                let _ = pipe.read_to_end(&mut buf).await;
-            }
-            buf
-        };
-        let (_, out, err, status) = tokio::join!(feed, read_stdout, read_stderr, child.wait());
-        (out, err, status)
+        // Wait only after the pipes close: reaping `sh` first would drop its
+        // pid, and a timeout could then no longer kill a grandchild that
+        // still holds stdout.
+        let (_, out, err) = tokio::join!(feed, read_capped(stdout), read_capped(stderr));
+        (out, err, child.wait().await)
     })
     .await;
 
@@ -524,6 +519,18 @@ async fn run_command(hook: &HookCommand, event: HookEvent, input: &[u8], cwd: &P
             HookVerdict::default()
         }
     }
+}
+
+/// Read a hook's output pipe, keeping the first [`MAX_HOOK_OUTPUT_BYTES`]
+/// and draining the rest so the hook never blocks on a full pipe.
+async fn read_capped<R: tokio::io::AsyncRead + Unpin>(pipe: Option<R>) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+    let mut buf = Vec::new();
+    let Some(pipe) = pipe else { return buf };
+    let mut limited = pipe.take(MAX_HOOK_OUTPUT_BYTES);
+    let _ = limited.read_to_end(&mut buf).await;
+    let _ = tokio::io::copy(&mut limited.into_inner(), &mut tokio::io::sink()).await;
+    buf
 }
 
 /// Kill a timed-out hook and, on Unix, its whole process group.
@@ -811,6 +818,46 @@ mod tests {
             assert!(!marker.exists(), "the hook's children must be killed with it");
         }
 
+        /// A hook whose shell exits at once while a background child holds
+        /// stdout: the timeout must still kill the child's process group.
+        #[tokio::test]
+        async fn timeout_kills_children_of_an_exited_shell() {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join("survived");
+            let mut hook = command(&format!("(sleep 3; touch '{}') & exit 0", marker.display()));
+            hook.timeout = Some(1);
+            let hooks = hooks_for(HookEvent::Stop, None, vec![hook]);
+            let started = Instant::now();
+            run(&hooks, HookEventData::Stop { stop_hook_active: false, last_assistant_message: "" }, dir.path()).await;
+            assert!(started.elapsed() < Duration::from_secs(3));
+            tokio::time::sleep(Duration::from_secs(4)).await;
+            assert!(!marker.exists(), "the background child must be killed");
+        }
+
+        #[tokio::test]
+        async fn large_output_is_capped_and_the_exit_code_still_counts() {
+            let dir = tempfile::tempdir().unwrap();
+            // 3 MiB on stdout and stderr, then exit 2.
+            let hooks = hooks_for(
+                HookEvent::UserPromptSubmit,
+                None,
+                vec![command("head -c 3145728 /dev/zero; head -c 3145728 /dev/zero >&2; exit 2")],
+            );
+            let result = run(&hooks, HookEventData::UserPromptSubmit { prompt: "p" }, dir.path()).await;
+            assert!(result.is_deny());
+            assert_eq!(result.reason_or_default().len(), MAX_HOOK_OUTPUT_BYTES as usize);
+        }
+
+        #[tokio::test]
+        async fn zero_timeout_means_the_default() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut hook = command(r#"sleep 1; echo '{"decision":"deny"}'"#);
+            hook.timeout = Some(0);
+            let hooks = hooks_for(HookEvent::Stop, None, vec![hook]);
+            let result = run(&hooks, HookEventData::Stop { stop_hook_active: false, last_assistant_message: "" }, dir.path()).await;
+            assert!(result.is_deny());
+        }
+
         #[tokio::test]
         async fn hooks_run_in_order_and_merge() {
             let dir = tempfile::tempdir().unwrap();
@@ -867,24 +914,24 @@ mod tests {
         }
 
         /// Plugin hooks run through the same engine, after settings hooks,
-        /// with the plugin's root exported. PreCompact is used only by this
+        /// with the plugin's root exported. SessionEnd is used only by this
         /// test in this crate, so the process-global registry cannot leak
-        /// into other tests.
+        /// into other tests run in parallel.
         #[tokio::test]
         async fn plugin_hooks_run_after_settings_hooks() {
             let dir = tempfile::tempdir().unwrap();
             let log = dir.path().join("order.log");
             let mut plugin_hook = command(&format!("echo \"plugin $CLAUDE_PLUGIN_NAME $CLAUDE_PLUGIN_ROOT\" >> '{}'", log.display()));
             plugin_hook.plugin = Some(crate::config::HookPluginSource { name: "demo".into(), root: "/plugins/demo".into() });
-            set_plugin_hooks(hooks_for(HookEvent::PreCompact, None, vec![plugin_hook]));
-            assert!(has_hooks(&HookMap::new(), HookEvent::PreCompact));
+            set_plugin_hooks(hooks_for(HookEvent::SessionEnd, None, vec![plugin_hook]));
+            assert!(has_hooks(&HookMap::new(), HookEvent::SessionEnd));
 
-            let settings = hooks_for(HookEvent::PreCompact, None, vec![command(&format!("echo settings >> '{}'", log.display()))]);
-            run(&settings, HookEventData::PreCompact { trigger: CompactTrigger::Auto, custom_instructions: "" }, dir.path()).await;
+            let settings = hooks_for(HookEvent::SessionEnd, None, vec![command(&format!("echo settings >> '{}'", log.display()))]);
+            run(&settings, HookEventData::SessionEnd { reason: SessionEndReason::Other }, dir.path()).await;
             set_plugin_hooks(HookMap::new());
 
             assert_eq!(std::fs::read_to_string(&log).unwrap(), "settings\nplugin demo /plugins/demo\n");
-            assert!(!has_hooks(&HookMap::new(), HookEvent::PreCompact));
+            assert!(!has_hooks(&HookMap::new(), HookEvent::SessionEnd));
         }
     }
 }
