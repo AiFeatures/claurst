@@ -295,11 +295,18 @@ impl App {
                 self.is_streaming = false;
                 self.spinner_verb = None;
 
-                // Update context window usage from the usage info.
-                if let Some(ref u) = usage {
-                    let turn_tokens = u.input_tokens + u.output_tokens
-                        + u.cache_creation_input_tokens + u.cache_read_input_tokens;
-                    self.context_used_tokens = self.context_used_tokens.saturating_add(turn_tokens);
+                // Context meter (#444): the prompt size of the request that
+                // just finished (uncached + cache-write + cache-read input),
+                // the figure the loop's own compaction check anchors on. Each
+                // request resends the whole history, so summing them
+                // over-counts. A provider that reports no input keeps the
+                // previous reading.
+                if let Some(prompt_tokens) = usage
+                    .as_ref()
+                    .map(claurst_core::types::UsageInfo::total_input)
+                    .filter(|tokens| *tokens > 0)
+                {
+                    self.context_used_tokens = prompt_tokens;
                 }
                 // Record elapsed time and pick a completion verb
                 let seed = self.frame_count as usize ^ (self.messages.len() * 7);
@@ -377,8 +384,9 @@ impl App {
                 }
             }
             QueryEvent::Compacted(record) => {
-                // The model now sees the compacted history: track its size so
-                // the context meter and warnings start from the new baseline.
+                // The model now sees the compacted history: its estimate is
+                // the meter's new baseline until the next request reports
+                // real prompt tokens, and warnings may fire again.
                 self.context_used_tokens = record.tokens_after;
                 self.token_warning_threshold_shown = 0;
             }
