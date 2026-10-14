@@ -483,8 +483,10 @@ async fn main() -> anyhow::Result<()> {
     config.disable_claude_mds = cli.no_claude_md || cli.bare;
     if cli.bare {
         // Bare mode runs no event hooks. Drop any hooks resolved from
-        // settings so no `run_hooks` call site has anything to execute.
+        // settings, and refuse plugin hooks for the whole process (a plugin
+        // reload must not add them back), so `run_hooks` has nothing to run.
         config.hooks.clear();
+        claurst_core::hooks::disable_plugin_hooks();
         // Nor does it list or run skills from the repository's own skill
         // directories (global and bundled skills stay).
         config.skills.skip_project_dirs = true;

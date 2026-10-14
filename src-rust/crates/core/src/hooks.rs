@@ -349,11 +349,23 @@ pub fn matcher_matches(pattern: Option<&str>, target: Option<&str>) -> bool {
 // ---------------------------------------------------------------------------
 
 static PLUGIN_HOOKS: parking_lot::RwLock<Option<Arc<HookMap>>> = parking_lot::const_rwlock(None);
+static PLUGIN_HOOKS_DISABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Replace the hooks contributed by plugins. They run after settings hooks
 /// for every event. Called by the plugin loader at startup and on reload.
+/// A no-op after [`disable_plugin_hooks`].
 pub fn set_plugin_hooks(hooks: HookMap) {
+    if PLUGIN_HOOKS_DISABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     *PLUGIN_HOOKS.write() = (!hooks.is_empty()).then(|| Arc::new(hooks));
+}
+
+/// Clear plugin hooks for the rest of the process and ignore later
+/// registrations (`--bare`, so a plugin reload cannot add hooks back).
+pub fn disable_plugin_hooks() {
+    PLUGIN_HOOKS_DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+    *PLUGIN_HOOKS.write() = None;
 }
 
 /// The hooks contributed by plugins, if any.
