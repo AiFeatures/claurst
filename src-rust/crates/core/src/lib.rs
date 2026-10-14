@@ -1253,6 +1253,16 @@ pub mod config {
             assert!(value["config"].get("statusLine").is_none());
         }
         #[test]
+        fn project_cannot_set_completion_wakeups() {
+            let mut project = Settings::default();
+            project.config.completion_wakeups = Some(CompletionWakeups {
+                subagents: Some(true),
+                shell: Some(true),
+            });
+            let merged = Settings::merge(Settings::default(), project);
+            assert!(merged.config.completion_wakeups.is_none());
+        }
+        #[test]
         fn project_cannot_override_global_status_line() {
             let global = Settings {
                 config: Config {
@@ -5429,15 +5439,6 @@ mod tests {
         value["completionWakeups"] = serde_json::json!({ "shell": false });
         let cfg: crate::config::Config = serde_json::from_value(value).unwrap();
         assert!(!cfg.shell_completion_wakeups(Some(true)));
-
-        // Global-only: a project settings file cannot enable wake-ups.
-        let mut project = crate::config::Settings::default();
-        project.config.completion_wakeups = Some(crate::config::CompletionWakeups {
-            subagents: Some(true),
-            shell: Some(true),
-        });
-        let merged = crate::config::Settings::merge(crate::config::Settings::default(), project);
-        assert!(merged.config.completion_wakeups.is_none());
 
         let json = serde_json::to_string(&crate::config::Config::default()).unwrap();
         assert!(!json.contains("completionWakeups"));
