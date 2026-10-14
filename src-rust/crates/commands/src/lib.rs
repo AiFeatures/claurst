@@ -660,6 +660,19 @@ impl SlashCommand for CompactCommand {
             ctx.config.effective_model(),
         );
         let instructions = Some(args.trim()).filter(|a| !a.is_empty());
+        // PreCompact hooks (#447). Informational: the decision is ignored.
+        claurst_core::hooks::run_hooks(
+            &ctx.config.hooks,
+            &claurst_core::hooks::HookPayload::new(
+                &ctx.session_id,
+                &ctx.working_dir,
+                claurst_core::hooks::HookEventData::PreCompact {
+                    trigger: claurst_core::hooks::CompactTrigger::Manual,
+                    custom_instructions: instructions.unwrap_or_default(),
+                },
+            ),
+        )
+        .await;
         compact_now(
             provider.as_ref(),
             model,
@@ -938,8 +951,8 @@ impl SlashCommand for StatusCommand {
             format!("{} server(s) configured", mcp_count)
         };
 
-        // Hook status
-        let hook_count: usize = ctx.config.hooks.values().map(|v| v.len()).sum();
+        // Hook status (settings hooks; plugin hooks are listed by /hooks)
+        let hook_count: usize = ctx.config.hooks.values().flatten().map(|g| g.hooks.len()).sum();
 
         // UI settings
         let ui = load_ui_settings();
@@ -1126,8 +1139,10 @@ impl SlashCommand for HooksCommand {
     fn description(&self) -> &str { "Show configured event hooks" }
     fn help(&self) -> &str {
         "Usage: /hooks\n\
-         Show hooks configured in settings.json under 'hooks'.\n\
-         Hooks fire shell commands on events: PreToolUse, PostToolUse, Stop, UserPromptSubmit."
+         Show the hooks that run: settings hooks (the 'hooks' key of ~/.claurst/settings.json)\n\
+         and hooks registered by plugins. Events: PreToolUse, PostToolUse, UserPromptSubmit,\n\
+         Stop, SubagentStop, SessionStart, SessionEnd, Notification, PreCompact, PostModelTurn.\n\
+         See docs/hooks.md."
     }
 
     async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
@@ -1137,7 +1152,7 @@ impl SlashCommand for HooksCommand {
         //
         // Signal to the CLI driver that it should open the TUI overlay if possible;
         // the CLI will fall back to the text listing when no TUI is active.
-        if ctx.config.hooks.is_empty() {
+        if ctx.config.hooks.is_empty() && claurst_core::hooks::plugin_hooks().is_none() {
             // If there is nothing to show in the overlay, emit a helpful message
             // so the user knows what to do.
             return CommandResult::Message(
@@ -1145,7 +1160,7 @@ impl SlashCommand for HooksCommand {
                  Add hooks to ~/.claurst/settings.json under the 'hooks' key.\n\
                  Example:\n\
                  \x20 \"hooks\": {\n\
-                 \x20   \"PreToolUse\": [{ \"matcher\": \"*\", \"hooks\": [{ \"type\": \"command\", \"command\": \"echo $STDIN\" }] }]\n\
+                 \x20   \"PreToolUse\": [{ \"matcher\": \"Bash\", \"hooks\": [{ \"type\": \"command\", \"command\": \"cat >> ~/.claurst/hooks.log\" }] }]\n\
                  \x20 }"
                     .to_string(),
             );

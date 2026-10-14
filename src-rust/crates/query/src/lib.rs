@@ -197,6 +197,9 @@ pub struct QueryConfig {
     /// batch and every compaction, so a crash loses at most the step in
     /// flight. `None` (sub-agents, headless runs) persists nothing.
     pub session_journal: Option<Arc<claurst_core::session_journal::SessionJournal>>,
+    /// Set for a sub-agent's loop: a finished turn fires `SubagentStop`
+    /// hooks instead of `Stop` (#447).
+    pub is_subagent: bool,
 }
 
 impl Default for QueryConfig {
@@ -234,6 +237,7 @@ impl Default for QueryConfig {
             retry: claurst_api::RetryConfig::default(),
             auto_compact: true,
             session_journal: None,
+            is_subagent: false,
         }
     }
 }
@@ -514,6 +518,9 @@ pub async fn run_query_loop(
     // tool-less summary turn has been dispatched so it can never re-trigger
     // (anti-recursion guard).
     let mut degradation_done = false;
+    // Set once a Stop hook has blocked a stop in this run; sent to later Stop
+    // hooks as `stop_hook_active` so they can avoid blocking forever (#447).
+    let mut stop_hook_active = false;
 
     // Turn-cap precedence (PR #398 review): session override (set via
     // `/turns`) wins over the agent definition, which wins over config.
@@ -704,6 +711,26 @@ pub async fn run_query_loop(
             }};
         }
 
+        // Stop / SubagentStop hooks (#447), fired exactly once for each
+        // finished turn. A hook that blocks the stop has its reason sent to
+        // the model and the loop continues.
+        macro_rules! fire_stop_hooks {
+            ($assistant_msg:expr) => {{
+                if let Some(reason) =
+                    stop_hooks(&$assistant_msg, stop_hook_active, config.is_subagent, tool_ctx).await
+                {
+                    stop_hook_active = true;
+                    let feedback = Message::user(format!("Stop hook feedback: {reason}"));
+                    if let Some(ref tx) = event_tx {
+                        let _ = tx.send(QueryEvent::Status(format!("Stop hook blocked stopping: {reason}")));
+                        let _ = tx.send(QueryEvent::MessageCommitted(feedback.clone()));
+                    }
+                    messages.push(feedback);
+                    continue;
+                }
+            }};
+        }
+
         // Check for cancellation
         if cancel_token.is_cancelled() {
             return QueryOutcome::Cancelled;
@@ -790,6 +817,7 @@ pub async fn run_query_loop(
                 config.session_journal.as_deref(),
                 event_tx.as_ref(),
                 &cancel_token,
+                tool_ctx,
             )
             .await
         {
@@ -1149,6 +1177,7 @@ pub async fn run_query_loop(
                                     config.max_tokens,
                                     config.session_journal.as_deref(),
                                     event_tx.as_ref(),
+                                    tool_ctx,
                                 )
                                 .await
                                 {
@@ -1342,6 +1371,7 @@ pub async fn run_query_loop(
                                 config.max_tokens,
                                 config.session_journal.as_deref(),
                                 event_tx.as_ref(),
+                                tool_ctx,
                             )
                             .await
                             {
@@ -1449,6 +1479,19 @@ pub async fn run_query_loop(
                     messages.push(assistant_msg.clone());
                     persist_step(config, messages);
 
+                    // PostModelTurn hooks (#447): a deny vetoes continuing.
+                    let model_turn_hooks = post_model_turn(&assistant_msg, tool_ctx).await;
+                    if model_turn_hooks.is_deny() {
+                        if let Some(ref tx) = event_tx {
+                            let _ = tx.send(QueryEvent::MessageCommitted(assistant_msg.clone()));
+                            let _ = tx.send(QueryEvent::Status(format!(
+                                "PostModelTurn hook stopped the turn: {}",
+                                model_turn_hooks.reason_or_default()
+                            )));
+                        }
+                        return QueryOutcome::EndTurn { message: assistant_msg, usage };
+                    }
+
                     // Handle tool-use turn: execute tools and loop.
                     let tool_use_blocks: Vec<_> = content_blocks.iter().filter_map(|b| {
                         if let ContentBlock::ToolUse { id, name, input, .. } = b {
@@ -1483,7 +1526,7 @@ pub async fn run_query_loop(
                                 // and recover from (issues #215, #439).
                                 invalid_tool_input_result(&tool_name, err)
                             } else {
-                                execute_tool(&tool_name, &tool_input, tools, tool_ctx).await
+                                run_tool_with_hooks(&tool_name, tool_input, tools, tool_ctx).await
                             };
                             if let Some(ref tx) = event_tx {
                                 let _ = tx.send(QueryEvent::ToolEnd {
@@ -1502,6 +1545,11 @@ pub async fn run_query_loop(
                                     config.tool_result_max_bytes,
                                 ),
                                 is_error: Some(is_error),
+                            });
+                        }
+                        if let Some(context) = model_turn_hooks.additional_context {
+                            tool_results.push(ContentBlock::Text {
+                                text: format!("PostModelTurn hook context:\n{context}"),
                             });
                         }
                         let results_msg = Message {
@@ -1566,6 +1614,7 @@ pub async fn run_query_loop(
                         }
                     }
 
+                    fire_stop_hooks!(assistant_msg);
                     continue_or_end!(assistant_msg, usage);
                 } else if provider_id_str != "anthropic" {
                     // Non-Anthropic provider detected but no API key / credentials
@@ -1624,6 +1673,7 @@ pub async fn run_query_loop(
                         config.max_tokens,
                         config.session_journal.as_deref(),
                         event_tx.as_ref(),
+                        tool_ctx,
                     )
                     .await
                     {
@@ -1746,6 +1796,7 @@ pub async fn run_query_loop(
                     config.max_tokens,
                     config.session_journal.as_deref(),
                     event_tx.as_ref(),
+                    tool_ctx,
                 )
                 .await
                 {
@@ -1831,36 +1882,17 @@ pub async fn run_query_loop(
             _ => raw_stop,
         };
 
-        // T1-3: Fire PostModelTurn hooks after the model samples a response.
-        // Hooks can inject blocking errors or veto continuation entirely.
-        {
-            let hook_result = fire_post_sampling_hooks(&assistant_msg, &tool_ctx.config);
-            if !hook_result.blocking_errors.is_empty() {
-                if hook_result.prevent_continuation {
-                    // Hard veto: push the errors into the conversation and abort.
-                    for err_msg in hook_result.blocking_errors {
-                        messages.push(err_msg);
-                    }
-                    if let Some(ref tx) = event_tx {
-                        let _ = tx.send(QueryEvent::Status(
-                            "PostModelTurn hook vetoed continuation.".to_string(),
-                        ));
-                    }
-                    let last = messages
-                        .last()
-                        .cloned()
-                        .unwrap_or_else(|| Message::assistant("Hook blocked continuation."));
-                    return QueryOutcome::EndTurn {
-                        message: last,
-                        usage,
-                    };
-                }
-                // Soft errors: inject them so the model can react next turn.
-                for err_msg in hook_result.blocking_errors {
-                    debug!("PostModelTurn hook injecting error message");
-                    messages.push(err_msg);
-                }
+        // PostModelTurn hooks (#447): a deny vetoes continuing; context is
+        // sent with this turn's tool results.
+        let model_turn_hooks = post_model_turn(&assistant_msg, tool_ctx).await;
+        if model_turn_hooks.is_deny() {
+            if let Some(ref tx) = event_tx {
+                let _ = tx.send(QueryEvent::Status(format!(
+                    "PostModelTurn hook stopped the turn: {}",
+                    model_turn_hooks.reason_or_default()
+                )));
             }
+            return QueryOutcome::EndTurn { message: assistant_msg, usage };
         }
 
         if let Some(ref tx) = event_tx {
@@ -1871,39 +1903,9 @@ pub async fn run_query_loop(
             });
         }
 
-        // Helper closure for firing the Stop hook.
-        macro_rules! fire_stop_hook {
-            ($msg:expr) => {{
-                let stop_ctx = claurst_core::hooks::HookContext {
-                    event: "Stop".to_string(),
-                    tool_name: None,
-                    tool_input: None,
-                    tool_output: Some($msg.get_all_text()),
-                    is_error: None,
-                    session_id: Some(tool_ctx.session_id.clone()),
-                };
-                claurst_core::hooks::run_hooks(
-                    &tool_ctx.config.hooks,
-                    claurst_core::config::HookEvent::Stop,
-                    &stop_ctx,
-                    &tool_ctx.working_dir,
-                )
-                .await;
-            }};
-        }
-
         match stop {
             "end_turn" => {
-                fire_stop_hook!(assistant_msg);
-
-                // T1-3: Fire Stop hooks in background (fire-and-forget).
-                // `stop_hooks_with_full_behavior` spawns blocking tasks internally
-                // and returns immediately with an empty Vec.
-                let _bg = stop_hooks_with_full_behavior(
-                    &assistant_msg,
-                    &tool_ctx.config,
-                    tool_ctx.working_dir.clone(),
-                );
+                fire_stop_hooks!(assistant_msg);
 
                 // Asynchronously extract and persist session memories if warranted.
                 // Runs in a detached Tokio task so it doesn't block the query loop.
@@ -2061,8 +2063,8 @@ pub async fn run_query_loop(
                 // ---------------------------------------------------------------------------
                 // Streaming tool executor: parallel non-agent tool dispatch.
                 //
-                // Phase 1: Run PreToolUse hooks sequentially (they can block/deny execution
-                //          and may display interactive permission dialogs).
+                // Phase 1: Run PreToolUse hooks sequentially (they can deny, ask,
+                //          allow or rewrite the input, and may show permission dialogs).
                 // Phase 2: Dispatch all non-blocked tool executions concurrently via
                 //          futures::future::join_all, preserving original order.
                 // Phase 3: Fire PostToolUse hooks + emit events, then collect results.
@@ -2070,24 +2072,16 @@ pub async fn run_query_loop(
                 // This mirrors the TypeScript StreamingToolExecutor pattern.
                 // ---------------------------------------------------------------------------
 
-                // Intermediate record produced during Phase 1.
                 struct PreparedTool {
                     id: String,
                     name: String,
-                    input: Value,
-                    /// None means the pre-hook blocked execution; the String is the error reason.
-                    blocked_result: Option<ToolResult>,
+                    call: PreToolUse,
                 }
 
                 // Phase 1: sequential pre-hook pass.
                 let mut prepared: Vec<PreparedTool> = Vec::with_capacity(tool_blocks.len());
                 for block in tool_blocks {
                     if let ContentBlock::ToolUse { id, name, input, .. } = block {
-                        // Clone from the references returned by get_tool_use_blocks()
-                        let id = id.clone();
-                        let name = name.clone();
-                        let input = input.clone();
-
                         if let Some(ref tx) = event_tx {
                             let _ = tx.send(QueryEvent::ToolStart {
                                 tool_name: name.clone(),
@@ -2098,75 +2092,30 @@ pub async fn run_query_loop(
 
                         // Invalid argument JSON (#439): answer with a tool
                         // error, never run the tool or its hooks with `{}`.
-                        if let Some(err) = invalid_tool_inputs.get(&id) {
-                            let blocked_result = Some(invalid_tool_input_result(&name, err));
-                            prepared.push(PreparedTool { id, name, input, blocked_result });
-                            continue;
-                        }
-
-                        let hooks = &tool_ctx.config.hooks;
-                        let hook_ctx = claurst_core::hooks::HookContext {
-                            event: "PreToolUse".to_string(),
-                            tool_name: Some(name.clone()),
-                            tool_input: Some(input.clone()),
-                            tool_output: None,
-                            is_error: None,
-                            session_id: Some(tool_ctx.session_id.clone()),
+                        let call = if let Some(err) = invalid_tool_inputs.get(id) {
+                            PreToolUse::Blocked(invalid_tool_input_result(name, err))
+                        } else {
+                            pre_tool_use(name, input.clone(), tool_ctx).await
                         };
-                        let pre_outcome = claurst_core::hooks::run_hooks(
-                            hooks,
-                            claurst_core::config::HookEvent::PreToolUse,
-                            &hook_ctx,
-                            &tool_ctx.working_dir,
-                        )
-                        .await;
-
-                        let plugin_pre_outcome =
-                            claurst_plugins::run_global_pre_tool_hook(&name, &input);
-
-                        let blocked_result =
-                            if let claurst_core::hooks::HookOutcome::Blocked(reason) = pre_outcome {
-                                warn!(tool = %name, reason = %reason, "PreToolUse hook blocked execution");
-                                Some(claurst_tools::ToolResult::error(format!(
-                                    "Blocked by hook: {}",
-                                    reason
-                                )))
-                            } else if let claurst_plugins::HookOutcome::Deny(reason) = plugin_pre_outcome {
-                                warn!(tool = %name, reason = %reason, "Plugin PreToolUse hook blocked execution");
-                                Some(claurst_tools::ToolResult::error(format!(
-                                    "Blocked by plugin hook: {}",
-                                    reason
-                                )))
-                            } else {
-                                None
-                            };
-
-                        prepared.push(PreparedTool {
-                            id,
-                            name,
-                            input,
-                            blocked_result,
-                        });
+                        prepared.push(PreparedTool { id: id.clone(), name: name.clone(), call });
                     }
                 }
 
                 // Phase 2: build execution futures for non-blocked tools and join them.
-                // Blocked tools yield a ready future with the pre-computed error result.
-                // Non-blocked tools execute concurrently via join_all.
-                // Each async block owns its cloned name/input so there are no lifetime issues.
+                // Blocked tools yield a ready future with their error result.
+                // A call a hook allowed runs with that call's permission context.
                 let exec_futures: Vec<_> = prepared
                     .iter()
-                    .map(|p| {
-                        if p.blocked_result.is_some() {
-                            let r = p.blocked_result.clone().unwrap();
-                            futures::future::Either::Left(async move { r })
-                        } else {
-                            let name = p.name.clone();
-                            let input = p.input.clone();
-                            futures::future::Either::Right(async move {
-                                execute_tool(&name, &input, tools, tool_ctx).await
-                            })
+                    .map(|p| match &p.call {
+                        PreToolUse::Blocked(result) => {
+                            futures::future::Either::Left(std::future::ready(result.clone()))
                         }
+                        PreToolUse::Run { input, ctx } => futures::future::Either::Right(execute_tool(
+                            &p.name,
+                            input,
+                            tools,
+                            ctx.as_deref().unwrap_or(tool_ctx),
+                        )),
                     })
                     .collect();
 
@@ -2183,34 +2132,13 @@ pub async fn run_query_loop(
                 // When the batch was cancelled we skip the awaiting PostToolUse
                 // hooks (they run external commands and would defeat the point of
                 // returning promptly) but still emit ToolEnd + build every result
-                // block so the conversation and TUI stay consistent.
+                // block so the conversation and TUI stay consistent. Calls that
+                // never ran get no PostToolUse.
                 let mut result_blocks: Vec<ContentBlock> =
-                    Vec::with_capacity(prepared.len());
-                for (p, result) in prepared.iter().zip(exec_results) {
-                    if !batch_cancelled {
-                        let hooks = &tool_ctx.config.hooks;
-                        let post_ctx = claurst_core::hooks::HookContext {
-                            event: "PostToolUse".to_string(),
-                            tool_name: Some(p.name.clone()),
-                            tool_input: Some(p.input.clone()),
-                            tool_output: Some(result.content.clone()),
-                            is_error: Some(result.is_error),
-                            session_id: Some(tool_ctx.session_id.clone()),
-                        };
-                        claurst_core::hooks::run_hooks(
-                            hooks,
-                            claurst_core::config::HookEvent::PostToolUse,
-                            &post_ctx,
-                            &tool_ctx.working_dir,
-                        )
-                        .await;
-
-                        claurst_plugins::run_global_post_tool_hook(
-                            &p.name,
-                            &p.input,
-                            &result.content,
-                            result.is_error,
-                        );
+                    Vec::with_capacity(prepared.len() + 1);
+                for (p, mut result) in prepared.iter().zip(exec_results) {
+                    if let (false, PreToolUse::Run { input, .. }) = (batch_cancelled, &p.call) {
+                        post_tool_use(&p.name, input, &mut result, tool_ctx).await;
                     }
 
                     if let Some(ref tx) = event_tx {
@@ -2233,6 +2161,11 @@ pub async fn run_query_loop(
                         is_error: if is_error { Some(true) } else { None },
                     });
                 }
+                if let Some(context) = model_turn_hooks.additional_context {
+                    result_blocks.push(ContentBlock::Text {
+                        text: format!("PostModelTurn hook context:\n{context}"),
+                    });
+                }
 
                 // Append tool results as a user message so the history remains
                 // valid (every tool_use is answered) even on cancellation.
@@ -2253,12 +2186,7 @@ pub async fn run_query_loop(
                 continue;
             }
             "stop_sequence" => {
-                fire_stop_hook!(assistant_msg);
-                let _bg = stop_hooks_with_full_behavior(
-                    &assistant_msg,
-                    &tool_ctx.config,
-                    tool_ctx.working_dir.clone(),
-                );
+                fire_stop_hooks!(assistant_msg);
                 if let (Some(ref snap), Some(ref hash)) = (&shadow_snap, &initial_snapshot) {
                     let patch = snap.patch(hash).await;
                     if !patch.files.is_empty() {
@@ -2269,12 +2197,7 @@ pub async fn run_query_loop(
             }
             other => {
                 warn!(stop_reason = other, "Unknown stop reason, treating as end_turn");
-                fire_stop_hook!(assistant_msg);
-                let _bg = stop_hooks_with_full_behavior(
-                    &assistant_msg,
-                    &tool_ctx.config,
-                    tool_ctx.working_dir.clone(),
-                );
+                fire_stop_hooks!(assistant_msg);
                 if let (Some(ref snap), Some(ref hash)) = (&shadow_snap, &initial_snapshot) {
                     let patch = snap.patch(hash).await;
                     if !patch.files.is_empty() {
@@ -2404,6 +2327,7 @@ mod tests {
             retry: claurst_api::RetryConfig::default(),
             auto_compact: true,
             session_journal: None,
+            is_subagent: false,
         }
     }
 
@@ -4606,5 +4530,446 @@ mod tests {
             "exactly one compaction: {:?}",
             run.events
         );
+    }
+}
+
+/// Hook call sites in `run_query_loop` (#447), driven through the provider
+/// branch by a scripted provider and real `sh` hook fixtures.
+#[cfg(all(test, unix))]
+mod hook_loop_tests {
+    use super::*;
+    use claurst_core::config::{HookCommand, HookEvent, HookMap, HookMatcher, HookType};
+    use claurst_core::permissions::{PermissionDecision, PermissionHandler, PermissionRequest};
+    use std::collections::VecDeque;
+    use std::path::Path;
+    use std::sync::Mutex as StdMutex;
+
+    /// One scripted model response.
+    enum Step {
+        /// Call `rec_tool` with this JSON input.
+        Tool(&'static str),
+        /// End the turn with this text.
+        Text(&'static str),
+    }
+
+    struct ScriptedProvider {
+        id: claurst_core::provider_id::ProviderId,
+        steps: StdMutex<VecDeque<Step>>,
+        requests: Arc<StdMutex<usize>>,
+    }
+
+    #[async_trait::async_trait]
+    impl claurst_api::LlmProvider for ScriptedProvider {
+        fn id(&self) -> &claurst_core::provider_id::ProviderId {
+            &self.id
+        }
+        fn name(&self) -> &str {
+            "scripted-mock"
+        }
+
+        async fn create_message(
+            &self,
+            _request: claurst_api::ProviderRequest,
+        ) -> Result<claurst_api::ProviderResponse, claurst_api::ProviderError> {
+            unimplemented!("these tests only use create_message_stream")
+        }
+
+        async fn create_message_stream(
+            &self,
+            _request: claurst_api::ProviderRequest,
+        ) -> Result<
+            std::pin::Pin<
+                Box<
+                    dyn futures::Stream<
+                            Item = Result<claurst_api::StreamEvent, claurst_api::ProviderError>,
+                        > + Send,
+                >,
+            >,
+            claurst_api::ProviderError,
+        > {
+            use claurst_api::provider_types::StopReason;
+            use claurst_api::StreamEvent;
+
+            *self.requests.lock().unwrap() += 1;
+            let step = self.steps.lock().unwrap().pop_front().unwrap_or(Step::Text("done"));
+            let start = Ok(StreamEvent::MessageStart {
+                id: uuid::Uuid::new_v4().to_string(),
+                model: "mock-model".to_string(),
+                usage: UsageInfo::default(),
+            });
+            let events = match step {
+                Step::Tool(input) => vec![
+                    start,
+                    Ok(StreamEvent::ContentBlockStart {
+                        index: 0,
+                        content_block: ContentBlock::ToolUse {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            name: "rec_tool".to_string(),
+                            input: serde_json::json!({}),
+                            thought_signature: None,
+                        },
+                    }),
+                    Ok(StreamEvent::InputJsonDelta { index: 0, partial_json: input.to_string() }),
+                    Ok(StreamEvent::MessageDelta {
+                        stop_reason: Some(StopReason::ToolUse),
+                        usage: Some(UsageInfo::default()),
+                    }),
+                    Ok(StreamEvent::MessageStop),
+                ],
+                Step::Text(text) => vec![
+                    start,
+                    Ok(StreamEvent::TextDelta { index: 0, text: text.to_string() }),
+                    Ok(StreamEvent::MessageDelta {
+                        stop_reason: Some(StopReason::EndTurn),
+                        usage: Some(UsageInfo::default()),
+                    }),
+                    Ok(StreamEvent::MessageStop),
+                ],
+            };
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+
+        async fn health_check(
+            &self,
+        ) -> Result<claurst_api::ProviderStatus, claurst_api::ProviderError> {
+            Ok(claurst_api::ProviderStatus::Healthy)
+        }
+
+        fn capabilities(&self) -> claurst_api::ProviderCapabilities {
+            claurst_api::ProviderCapabilities {
+                streaming: true,
+                tool_calling: true,
+                thinking: false,
+                image_input: false,
+                pdf_input: false,
+                audio_input: false,
+                video_input: false,
+                caching: false,
+                structured_output: false,
+                system_prompt_style: claurst_api::SystemPromptStyle::TopLevel,
+            }
+        }
+    }
+
+    /// Records every input it runs with. Execute-level and not self-gating,
+    /// so the central permission backstop asks before it runs. With
+    /// `nested`, it also asks permission for that tool while running, the way
+    /// the Agent tool's sub-agent does, and records `{"nested_allowed": bool}`.
+    struct RecTool {
+        inputs: Arc<StdMutex<Vec<Value>>>,
+        nested: Option<&'static str>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for RecTool {
+        fn name(&self) -> &str {
+            "rec_tool"
+        }
+        fn description(&self) -> &str {
+            "records its inputs"
+        }
+        fn permission_level(&self) -> PermissionLevel {
+            PermissionLevel::Execute
+        }
+        fn input_schema(&self) -> Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
+            self.inputs.lock().unwrap().push(input);
+            if let Some(nested) = self.nested {
+                let allowed = ctx.check_permission(nested, "nested call", false).is_ok();
+                self.inputs.lock().unwrap().push(serde_json::json!({ "nested_allowed": allowed }));
+            }
+            ToolResult::success("rec ran")
+        }
+    }
+
+    struct FixedHandler(PermissionDecision);
+
+    impl PermissionHandler for FixedHandler {
+        fn check_permission(&self, _request: &PermissionRequest) -> PermissionDecision {
+            self.0.clone()
+        }
+        fn request_permission(&self, request: &PermissionRequest) -> PermissionDecision {
+            self.check_permission(request)
+        }
+    }
+
+    fn on(hooks: &mut HookMap, event: HookEvent, matcher: Option<&str>, command: String) {
+        hooks.entry(event).or_default().push(HookMatcher {
+            matcher: matcher.map(str::to_string),
+            hooks: vec![HookCommand { kind: HookType::Command, command, timeout: Some(10), plugin: None }],
+        });
+    }
+
+    /// Append the hook's stdin payload to `file`, one JSON object per line.
+    fn log_payload(file: &Path) -> String {
+        format!("cat >> '{0}'; echo >> '{0}'", file.display())
+    }
+
+    fn read_payloads(file: &Path) -> Vec<Value> {
+        std::fs::read_to_string(file)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    struct Run {
+        outcome: QueryOutcome,
+        history: String,
+        tool_inputs: Vec<Value>,
+        requests: usize,
+    }
+
+    async fn drive(hooks: HookMap, steps: Vec<Step>, permission: PermissionDecision, is_subagent: bool) -> Run {
+        drive_nested(hooks, steps, permission, is_subagent, None).await
+    }
+
+    async fn drive_nested(
+        hooks: HookMap,
+        steps: Vec<Step>,
+        permission: PermissionDecision,
+        is_subagent: bool,
+        nested: Option<&'static str>,
+    ) -> Run {
+        let requests = Arc::new(StdMutex::new(0));
+        let provider = Arc::new(ScriptedProvider {
+            id: claurst_core::provider_id::ProviderId::new("mockprov"),
+            steps: StdMutex::new(steps.into()),
+            requests: requests.clone(),
+        });
+        let mut registry = claurst_api::ProviderRegistry::new();
+        registry.register(provider);
+
+        let client = claurst_api::AnthropicClient::new(claurst_api::client::ClientConfig {
+            api_key: "test-key".to_string(),
+            ..Default::default()
+        })
+        .expect("build test client");
+
+        let config = Config { provider: Some("mockprov".to_string()), hooks, ..Default::default() };
+        let ctx = ToolContext {
+            working_dir: std::env::temp_dir(),
+            permission_mode: claurst_core::config::PermissionMode::Default,
+            permission_handler: Arc::new(FixedHandler(permission)),
+            cost_tracker: claurst_core::cost::CostTracker::new(),
+            session_id: "hook-loop-test".to_string(),
+            file_history: Arc::new(parking_lot::Mutex::new(claurst_core::file_history::FileHistory::new())),
+            current_turn: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            non_interactive: true,
+            mcp_manager: None,
+            config,
+            managed_agent_config: None,
+            completion_notifier: None,
+            pending_permissions: None,
+            permission_manager: None,
+            user_question_tx: None,
+            cancel_token: tokio_util::sync::CancellationToken::new(),
+        };
+
+        let query_config = QueryConfig {
+            model: "mock-model".to_string(),
+            max_turns: 6,
+            provider_registry: Some(Arc::new(registry)),
+            is_subagent,
+            ..Default::default()
+        };
+
+        let inputs = Arc::new(StdMutex::new(Vec::new()));
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(RecTool { inputs: inputs.clone(), nested })];
+        let mut messages = vec![Message::user("start")];
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_query_loop(
+                &client,
+                &mut messages,
+                &tools,
+                &ctx,
+                &query_config,
+                claurst_core::cost::CostTracker::new(),
+                None,
+                tokio_util::sync::CancellationToken::new(),
+                None,
+            ),
+        )
+        .await
+        .expect("loop must not hang");
+
+        let tool_inputs = inputs.lock().unwrap().clone();
+        let requests = *requests.lock().unwrap();
+        Run { outcome, history: serde_json::to_string(&messages).unwrap(), tool_inputs, requests }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stop_fires_exactly_once_per_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let stop_log = dir.path().join("stop.log");
+        let mut hooks = HookMap::new();
+        on(&mut hooks, HookEvent::Stop, None, log_payload(&stop_log));
+        on(&mut hooks, HookEvent::SubagentStop, None, log_payload(&stop_log));
+
+        let run = drive(hooks, vec![Step::Tool("{}"), Step::Text("finished")], PermissionDecision::Allow, false).await;
+
+        assert!(matches!(run.outcome, QueryOutcome::EndTurn { .. }));
+        let payloads = read_payloads(&stop_log);
+        assert_eq!(payloads.len(), 1, "one Stop for one finished turn: {payloads:?}");
+        assert_eq!(payloads[0]["hook_event_name"], "Stop");
+        assert_eq!(payloads[0]["session_id"], "hook-loop-test");
+        assert_eq!(payloads[0]["stop_hook_active"], false);
+        assert_eq!(payloads[0]["last_assistant_message"], "finished");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn subagent_loop_fires_subagent_stop_instead_of_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let stop_log = dir.path().join("stop.log");
+        let mut hooks = HookMap::new();
+        on(&mut hooks, HookEvent::Stop, None, log_payload(&stop_log));
+        on(&mut hooks, HookEvent::SubagentStop, None, log_payload(&stop_log));
+
+        drive(hooks, vec![Step::Text("sub done")], PermissionDecision::Allow, true).await;
+
+        let payloads = read_payloads(&stop_log);
+        assert_eq!(payloads.len(), 1, "{payloads:?}");
+        assert_eq!(payloads[0]["hook_event_name"], "SubagentStop");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stop_hook_block_feeds_reason_back_and_continues() {
+        let dir = tempfile::tempdir().unwrap();
+        let stop_log = dir.path().join("stop.log");
+        let mut hooks = HookMap::new();
+        // Block the first stop only: once `stop_hook_active` is set, allow.
+        on(
+            &mut hooks,
+            HookEvent::Stop,
+            None,
+            format!(
+                "p=$(cat); echo \"$p\" >> '{}'; case \"$p\" in *'\"stop_hook_active\":true'*) exit 0;; esac; echo 'run the tests' >&2; exit 2",
+                stop_log.display()
+            ),
+        );
+
+        let run = drive(hooks, vec![Step::Text("first"), Step::Text("second")], PermissionDecision::Allow, false).await;
+
+        assert_eq!(run.requests, 2, "a blocked stop continues the loop once");
+        assert!(run.history.contains("Stop hook feedback: run the tests"), "{}", run.history);
+        let payloads = read_payloads(&stop_log);
+        assert_eq!(payloads.len(), 2);
+        assert_eq!(payloads[0]["stop_hook_active"], false);
+        assert_eq!(payloads[1]["stop_hook_active"], true);
+        match run.outcome {
+            QueryOutcome::EndTurn { message, .. } => assert_eq!(message.get_all_text(), "second"),
+            other => panic!("unexpected outcome {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pre_tool_use_deny_blocks_the_call() {
+        let mut hooks = HookMap::new();
+        on(&mut hooks, HookEvent::PreToolUse, Some("rec_tool"), "echo 'not today' >&2; exit 2".into());
+
+        let run = drive(hooks, vec![Step::Tool(r#"{"x":1}"#), Step::Text("ok")], PermissionDecision::Allow, false).await;
+
+        assert!(run.tool_inputs.is_empty(), "denied tool must not run");
+        assert!(run.history.contains("Blocked by PreToolUse hook: not today"), "{}", run.history);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn matcher_that_does_not_select_the_tool_leaves_it_alone() {
+        let mut hooks = HookMap::new();
+        on(&mut hooks, HookEvent::PreToolUse, Some("Edit|Write"), "exit 2".into());
+
+        let run = drive(hooks, vec![Step::Tool(r#"{"x":1}"#), Step::Text("ok")], PermissionDecision::Allow, false).await;
+
+        assert_eq!(run.tool_inputs, vec![serde_json::json!({"x": 1})]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn updated_input_replaces_input_and_post_tool_use_adds_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let post_log = dir.path().join("post.log");
+        let mut hooks = HookMap::new();
+        on(&mut hooks, HookEvent::PreToolUse, None, r#"echo '{"updatedInput":{"x":2}}'"#.into());
+        on(
+            &mut hooks,
+            HookEvent::PostToolUse,
+            Some("rec_.*"),
+            format!(
+                "cat >> '{0}'; echo >> '{0}'; echo '{{\"additionalContext\":\"lint clean\"}}'",
+                post_log.display()
+            ),
+        );
+
+        let run = drive(hooks, vec![Step::Tool(r#"{"x":1}"#), Step::Text("ok")], PermissionDecision::Allow, false).await;
+
+        assert_eq!(run.tool_inputs, vec![serde_json::json!({"x": 2})]);
+        let post = read_payloads(&post_log);
+        assert_eq!(post.len(), 1);
+        assert_eq!(post[0]["hook_event_name"], "PostToolUse");
+        assert_eq!(post[0]["tool_name"], "rec_tool");
+        assert_eq!(post[0]["tool_input"], serde_json::json!({"x": 2}));
+        assert_eq!(post[0]["tool_response"]["content"], "rec ran");
+        assert!(run.history.contains("PostToolUse hook context:\\nlint clean"), "{}", run.history);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hook_allow_skips_the_prompt_but_not_a_denial() {
+        let mut allow_hooks = HookMap::new();
+        on(&mut allow_hooks, HookEvent::PreToolUse, None, r#"echo '{"decision":"allow"}'"#.into());
+
+        // The policy would ask (a hard denial when non-interactive): the
+        // hook's allow answers the prompt.
+        let ask = PermissionDecision::Ask { reason: "policy asks".into() };
+        let run = drive(allow_hooks.clone(), vec![Step::Tool("{}"), Step::Text("ok")], ask, false).await;
+        assert_eq!(run.tool_inputs.len(), 1, "allow must answer the permission prompt");
+
+        // An explicit policy denial still wins.
+        let run = drive(allow_hooks, vec![Step::Tool("{}"), Step::Text("ok")], PermissionDecision::Deny, false).await;
+        assert!(run.tool_inputs.is_empty(), "allow must not override a denial");
+    }
+
+    /// A hook allowing a call (say, `Agent`) approves that call's own
+    /// prompts only, never prompts for other tools raised while it runs
+    /// (the sub-agent's Bash or Write calls).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hook_allow_does_not_approve_nested_tool_calls() {
+        let mut hooks = HookMap::new();
+        on(&mut hooks, HookEvent::PreToolUse, Some("rec_tool"), r#"echo '{"decision":"allow"}'"#.into());
+
+        let ask = PermissionDecision::Ask { reason: "policy asks".into() };
+        let run = drive_nested(hooks, vec![Step::Tool("{}"), Step::Text("ok")], ask, false, Some("Bash")).await;
+
+        assert_eq!(
+            run.tool_inputs,
+            vec![serde_json::json!({}), serde_json::json!({ "nested_allowed": false })],
+            "the allowed tool runs; its nested Bash prompt is still denied non-interactively"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hook_ask_prompts_even_when_policy_allows() {
+        let mut hooks = HookMap::new();
+        on(&mut hooks, HookEvent::PreToolUse, None, r#"echo '{"decision":"ask","reason":"double-check"}'"#.into());
+
+        // Non-interactive: the forced prompt cannot be answered, so it denies.
+        let run = drive(hooks, vec![Step::Tool("{}"), Step::Text("ok")], PermissionDecision::Allow, false).await;
+
+        assert!(run.tool_inputs.is_empty(), "ask must not run the tool unprompted");
+        assert!(run.history.contains("double-check"), "{}", run.history);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn post_model_turn_deny_stops_before_tools_run() {
+        let mut hooks = HookMap::new();
+        on(&mut hooks, HookEvent::PostModelTurn, None, "echo 'budget' >&2; exit 2".into());
+
+        let run = drive(hooks, vec![Step::Tool("{}"), Step::Text("never")], PermissionDecision::Allow, false).await;
+
+        assert!(matches!(run.outcome, QueryOutcome::EndTurn { .. }));
+        assert!(run.tool_inputs.is_empty());
+        assert_eq!(run.requests, 1);
     }
 }

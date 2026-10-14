@@ -1,4 +1,4 @@
-use crate::config::{HookEntry, HookEvent, McpServerConfig, Settings, Theme};
+use crate::config::{parse_hook_map, HookMap, McpServerConfig, Settings, Theme};
 use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -706,61 +706,18 @@ fn parse_mcp_servers(value: &Value) -> Result<Vec<McpServerConfig>> {
     Ok(servers)
 }
 
-fn parse_hooks(value: &Value) -> Result<HashMap<HookEvent, Vec<HookEntry>>> {
-    let Some(obj) = value.as_object() else {
-        return Err(anyhow!("hooks must be an object"));
-    };
-    let mut out = HashMap::new();
-    for (event_name, event_value) in obj {
-        let event = parse_hook_event(event_name)?;
-        let entries = event_value
-            .as_array()
-            .ok_or_else(|| anyhow!("hooks.{event_name} must be an array"))?;
-        let mut hook_entries = Vec::new();
-        for entry in entries {
-            let entry_obj = entry
-                .as_object()
-                .ok_or_else(|| anyhow!("hooks.{event_name}[] must be an object"))?;
-            let matcher = entry_obj
-                .get("matcher")
-                .and_then(Value::as_str)
-                .unwrap_or("*")
-                .to_string();
-            let hooks = entry_obj
-                .get("hooks")
-                .and_then(Value::as_array)
-                .ok_or_else(|| anyhow!("hooks.{event_name}[].hooks must be an array"))?;
-            for hook in hooks {
-                let hook_obj = hook
-                    .as_object()
-                    .ok_or_else(|| anyhow!("hooks.{event_name}[].hooks[] must be an object"))?;
-                let command = hook_obj
-                    .get("command")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow!("hooks.{event_name} hook is missing command"))?
-                    .to_string();
-                hook_entries.push(HookEntry {
-                    command,
-                    tool_filter: if matcher == "*" { None } else { Some(matcher.clone()) },
-                    blocking: false,
-                });
-            }
-        }
-        out.insert(event, hook_entries);
+/// Claude Code's hooks use the same shape as claurst's, so they import
+/// as-is. Events and handler types claurst does not implement are dropped
+/// (the warnings say which); an object with nothing importable is an error.
+fn parse_hooks(value: &Value) -> Result<HookMap> {
+    let (hooks, warnings) = parse_hook_map(value);
+    for warning in &warnings {
+        tracing::warn!("import hooks: {warning}");
     }
-    Ok(out)
-}
-
-fn parse_hook_event(name: &str) -> Result<HookEvent> {
-    match name {
-        "PreToolUse" => Ok(HookEvent::PreToolUse),
-        "PostToolUse" => Ok(HookEvent::PostToolUse),
-        "Stop" => Ok(HookEvent::Stop),
-        "PostModelTurn" => Ok(HookEvent::PostModelTurn),
-        "UserPromptSubmit" => Ok(HookEvent::UserPromptSubmit),
-        "Notification" => Ok(HookEvent::Notification),
-        _ => Err(anyhow!("unsupported hooks event: {name}")),
+    if hooks.is_empty() && !warnings.is_empty() {
+        return Err(anyhow!("no importable hooks: {}", warnings.join("; ")));
     }
+    Ok(hooks)
 }
 
 fn skip_reason_for_key(key: &str) -> &'static str {
@@ -856,10 +813,10 @@ mod tests {
             ]
         });
         let hooks = parse_hooks(&value).unwrap();
-        let entries = hooks.get(&HookEvent::PreToolUse).unwrap();
+        let entries = hooks.get(&crate::config::HookEvent::PreToolUse).unwrap();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].tool_filter.as_deref(), Some("Bash"));
-        assert_eq!(entries[0].command, "echo hi");
+        assert_eq!(entries[0].matcher.as_deref(), Some("Bash"));
+        assert_eq!(entries[0].hooks[0].command, "echo hi");
     }
 
     #[test]

@@ -44,6 +44,7 @@ use claurst_core::{
     cost::CostTracker,
     permissions::{AutoPermissionHandler, InteractivePermissionHandler, PermissionManager},
 };
+use claurst_core::hooks::{HookEventData, SessionEndReason, SessionStartSource};
 use claurst_tools::ToolContext;
 use clap::{ArgAction, Parser, ValueEnum};
 use parking_lot::Mutex as ParkingMutex;
@@ -488,8 +489,10 @@ async fn main() -> anyhow::Result<()> {
     config.disable_claude_mds = cli.no_claude_md || cli.bare;
     if cli.bare {
         // Bare mode runs no event hooks. Drop any hooks resolved from
-        // settings so no `run_hooks` call site has anything to execute.
+        // settings, and refuse plugin hooks for the whole process (a plugin
+        // reload must not add them back), so `run_hooks` has nothing to run.
         config.hooks.clear();
+        claurst_core::hooks::disable_plugin_hooks();
         // Nor does it list or run skills from the repository's own skill
         // directories (global and bundled skills stay).
         config.skills.skip_project_dirs = true;
@@ -807,9 +810,10 @@ async fn main() -> anyhow::Result<()> {
     {
         let plugin_cmd_count = plugin_registry.all_command_defs().len();
         let plugin_hook_count = plugin_registry
-            .build_hook_registry()
+            .hook_map()
             .values()
-            .map(|v| v.len())
+            .flatten()
+            .map(|group| group.hooks.len())
             .sum::<usize>();
         info!(
             plugins = plugin_registry.enabled_count(),
@@ -831,6 +835,10 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
+    // Plugin hooks run through the core hook engine after settings hooks
+    // (#447); the registry is then shared with commands and tools.
+    claurst_plugins::set_global_hooks(&plugin_registry);
+    claurst_plugins::set_global_registry(plugin_registry);
 
     // Build model registry for dynamic model/provider resolution.
     // The registry is pre-populated with a hardcoded snapshot and enriched
@@ -1535,7 +1543,7 @@ async fn run_headless(
     client: Arc<claurst_api::AnthropicClient>,
     tools: Arc<Vec<Box<dyn claurst_tools::Tool>>>,
     tool_ctx: ToolContext,
-    query_config: claurst_query::QueryConfig,
+    mut query_config: claurst_query::QueryConfig,
     cost_tracker: Arc<CostTracker>,
 ) -> anyhow::Result<i32> {
     use tokio_util::sync::CancellationToken;
@@ -1641,10 +1649,26 @@ async fn run_headless(
     let mut tool_ctx = tool_ctx;
     tool_ctx.session_id = session.id.clone();
     let mut history = std::mem::take(&mut session.messages);
+
+    // Hooks (#447): SessionStart, then UserPromptSubmit for a text prompt.
+    let start_source =
+        if history.is_empty() { SessionStartSource::Startup } else { SessionStartSource::Resume };
+    session_start_hooks(&tool_ctx, &mut query_config, start_source).await;
+    if cli.input_format != CliInputFormat::StreamJson {
+        if let Some(prompt_msg) = messages.first_mut() {
+            let prompt = prompt_msg.get_all_text();
+            let hooks = user_prompt_submit_hooks(&tool_ctx, &prompt).await;
+            if hooks.is_deny() {
+                eprintln!("Prompt blocked by UserPromptSubmit hook: {}", hooks.reason_or_default());
+                session_end_hooks(&tool_ctx, SessionEndReason::Other).await;
+                return Ok(1);
+            }
+            append_prompt_context(prompt_msg, hooks.additional_context);
+        }
+    }
     history.extend(messages);
     // A resumed session keeps its model unless --model overrides it, as in
     // the TUI. (A new session already records the configured model.)
-    let mut query_config = query_config;
     if cli.model.is_none() && !session.model.is_empty() {
         query_config.model.clone_from(&session.model);
     }
@@ -1672,6 +1696,8 @@ async fn run_headless(
             interrupt.cancel();
         }
     });
+    // `drive` takes the context; SessionEnd needs it after the run.
+    let end_ctx = tool_ctx.clone();
     let (outcome, messages) = headless::drive(
         client,
         tools,
@@ -1701,6 +1727,7 @@ async fn run_headless(
         );
     }
 
+    session_end_hooks(&end_ctx, SessionEndReason::Other).await;
     Ok(result.subtype.exit_code())
 }
 
@@ -1900,6 +1927,7 @@ async fn run_interactive(
         resume_id
     };
 
+    let mut resumed = false;
     let mut session = if let Some(ref id) = resume_id {
         match claurst_core::session_journal::load(&claurst_core::history::sessions_dir(), id) {
             Ok(claurst_core::session_journal::LoadedSession { session, replayed, rebuilt }) => {
@@ -1915,6 +1943,7 @@ async fn run_interactive(
                         replayed
                     );
                 }
+                resumed = true;
                 if let Some(saved_dir) = session.working_dir.as_ref() {
                     let saved_path = std::path::PathBuf::from(saved_dir);
                     if saved_path.exists() {
@@ -1955,6 +1984,8 @@ async fn run_interactive(
     }
     let mut base_query_config = query_config;
     base_query_config.session_journal = Some(session_journal.clone());
+    let start_source = if resumed { SessionStartSource::Resume } else { SessionStartSource::Startup };
+    session_start_hooks(&tool_ctx, &mut base_query_config, start_source).await;
     // Goal autonomy is now an in-loop continuation policy (issue #230 / MI-3):
     // run_query_loop itself decides whether to continue toward an active goal
     // after each turn, instead of the REPL re-dispatching a fresh turn. Select
@@ -2725,7 +2756,7 @@ async fn run_interactive(
                                     // when the user types /hooks in the TUI prompt, so
                                     // this branch only triggers when the command returns
                                     // the variant explicitly (e.g. from a non-prompt context).
-                                    app.hooks_config_menu.open();
+                                    app.hooks_config_menu.open(&app.config.hooks);
                                     app.status_message =
                                         Some("Hooks configuration browser".to_string());
                                 }
@@ -3062,24 +3093,18 @@ async fn run_interactive(
                             }
                         }
 
-                        // Fire UserPromptSubmit hook (non-blocking)
-                        if !cmd_ctx.config.hooks.is_empty() {
-                            let hook_ctx = claurst_core::hooks::HookContext {
-                                event: "UserPromptSubmit".to_string(),
-                                tool_name: None,
-                                tool_input: None,
-                                tool_output: Some(input.clone()),
-                                is_error: None,
-                                session_id: Some(tool_ctx.session_id.clone()),
-                            };
-                            claurst_core::hooks::run_hooks(
-                                &cmd_ctx.config.hooks,
-                                claurst_core::config::HookEvent::UserPromptSubmit,
-                                &hook_ctx,
-                                &tool_ctx.working_dir,
-                            )
-                            .await;
+                        // UserPromptSubmit hooks (#447): a deny keeps the
+                        // prompt out of the conversation; context is sent with it.
+                        let prompt_hooks = user_prompt_submit_hooks(&tool_ctx, &input).await;
+                        if prompt_hooks.is_deny() {
+                            app.status_message = Some(format!(
+                                "Prompt blocked by UserPromptSubmit hook: {}",
+                                prompt_hooks.reason_or_default()
+                            ));
+                            app.set_prompt_text(input);
+                            continue;
                         }
+                        let prompt_context = prompt_hooks.additional_context;
 
                         // Regular user message (with optional image attachments + file injection)
                         let pending_imgs = app.prompt_input.clear_images();
@@ -3131,7 +3156,7 @@ async fn run_interactive(
                             // No oversized files: inject within-limit files and send
                             let file_prefix = claurst_tui::file_injection::build_file_blocks(&within_limit);
 
-                            let user_msg = if !file_prefix.is_empty() || !pending_imgs.is_empty() {
+                            let mut user_msg = if !file_prefix.is_empty() || !pending_imgs.is_empty() {
                                 let mut blocks: Vec<claurst_core::types::ContentBlock> = Vec::new();
 
                                 // Add file blocks if there's any file content
@@ -3160,6 +3185,7 @@ async fn run_interactive(
                             } else {
                                 claurst_core::types::Message::user(input.clone())
                             };
+                            append_prompt_context(&mut user_msg, prompt_context);
 
                             messages.push(user_msg.clone());
                             app.push_message(user_msg);
@@ -3167,7 +3193,7 @@ async fn run_interactive(
                             session.updated_at = chrono::Utc::now();
                         } else {
                             // File injection disabled: send as-is
-                            let user_msg = if pending_imgs.is_empty() {
+                            let mut user_msg = if pending_imgs.is_empty() {
                                 claurst_core::types::Message::user(input.clone())
                             } else {
                                 let mut blocks: Vec<claurst_core::types::ContentBlock> = pending_imgs
@@ -3187,6 +3213,7 @@ async fn run_interactive(
                                 blocks.push(claurst_core::types::ContentBlock::Text { text: input.clone() });
                                 claurst_core::types::Message::user_blocks(blocks)
                             };
+                            append_prompt_context(&mut user_msg, prompt_context);
 
                             messages.push(user_msg.clone());
                             app.push_message(user_msg);
@@ -4523,7 +4550,71 @@ async fn run_interactive(
     }
     status_line_cancel.cancel();
     restore_terminal(&mut terminal)?;
+    session_end_hooks(&tool_ctx, SessionEndReason::PromptInputExit).await;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Session and prompt hooks (#447)
+// ---------------------------------------------------------------------------
+
+fn session_hook_payload<'a>(
+    tool_ctx: &'a ToolContext,
+    data: HookEventData<'a>,
+) -> claurst_core::hooks::HookPayload<'a> {
+    claurst_core::hooks::HookPayload::new(&tool_ctx.session_id, &tool_ctx.working_dir, data)
+}
+
+/// Fire SessionStart hooks. Their context joins the session context sent
+/// with every request.
+async fn session_start_hooks(
+    tool_ctx: &ToolContext,
+    query_config: &mut claurst_query::QueryConfig,
+    source: SessionStartSource,
+) {
+    let result = claurst_core::hooks::run_hooks(
+        &tool_ctx.config.hooks,
+        &session_hook_payload(tool_ctx, HookEventData::SessionStart { source }),
+    )
+    .await;
+    if let Some(context) = result.additional_context {
+        query_config.session_context = Some(match query_config.session_context.take() {
+            Some(existing) => format!("{existing}\n\n# SessionStart hook context\n{context}"),
+            None => format!("# SessionStart hook context\n{context}"),
+        });
+    }
+}
+
+/// Fire SessionEnd hooks and wait for them.
+async fn session_end_hooks(tool_ctx: &ToolContext, reason: SessionEndReason) {
+    claurst_core::hooks::run_hooks(
+        &tool_ctx.config.hooks,
+        &session_hook_payload(tool_ctx, HookEventData::SessionEnd { reason }),
+    )
+    .await;
+}
+
+/// Fire UserPromptSubmit hooks for `prompt`.
+async fn user_prompt_submit_hooks(tool_ctx: &ToolContext, prompt: &str) -> claurst_core::hooks::HookResult {
+    claurst_core::hooks::run_hooks(
+        &tool_ctx.config.hooks,
+        &session_hook_payload(tool_ctx, HookEventData::UserPromptSubmit { prompt }),
+    )
+    .await
+}
+
+/// Send UserPromptSubmit hook context with the prompt, as its own text block.
+fn append_prompt_context(message: &mut claurst_core::types::Message, context: Option<String>) {
+    use claurst_core::types::{ContentBlock, MessageContent};
+    let Some(context) = context else { return };
+    let block = ContentBlock::Text { text: format!("UserPromptSubmit hook context:\n{context}") };
+    match &mut message.content {
+        MessageContent::Blocks(blocks) => blocks.push(block),
+        MessageContent::Text(text) => {
+            let text = std::mem::take(text);
+            message.content = MessageContent::Blocks(vec![ContentBlock::Text { text }, block]);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5162,28 +5253,27 @@ mod bare_mode_tests {
         let registry = claurst_plugins::PluginRegistry::new();
         assert_eq!(registry.enabled_count(), 0, "no plugins enabled");
         assert!(registry.all_command_defs().is_empty(), "no plugin commands");
-        let hook_count: usize = registry
-            .build_hook_registry()
-            .values()
-            .map(|v| v.len())
-            .sum();
-        assert_eq!(hook_count, 0, "no plugin hooks");
+        assert!(registry.hook_map().is_empty(), "no plugin hooks");
         assert!(registry.all_mcp_servers().is_empty(), "no plugin MCP servers");
     }
 
     #[test]
     fn bare_mode_clears_hooks() {
-        use claurst_core::config::{HookEntry, HookEvent};
+        use claurst_core::config::{HookCommand, HookEvent, HookMap, HookMatcher, HookType};
         // Simulate settings-derived hooks, then apply the bare-mode clear that
-        // main() performs. Every `run_hooks` call site guards on
-        // `config.hooks.is_empty()`, so an empty map means nothing executes.
-        let mut hooks: std::collections::HashMap<HookEvent, Vec<HookEntry>> =
-            std::collections::HashMap::new();
+        // main() performs. Bare mode also registers no plugin hooks, so an
+        // empty map means `run_hooks` has nothing to execute.
+        let mut hooks = HookMap::new();
         hooks.insert(
             HookEvent::PreToolUse,
-            vec![HookEntry {
-                command: "echo untrusted".to_string(),
-                ..Default::default()
+            vec![HookMatcher {
+                matcher: None,
+                hooks: vec![HookCommand {
+                    kind: HookType::Command,
+                    command: "echo untrusted".to_string(),
+                    timeout: None,
+                    plugin: None,
+                }],
             }],
         );
         assert!(!hooks.is_empty(), "precondition: hooks are present");

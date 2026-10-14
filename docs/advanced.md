@@ -51,7 +51,7 @@ The context window has a finite size. Auto-compaction automatically summarises t
 
 Claurst tracks token usage after every model turn. When usage crosses the auto-compact threshold — which is the effective context window size minus a 13,000-token buffer — it runs `compactConversation` to summarise the history and replaces the messages with a compact summary plus any trailing context.
 
-The `PreCompact` hook fires before compaction (exit code 2 blocks it). The `PostCompact` hook fires after.
+The `PreCompact` hook fires before compaction, with `trigger` set to `auto` or `manual`; it cannot block it. There is no `PostCompact` hook. See [Hooks](hooks.md).
 
 ### Controlling auto-compaction
 
@@ -176,15 +176,6 @@ Subagents spawned via the `Agent` tool can operate in isolated git worktrees to 
 
 - `EnterWorktreeTool` — checks out a new worktree and switches the agent's working directory to it.
 - `ExitWorktreeTool` — removes the worktree and returns the agent to the original directory.
-
-### Custom worktree backends
-
-For non-git repositories or specialised isolation requirements, the `WorktreeCreate` and `WorktreeRemove` hook events let you substitute an external worktree manager:
-
-- `WorktreeCreate` receives `{"name": "<slug>"}` and must write the absolute path of the created directory to stdout.
-- `WorktreeRemove` receives `{"worktree_path": "<path>"}` and is responsible for cleanup.
-
-This means worktrees can be Docker containers, virtual machines, or any directory-backed isolation primitive.
 
 ---
 
@@ -595,7 +586,7 @@ The `/memory` command opens the memory management UI for viewing, editing, and o
 | `autoAccept` | Accepts all tool calls without prompting. Use with caution. |
 | `bypassPermissions` | Skips the permission system entirely. Intended for trusted automation only. |
 
-The active mode is set with `--permission-mode <mode>` or via the `PermissionRequest` hook.
+The active mode is set with `--permission-mode <mode>`.
 
 ### Tool risk classification
 
@@ -613,7 +604,7 @@ Every tool is classified into a risk tier that determines the default permission
 
 Within `BashTool`, commands are further classified by analysing the command string against known patterns. Commands matching dangerous patterns (e.g. `rm -rf`, `dd if=`, pipe chains with destructive intent) receive a higher risk rating and may be blocked depending on the active permission mode.
 
-The `PermissionRequest` hook can intercept any tool call before the user prompt is displayed, allowing automated allow/deny decisions based on context.
+A `PreToolUse` hook can decide a tool call before the permission prompt: `allow` skips the prompt, `ask` forces it, `deny` blocks the call. See [Hooks](hooks.md).
 
 ---
 
@@ -656,18 +647,18 @@ Custom commands appear alongside built-in commands in the `/` menu.
 
 ## Formatters
 
-Auto-formatters run automatically after file writes when configured. The typical setup uses a `PostToolUse` hook on `FileWrite` or `FileEdit`:
+Auto-formatters run automatically after file writes when configured. A `PostToolUse` hook on `Write` and `Edit` works too:
 
 ```json
 {
   "hooks": {
     "PostToolUse": [
       {
-        "matcher": "FileWrite",
+        "matcher": "Edit|Write",
         "hooks": [
           {
             "type": "command",
-            "command": "bash -c 'FILE=$(jq -r .inputs.file_path); prettier --write \"$FILE\" 2>/dev/null || true'"
+            "command": "f=$(jq -r .tool_input.file_path); prettier --write \"$f\" 2>/dev/null || true"
           }
         ]
       }
@@ -683,7 +674,7 @@ Common formatters:
 - **gofmt** (`gofmt -w <file>`) — Go.
 - **clang-format** (`clang-format -i <file>`) — C/C++.
 
-The hook exit code does not affect the tool call result; formatters should suppress non-zero exits for unknown file types (`|| true`).
+A `PostToolUse` hook cannot undo the tool call; a non-zero exit other than 2 is only logged. Suppress failures for unknown file types (`|| true`).
 
 ---
 
@@ -711,8 +702,6 @@ Environment variables can be set in `.claude/settings.json` under an `env` key. 
   }
 }
 ```
-
-The `CwdChanged` hook can also write environment exports to `$CLAUDE_ENV_FILE` to propagate dynamic values into subsequent Bash commands within the same session.
 
 ---
 
