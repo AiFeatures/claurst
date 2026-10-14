@@ -1099,7 +1099,7 @@ use super::types::{ContextMenuItem, ContextMenuState};
         session.title = Some(title.to_string());
         session.working_dir = Some(working_dir.to_string_lossy().into_owned());
         session.add_message(Message::user("hello"));
-        claurst_core::history::save_session(&session).await.unwrap();
+        claurst_core::history::save_session(&mut session).await.unwrap();
         session.id
     }
 

@@ -2541,7 +2541,7 @@ async fn run_interactive(
                                         Some(destination.display().to_string());
                                     session.updated_at = chrono::Utc::now();
                                     let _ =
-                                        claurst_core::history::save_session(&session).await;
+                                        claurst_core::history::save_session(&mut session).await;
                                     // NOTE: opencode appends a synthetic
                                     // <system-reminder> prompt after a move. claurst
                                     // re-derives working_directory into every turn's
@@ -2585,7 +2585,7 @@ async fn run_interactive(
                                     session.messages = messages.clone();
                                     session.compactions.push(record);
                                     session.updated_at = chrono::Utc::now();
-                                    let _ = claurst_core::history::save_session(&session).await;
+                                    let _ = claurst_core::history::save_session(&mut session).await;
                                     app.status_message = Some(report);
                                 }
                                 Some(CommandResult::OpenRewindOverlay) => {
@@ -2653,7 +2653,7 @@ async fn run_interactive(
                                     session.updated_at = chrono::Utc::now();
                                     cmd_ctx.session_title = session.title.clone();
                                     let _ =
-                                        claurst_core::history::save_session(&session).await;
+                                        claurst_core::history::save_session(&mut session).await;
                                     claurst_tui::update_terminal_title(Some(&title));
                                     app.status_message = Some(format!(
                                         "Session renamed to \"{}\".",
@@ -3433,7 +3433,7 @@ async fn run_interactive(
                         // Persist the session URL into the saved session record.
                         session.remote_session_url = Some(session_url.clone());
                         session.updated_at = chrono::Utc::now();
-                        let _ = claurst_core::history::save_session(&session).await;
+                        let _ = claurst_core::history::save_session(&mut session).await;
 
                         // Wire the BridgeSessionInfo relay so live tool/text events reach
                         // the web UI via /api/bridge/sessions. This runs alongside
@@ -3587,7 +3587,7 @@ async fn run_interactive(
                         session.updated_at = chrono::Utc::now();
                         cmd_ctx.session_title = Some(title.clone());
                         app.session_title = Some(title);
-                        let _ = claurst_core::history::save_session(&session).await;
+                        let _ = claurst_core::history::save_session(&mut session).await;
                     }
                     Ok(TuiBridgeEvent::Error(msg)) => {
                         app.bridge_state = BridgeConnectionState::Failed {
@@ -4126,7 +4126,7 @@ async fn run_interactive(
                 }
 
                 // Save session to JSONL (primary storage)
-                let _ = claurst_core::history::save_session(&session).await;
+                let _ = claurst_core::history::save_session(&mut session).await;
 
                 // Also index into SQLite for /search support
                 {
