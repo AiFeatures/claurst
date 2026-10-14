@@ -50,7 +50,8 @@ pub use compact::{
     context_window_for_model, estimate_context_tokens, format_compact_summary, get_compact_prompt,
     group_messages_for_compact, micro_compact_if_needed, reactive_compact,
     resolve_context_window, should_auto_compact, should_auto_compact_for_window, should_compact,
-    should_context_collapse, snip_compact,
+    should_context_collapse, snip_compact, auto_compact_threshold, summary_token_budget, Compaction,
+    CompactionRecord, CompactionTrigger, UsageMark,
 };
 pub use session_memory::{
     ExtractedMemory, MemoryCategory, SessionMemoryExtractor, SessionMemoryState,
@@ -114,10 +115,12 @@ pub struct QueryConfig {
     pub working_directory: Option<String>,
     pub thinking_budget: Option<u32>,
     pub temperature: Option<f32>,
-    /// Maximum cumulative character count of all tool results in the message
-    /// history before older results are replaced with a truncation notice.
-    /// Mirrors the TS `applyToolResultBudget` mechanism.  Default: 50_000.
-    pub tool_result_budget: usize,
+    /// Per-item cap, in bytes, applied to each tool result when it is
+    /// appended to the history: longer output keeps its head and tail with a
+    /// note giving the omitted size (issue #441). History is never rewritten
+    /// afterwards, so the prompt prefix stays stable. `0` disables the cap.
+    /// Default: [`DEFAULT_TOOL_RESULT_MAX_BYTES`] (~16k tokens).
+    pub tool_result_max_bytes: usize,
     /// Optional effort level.  When set and `thinking_budget` is `None`,
     /// the effort level's `thinking_budget_tokens()` is used as the
     /// thinking budget.  Also provides a temperature override when the
@@ -178,6 +181,11 @@ pub struct QueryConfig {
     /// goal's guards allow, injecting the goal continuation message as the next
     /// user turn — instead of the CLI REPL re-dispatching a fresh turn.
     pub continuation: crate::continuation::ContinuationMode,
+    /// Automatic compaction (issue #441): the pre-request threshold check and
+    /// compact-and-retry on a provider context-window error. `false` (from
+    /// `--no-auto-compact`) leaves the history alone and surfaces overflow
+    /// errors; `/compact` still works.
+    pub auto_compact: bool,
 }
 
 impl Default for QueryConfig {
@@ -196,7 +204,7 @@ impl Default for QueryConfig {
             working_directory: None,
             thinking_budget: None,
             temperature: None,
-            tool_result_budget: 50_000,
+            tool_result_max_bytes: DEFAULT_TOOL_RESULT_MAX_BYTES,
             effort_level: None,
             command_queue: None,
             skill_index: None,
@@ -209,6 +217,7 @@ impl Default for QueryConfig {
             managed_agents: None,
             enabled_tools: None,
             continuation: crate::continuation::ContinuationMode::Default,
+            auto_compact: true,
         }
     }
 }
@@ -274,6 +283,9 @@ pub enum QueryEvent {
     /// `state` is Warning (≥ 80 %) or Critical (≥ 95 %).
     /// `pct_used` is the fraction of the context window consumed (0.0–1.0).
     TokenWarning { state: TokenWarningState, pct_used: f64 },
+    /// The loop compacted the history (issue #441). The caller records the
+    /// entry in the session; `tokens_after` is the new context estimate.
+    Compacted(CompactionRecord),
     /// Provider-reported subscription usage (0-100 per window), e.g. the
     /// Codex `x-codex-*` rate-limit headers.
     RateLimits { primary_used_percent: Option<f32>, secondary_used_percent: Option<f32> },
@@ -286,6 +298,14 @@ pub enum QueryEvent {
 // ---------------------------------------------------------------------------
 // Query loop
 // ---------------------------------------------------------------------------
+
+/// Default per-item cap for tool results appended to the history: 64k bytes,
+/// roughly 16k tokens. It sits above the largest tool-native output window
+/// (Read's 50 KiB page and Bash's 50 KiB window, each plus a continuation
+/// trailer) so the loop never re-cuts output a tool already bounded; cutting
+/// the middle of a Read page would hide the gap behind an intact offset
+/// trailer. It only catches tools without their own bound.
+pub const DEFAULT_TOOL_RESULT_MAX_BYTES: usize = 64_000;
 
 /// Maximum number of max_tokens continuation attempts before surfacing the
 /// partial response.  Mirrors `MAX_OUTPUT_TOKENS_RECOVERY_LIMIT` in query.ts.
@@ -422,6 +442,12 @@ pub async fn run_query_loop(
 
     let mut turn = 0u32;
     let mut compact_state = compact::AutoCompactState::default();
+    // Prompt-token count reported for the last request, anchoring the
+    // pre-request context projection. Cleared whenever history is compacted.
+    let mut last_usage: Option<compact::UsageMark> = None;
+    // One-shot guard: a context-window error compacts and retries the request
+    // once; a second overflow on the same request surfaces the error.
+    let mut overflow_recovery_used = false;
     // Tracks how many consecutive max_tokens recoveries we've attempted so
     // we don't loop forever on a model that can't finish within any budget.
     let mut max_tokens_recovery_count: u32 = 0;
@@ -618,28 +644,60 @@ pub async fn run_query_loop(
             }
         }
 
-        // Apply tool-result budget: if the cumulative size of all tool results
-        // in the conversation exceeds the configured threshold, replace the
-        // oldest results with a placeholder until we're back under budget.
-        // This mirrors the TS `applyToolResultBudget` call in query.ts.
-        if config.tool_result_budget > 0 {
-            let (budgeted, truncated) =
-                apply_tool_result_budget(std::mem::take(messages), config.tool_result_budget);
-            *messages = budgeted;
-            if truncated > 0 {
-                info!(
-                    truncated,
-                    budget = config.tool_result_budget,
-                    "Tool-result budget exceeded: truncated {} result(s)",
-                    truncated
-                );
-                if let Some(ref tx) = event_tx {
-                    let _ = tx.send(QueryEvent::Status(format!(
-                        "[{} older tool result(s) truncated to save context]",
-                        truncated
-                    )));
-                }
+        // Resolve where this request goes once, up front, so the compaction
+        // check below summarises through the same provider the request uses.
+        let route = config.provider_registry.as_deref().map(|registry| {
+            resolve_provider_route(registry, config, tool_ctx, &effective_model, client)
+        });
+
+        // Pre-request compaction check point (issue #441). It runs before
+        // every request, including the one that follows each tool batch, so
+        // a large batch of tool results is measured before it is sent.
+        //
+        // The window comes from the models.dev-backed registry (correct for
+        // every provider — 1M Gemini/GPT windows, 32k local models) with the
+        // Claude-centric heuristic as fallback (#216). The numerator anchors
+        // on the real prompt-token count of the last request and estimates
+        // only what was appended since (#231).
+        let context_window = compact::resolve_context_window(
+            config.model_registry.as_deref(),
+            route.as_ref().map_or_else(
+                || tool_ctx.config.provider.as_deref().unwrap_or("anthropic"),
+                |route| route.provider_id.as_str(),
+            ),
+            &effective_model,
+        );
+        let context_tokens = compact::estimate_context_tokens(messages, last_usage);
+
+        // Emit token warning events when approaching context limits.
+        // Thresholds mirror TypeScript autoCompact.ts: 80% → Warning, 95% → Critical.
+        let warning_state =
+            compact::calculate_token_warning_state_for_window(context_tokens, context_window);
+        if warning_state != compact::TokenWarningState::Ok {
+            if let Some(ref tx) = event_tx {
+                let _ = tx.send(QueryEvent::TokenWarning {
+                    state: warning_state,
+                    pct_used: context_tokens as f64 / context_window as f64,
+                });
             }
+        }
+
+        if config.auto_compact
+            && compact_before_request(
+                messages,
+                route.as_ref(),
+                client,
+                &effective_model,
+                context_tokens,
+                context_window,
+                config.max_tokens,
+                &mut compact_state,
+                event_tx.as_ref(),
+                &cancel_token,
+            )
+            .await
+        {
+            last_usage = None;
         }
 
         // Request-boundary invariant pass (issue #229 / MI-2). Compaction,
@@ -836,132 +894,16 @@ pub async fn run_query_loop(
             Arc::new(claurst_api::streaming::NullStreamHandler)
         };
 
-        // Non-Anthropic provider dispatch: if the model is "provider/model"
-        // format and the registry has that provider, use it directly.
-        //
-        // Provider resolution priority:
-        //   1. Explicit "provider/model" format in the model string
-        //   2. config.provider setting (from --provider flag or settings.json)
-        //   3. Model registry lookup (e.g. "gemini-3-flash-preview" → google)
-        //   4. Default to "anthropic"
-        if let Some(ref registry) = config.provider_registry {
-            let (provider_id_str, model_id_str) = if let Some(p) = tool_ctx.config.provider.as_deref().filter(|p| *p != "anthropic") {
-                // Explicit non-Anthropic provider in config — use it.
-                // If the stored model is in canonical "provider/model" form,
-                // strip the top-level provider prefix before sending it to the
-                // provider adapter. If it contains an additional slash
-                // (e.g. "meta-llama/Llama-3.3..." on OpenRouter), preserve it.
-                let provider_prefix = format!("{}/", p);
-                let model_id = effective_model
-                    .strip_prefix(&provider_prefix)
-                    .unwrap_or(&effective_model)
-                    .to_string();
-                (p.to_string(), model_id)
-            } else if let Some((p, m)) = effective_model.split_once('/') {
-                // No explicit provider but model has "provider/model" format.
-                // Check whether `p` is a known provider or just a model
-                // namespace (e.g. "meta-llama/Llama-3" on OpenRouter).
-                let known_providers = [
-                    // Native (non-OpenAI-compat) providers
-                    "anthropic", "openai", "google", "azure", "amazon-bedrock",
-                    "github-copilot", "codex", "openai-codex", "cohere", "minimax",
-                    // Local / self-hosted
-                    "ollama",
-                    "lmstudio", "lm-studio",
-                    "llamacpp", "llama-cpp", "llama-server",
-                    // OpenAI-compat cloud providers
-                    "groq", "mistral", "deepseek", "xai", "perplexity", "cerebras",
-                    "openrouter", "togetherai", "together-ai", "deepinfra", "venice",
-                    "huggingface", "nvidia", "fireworks", "sambanova",
-                    // Additional OpenAI-compat providers
-                    "qwen", "alibaba", "siliconflow",
-                    "moonshot", "moonshotai",
-                    "zhipu", "zhipuai",
-                    "zai",
-                    "nebius", "novita", "ovhcloud", "scaleway",
-                    "vultr", "vultr-ai",
-                    "baseten", "friendli", "upstage", "stepfun",
-                ];
-                if known_providers.contains(&p) {
-                    (p.to_string(), m.to_string())
-                } else {
-                    // Treat the whole string as the model ID, fall through
-                    // to auto-detection below.
-                    let fallback_provider = tool_ctx.config.provider.as_deref().unwrap_or("anthropic");
-                    (fallback_provider.to_string(), effective_model.clone())
-                }
-            } else {
-                // No explicit provider set (or set to "anthropic"): try the
-                // model registry to auto-detect provider from the model name.
-                // Use the shared model registry from QueryConfig if available;
-                // otherwise construct a temporary one.
-                let temp_reg;
-                let model_reg: &claurst_api::ModelRegistry = if let Some(ref shared) = config.model_registry {
-                    shared
-                } else {
-                    temp_reg = {
-                        let mut r = claurst_api::ModelRegistry::new();
-                        if let Some(cache_dir) = dirs::cache_dir() {
-                            let cache_path = cache_dir.join("claurst").join("models_dev.json");
-                            r.load_cache(&cache_path);
-                        }
-                        r
-                    };
-                    &temp_reg
-                };
-                if let Some(detected_pid) = model_reg.find_provider_for_model(&effective_model) {
-                    let pid_str = detected_pid.to_string();
-                    if pid_str != "anthropic" {
-                        (pid_str, effective_model.clone())
-                    } else {
-                        ("anthropic".to_string(), effective_model.clone())
-                    }
-                } else {
-                    // Fall back to config.provider (may be "anthropic" or None→"anthropic")
-                    let p = tool_ctx.config.provider.as_deref().unwrap_or("anthropic");
-                    (p.to_string(), effective_model.clone())
-                }
-            };
-
-            // Dispatch through the provider path for non-Anthropic providers,
-            // AND for Anthropic when the pre-built client has no API key
-            // (user started without ANTHROPIC_API_KEY but added one via /connect).
-            let use_provider_dispatch = provider_id_str != "anthropic"
-                || client.api_key_is_empty();
-
+        // Non-Anthropic provider dispatch through the route resolved at the
+        // top of this iteration (see `resolve_provider_route`).
+        if let Some(route) = route {
+            let ProviderRoute {
+                provider_id: provider_id_str,
+                model_id: model_id_str,
+                use_provider_dispatch,
+                provider,
+            } = route;
             if use_provider_dispatch {
-                let pid = claurst_core::provider_id::ProviderId::new(&provider_id_str);
-
-                // Always prefer a fresh provider built from the auth_store so
-                // that keys added at runtime via /connect are picked up
-                // immediately — even when the provider was pre-registered at
-                // startup with a stale or missing key.
-                let runtime_provider =
-                    claurst_api::registry::runtime_provider_for(&provider_id_str);
-
-                let registry_provider = if runtime_provider.is_some() {
-                    // Fresh auth_store key available — use it instead of the
-                    // (possibly stale) registry entry.
-                    None
-                } else {
-                    registry.get(&pid).cloned()
-                };
-
-                let mut provider = runtime_provider.or(registry_provider);
-
-                // Rebuild providers using the unified base resolver so overrides
-                // from settings/env/defaults are applied consistently.
-                if claurst_api::registry::resolve_provider_api_base(
-                    &tool_ctx.config,
-                    &provider_id_str,
-                ).is_some() {
-                    if let Some(overridden) = claurst_api::registry::provider_from_config(
-                        &tool_ctx.config,
-                        &provider_id_str,
-                    ) {
-                        provider = Some(overridden);
-                    }
-                }
                 if let Some(provider) = provider {
                     debug!(provider = %provider_id_str, model = %model_id_str, "Dispatching to non-Anthropic provider");
 
@@ -1070,6 +1012,26 @@ pub async fn run_query_loop(
                     let mut stream = match provider.create_message_stream(provider_request).await {
                         Ok(s) => s,
                         Err(e) => {
+                            // Context-window error: compact once and retry.
+                            if config.auto_compact
+                                && !overflow_recovery_used
+                                && provider_error_is_overflow(&e)
+                            {
+                                overflow_recovery_used = true;
+                                if compact_after_overflow(
+                                    messages,
+                                    provider.as_ref(),
+                                    &model_id_str,
+                                    config.max_tokens,
+                                    event_tx.as_ref(),
+                                )
+                                .await
+                                {
+                                    last_usage = None;
+                                    turn -= 1;
+                                    continue;
+                                }
+                            }
                             error!(provider = %provider_id_str, error = %e, "Provider stream failed");
                             return QueryOutcome::Error(
                                 claurst_core::error::ClaudeError::Api(e.to_string())
@@ -1103,7 +1065,7 @@ pub async fn run_query_loop(
                     // Set when the stream yields a mid-stream `Err`. The
                     // accumulated text/tool-calls are then incomplete and MUST
                     // NOT be assembled into a "completed" turn (issue #215).
-                    let mut provider_stream_error: Option<String> = None;
+                    let mut provider_stream_error: Option<claurst_api::ProviderError> = None;
 
                     loop {
                         tokio::select! {
@@ -1120,7 +1082,7 @@ pub async fn run_query_loop(
                                     None => break,
                                     Some(Err(e)) => {
                                         error!(provider = %provider_id_str, error = %e, "Provider stream error");
-                                        provider_stream_error = Some(e.to_string());
+                                        provider_stream_error = Some(e);
                                         break;
                                     }
                                     Some(Ok(evt)) => {
@@ -1216,6 +1178,27 @@ pub async fn run_query_loop(
                     // retry semantics: retry the turn if retries remain,
                     // otherwise surface the failure as a QueryOutcome::Error.
                     if let Some(err) = provider_stream_error {
+                        // A context-window error is not transient: compact
+                        // once and retry instead of resending the same prompt.
+                        if config.auto_compact
+                            && !overflow_recovery_used
+                            && provider_error_is_overflow(&err)
+                        {
+                            overflow_recovery_used = true;
+                            if compact_after_overflow(
+                                messages,
+                                provider.as_ref(),
+                                &model_id_str,
+                                config.max_tokens,
+                                event_tx.as_ref(),
+                            )
+                            .await
+                            {
+                                last_usage = None;
+                                turn -= 1;
+                                continue;
+                            }
+                        }
                         if retries_left > 0 {
                             retries_left -= 1;
                             warn!(
@@ -1311,6 +1294,11 @@ pub async fn run_query_loop(
                         usage.cache_creation_input_tokens,
                         usage.cache_read_input_tokens,
                     );
+                    last_usage = Some(compact::UsageMark {
+                        prompt_tokens: usage.total_input(),
+                        message_count: messages.len(),
+                    });
+                    overflow_recovery_used = false;
 
                     messages.push(assistant_msg.clone());
 
@@ -1360,7 +1348,10 @@ pub async fn run_query_loop(
                             }
                             tool_results.push(ContentBlock::ToolResult {
                                 tool_use_id: tool_id,
-                                content: claurst_core::types::ToolResultContent::Text(result.content),
+                                content: tool_result_for_history(
+                                    result.content,
+                                    config.tool_result_max_bytes,
+                                ),
                                 is_error: Some(result.is_error),
                             });
                         }
@@ -1459,6 +1450,27 @@ pub async fn run_query_loop(
         let mut stream_rx = match client.create_message_stream(request, handler).await {
             Ok(rx) => rx,
             Err(e) => {
+                // Context-window error: compact once and retry.
+                if config.auto_compact
+                    && !overflow_recovery_used
+                    && claude_error_is_overflow(&e)
+                {
+                    overflow_recovery_used = true;
+                    let summariser = anthropic_summariser(client);
+                    if compact_after_overflow(
+                        messages,
+                        &summariser,
+                        &effective_model,
+                        config.max_tokens,
+                        event_tx.as_ref(),
+                    )
+                    .await
+                    {
+                        last_usage = None;
+                        turn -= 1;
+                        continue;
+                    }
+                }
                 // On overloaded/rate-limit errors, attempt one switch to the fallback model.
                 let err_str = e.to_string().to_lowercase();
                 if !used_fallback
@@ -1494,6 +1506,8 @@ pub async fn run_query_loop(
         let mut accumulator = StreamAccumulator::new();
         let stall_deadline = tokio::time::sleep(STALL_TIMEOUT);
         tokio::pin!(stall_deadline);
+        // Set when the stream reports a context-window error event.
+        let mut stream_overflow = false;
 
         let stream_stalled = loop {
             tokio::select! {
@@ -1514,6 +1528,9 @@ pub async fn run_query_loop(
                                 AnthropicStreamEvent::Error { error_type, message } => {
                                     if error_type == "overloaded_error" {
                                         warn!(model = %effective_model, "API overloaded");
+                                    }
+                                    if claurst_api::is_context_overflow(message) {
+                                        stream_overflow = true;
                                     }
                                     error!(error_type, message, "Stream error");
                                 }
@@ -1540,6 +1557,29 @@ pub async fn run_query_loop(
             continue;
         }
 
+        // A context-window error mid-stream: compact once and retry; if that
+        // is not possible, surface the error rather than a partial turn.
+        if stream_overflow {
+            if config.auto_compact && !overflow_recovery_used {
+                overflow_recovery_used = true;
+                let summariser = anthropic_summariser(client);
+                if compact_after_overflow(
+                    messages,
+                    &summariser,
+                    &effective_model,
+                    config.max_tokens,
+                    event_tx.as_ref(),
+                )
+                .await
+                {
+                    last_usage = None;
+                    turn -= 1;
+                    continue;
+                }
+            }
+            return QueryOutcome::Error(ClaudeError::ContextWindowExceeded);
+        }
+
         let (mut assistant_msg, usage, stop_reason) = accumulator.finish();
 
         // Track costs
@@ -1549,6 +1589,11 @@ pub async fn run_query_loop(
             usage.cache_creation_input_tokens,
             usage.cache_read_input_tokens,
         );
+        last_usage = Some(compact::UsageMark {
+            prompt_tokens: usage.total_input(),
+            message_count: messages.len(),
+        });
+        overflow_recovery_used = false;
 
         // Budget guard: abort the loop if the configured USD cap is exceeded.
         if let Some(limit) = config.max_budget_usd {
@@ -1612,128 +1657,6 @@ pub async fn run_query_loop(
                 for err_msg in hook_result.blocking_errors {
                     debug!("PostModelTurn hook injecting error message");
                     messages.push(err_msg);
-                }
-            }
-        }
-
-        // Resolve the effective context window ONCE per turn for the active
-        // provider+model. Prefer the models.dev-backed registry value (correct
-        // for every provider — 1M Gemini/GPT windows, 32k local models) and
-        // fall back to the Claude-centric heuristic only when the registry has
-        // no usable entry. All threshold logic below keys off this. (#216)
-        let context_window = compact::resolve_context_window(
-            config.model_registry.as_deref(),
-            tool_ctx.config.provider.as_deref().unwrap_or("anthropic"),
-            &config.model,
-        );
-
-        // Numerator for every threshold below: prefer the REAL context-token
-        // count the provider just reported (input + cache-read + cache-creation
-        // = what the model actually saw) over the chars/4 estimate. With prompt
-        // caching the bare `input_tokens` field undercounts badly. Fall back to
-        // the estimate only before the first response / when usage is absent. (#231)
-        let real_usage = usage.total_input();
-        let context_tokens = compact::estimate_context_tokens(
-            messages,
-            (real_usage > 0).then_some(real_usage),
-        );
-
-        // Emit token warning events when approaching context limits.
-        // Thresholds mirror TypeScript autoCompact.ts: 80% → Warning, 95% → Critical.
-        {
-            let warning_state = compact::calculate_token_warning_state_for_window(
-                context_tokens,
-                context_window,
-            );
-            if warning_state != compact::TokenWarningState::Ok {
-                if let Some(ref tx) = event_tx {
-                    let pct_used = context_tokens as f64 / context_window as f64;
-                    let _ = tx.send(QueryEvent::TokenWarning {
-                        state: warning_state,
-                        pct_used,
-                    });
-                }
-            }
-        }
-
-        // Auto-compact: if context is near-full, summarise older messages now
-        // (before the next turn's API call would fail with prompt-too-long).
-        //
-        // Reactive compact (T1-1): when the CLAUDE_REACTIVE_COMPACT feature gate
-        // is enabled, we replace the proactive auto-compact path with reactive
-        // compact / context-collapse instead. This fires on every streaming turn
-        // so it can act before a prompt-too-long error is returned by the API.
-        //
-        // Feature gate check: CLAURST_FEATURE_REACTIVE_COMPACT=1
-        let reactive_compact_enabled =
-            claurst_core::feature_gates::is_feature_enabled("reactive_compact");
-
-        if reactive_compact_enabled {
-            // Reactive path: emergency collapse takes priority over normal compact.
-            let context_limit = context_window;
-            if compact::should_context_collapse(context_tokens, context_limit) {
-                if let Some(ref tx) = event_tx {
-                    let _ = tx.send(QueryEvent::Status(
-                        "Compacting context... (emergency collapse)".to_string(),
-                    ));
-                }
-                // Pass a clone so the live conversation survives a failed
-                // compaction; `*messages` is only overwritten on success (#213).
-                let outcome =
-                    compact::context_collapse(messages.clone(), client, config).await;
-                match apply_compact_result(messages, outcome) {
-                    Ok(tokens_freed) => {
-                        info!(tokens_freed, "Context-collapse complete");
-                    }
-                    Err(e) => {
-                        // `*messages` is left untouched — the conversation is intact.
-                        warn!(error = %e, "Context-collapse failed; conversation preserved");
-                    }
-                }
-            } else if compact::should_compact(context_tokens, context_limit) {
-                if let Some(ref tx) = event_tx {
-                    let _ = tx.send(QueryEvent::Status("Compacting context...".to_string()));
-                }
-                // Pass a clone so the live conversation survives a failed
-                // compaction; `*messages` is only overwritten on success (#213).
-                let outcome = compact::reactive_compact(
-                    messages.clone(),
-                    client,
-                    config,
-                    cancel_token.clone(),
-                    &[],
-                )
-                .await;
-                match apply_compact_result(messages, outcome) {
-                    Ok(tokens_freed) => {
-                        info!(tokens_freed, "Reactive compact complete");
-                    }
-                    // `*messages` is left untouched on both failure arms below.
-                    Err(claurst_core::error::ClaudeError::Cancelled) => {
-                        warn!("Reactive compact was cancelled; conversation preserved");
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "Reactive compact failed; conversation preserved");
-                    }
-                }
-            }
-        } else if stop == "end_turn" || stop == "tool_use" {
-            // Proactive auto-compact (original path, used when reactive compact is off).
-            if let Some(new_msgs) = compact::auto_compact_if_needed(
-                client,
-                messages,
-                context_tokens,
-                &config.model,
-                context_window,
-                &mut compact_state,
-            )
-            .await
-            {
-                *messages = new_msgs;
-                if let Some(ref tx) = event_tx {
-                    let _ = tx.send(QueryEvent::Status(
-                        "Context compacted to stay within limits.".to_string(),
-                    ));
                 }
             }
         }
@@ -2091,7 +2014,10 @@ pub async fn run_query_loop(
 
                     result_blocks.push(ContentBlock::ToolResult {
                         tool_use_id: p.id.clone(),
-                        content: ToolResultContent::Text(result.content),
+                        content: tool_result_for_history(
+                            result.content,
+                            config.tool_result_max_bytes,
+                        ),
                         is_error: if result.is_error { Some(true) } else { None },
                     });
                 }
@@ -2242,7 +2168,7 @@ mod tests {
             working_directory: None,
             thinking_budget: None,
             temperature: None,
-            tool_result_budget: 50_000,
+            tool_result_max_bytes: DEFAULT_TOOL_RESULT_MAX_BYTES,
             effort_level: None,
             command_queue: None,
             skill_index: None,
@@ -2255,6 +2181,7 @@ mod tests {
             managed_agents: None,
             enabled_tools: None,
             continuation: crate::continuation::ContinuationMode::Default,
+            auto_compact: true,
         }
     }
 
@@ -3541,5 +3468,314 @@ mod tests {
         let msgs = vec![Message::user("rocky, review this function")];
         let (_style, prompt) = effective_output_style_for_turn(&cfg, &msgs);
         assert!(prompt.unwrap().contains("Project Hail Mary"));
+    }
+
+    // ---- Issue #441: compaction check points --------------------------------
+
+    /// Scripted outcome for one main (non-summary) request.
+    #[derive(Clone, Copy)]
+    enum MainStep {
+        /// Fail with a provider context-window error.
+        Overflow,
+        /// End the turn with text.
+        Reply,
+    }
+
+    /// A provider double for compaction tests. Summarisation requests (the
+    /// summariser system prompt, no tools) get a canned summary; main requests
+    /// replay `script`. Every request is logged as `"summary"`, or as
+    /// `"main:compacted"` / `"main:plain"` depending on whether the history it
+    /// carried starts with a compaction summary.
+    struct CompactionProvider {
+        id: claurst_core::provider_id::ProviderId,
+        script: StdMutex<std::collections::VecDeque<MainStep>>,
+        log: Arc<StdMutex<Vec<String>>>,
+    }
+
+    fn scripted_text(
+        text: &str,
+    ) -> Vec<Result<claurst_api::StreamEvent, claurst_api::ProviderError>> {
+        use claurst_api::provider_types::StopReason;
+        use claurst_api::StreamEvent;
+        vec![
+            Ok(StreamEvent::MessageStart {
+                id: uuid::Uuid::new_v4().to_string(),
+                model: "mock-model".to_string(),
+                usage: UsageInfo::default(),
+            }),
+            Ok(StreamEvent::TextDelta { index: 0, text: text.to_string() }),
+            Ok(StreamEvent::MessageDelta {
+                stop_reason: Some(StopReason::EndTurn),
+                usage: Some(UsageInfo::default()),
+            }),
+            Ok(StreamEvent::MessageStop),
+        ]
+    }
+
+    #[async_trait::async_trait]
+    impl claurst_api::LlmProvider for CompactionProvider {
+        fn id(&self) -> &claurst_core::provider_id::ProviderId {
+            &self.id
+        }
+        fn name(&self) -> &str {
+            "compaction-mock"
+        }
+
+        async fn create_message(
+            &self,
+            _request: claurst_api::ProviderRequest,
+        ) -> Result<claurst_api::ProviderResponse, claurst_api::ProviderError> {
+            unimplemented!("compaction only uses create_message_stream")
+        }
+
+        async fn create_message_stream(
+            &self,
+            request: claurst_api::ProviderRequest,
+        ) -> Result<
+            std::pin::Pin<
+                Box<
+                    dyn futures::Stream<
+                            Item = Result<claurst_api::StreamEvent, claurst_api::ProviderError>,
+                        > + Send,
+                >,
+            >,
+            claurst_api::ProviderError,
+        > {
+            let is_summary = matches!(
+                &request.system_prompt,
+                Some(claurst_api::SystemPrompt::Text(text)) if text.contains("conversation summaries")
+            );
+            if is_summary {
+                self.log.lock().unwrap().push("summary".to_string());
+                return Ok(Box::pin(futures::stream::iter(scripted_text(
+                    "<summary>Earlier work, condensed.</summary>",
+                ))));
+            }
+
+            let compacted = request
+                .messages
+                .first()
+                .is_some_and(|m| m.get_all_text().contains("<compact-summary>"));
+            self.log.lock().unwrap().push(
+                if compacted { "main:compacted" } else { "main:plain" }.to_string(),
+            );
+            let step = self.script.lock().unwrap().pop_front().unwrap_or(MainStep::Reply);
+            match step {
+                MainStep::Overflow => Err(claurst_api::ProviderError::ContextOverflow {
+                    provider: self.id.clone(),
+                    message: "prompt is too long".to_string(),
+                    max_tokens: None,
+                }),
+                MainStep::Reply => Ok(Box::pin(futures::stream::iter(scripted_text("done")))),
+            }
+        }
+
+        async fn health_check(
+            &self,
+        ) -> Result<claurst_api::ProviderStatus, claurst_api::ProviderError> {
+            Ok(claurst_api::ProviderStatus::Healthy)
+        }
+
+        fn capabilities(&self) -> claurst_api::ProviderCapabilities {
+            claurst_api::ProviderCapabilities {
+                streaming: true,
+                tool_calling: true,
+                thinking: false,
+                image_input: false,
+                pdf_input: false,
+                audio_input: false,
+                video_input: false,
+                caching: false,
+                structured_output: false,
+                system_prompt_style: claurst_api::SystemPromptStyle::TopLevel,
+            }
+        }
+    }
+
+    /// `count` alternating user/assistant messages of `size` chars each,
+    /// starting and ending with a user message (`count` must be odd).
+    fn long_history(count: usize, size: usize) -> Vec<Message> {
+        (0..count)
+            .map(|i| {
+                let text = format!("turn {} {}", i, "x".repeat(size));
+                if i % 2 == 0 { Message::user(text) } else { Message::assistant(text) }
+            })
+            .collect()
+    }
+
+    /// Drive `run_query_loop` against [`CompactionProvider`] registered under
+    /// the non-Anthropic id `mockprov`. The mock model has no registry entry,
+    /// so the window falls back to the 100k heuristic and the threshold is
+    /// min(90k, 100k - min(32k, 25k)) = 75k tokens.
+    async fn drive_compaction_loop(
+        history: Vec<Message>,
+        script: Vec<MainStep>,
+        auto_compact: bool,
+    ) -> (QueryOutcome, Vec<String>, Vec<Message>) {
+        let log = Arc::new(StdMutex::new(Vec::new()));
+        let provider = Arc::new(CompactionProvider {
+            id: claurst_core::provider_id::ProviderId::new("mockprov"),
+            script: StdMutex::new(script.into()),
+            log: log.clone(),
+        });
+        let mut registry = claurst_api::ProviderRegistry::new();
+        registry.register(provider);
+
+        let client = claurst_api::AnthropicClient::new(claurst_api::client::ClientConfig {
+            api_key: "test-key".to_string(),
+            ..Default::default()
+        })
+        .expect("build test client");
+
+        let mut ctx = deny_all_context();
+        ctx.session_id = "compaction-test".to_string();
+        ctx.config.provider = Some("mockprov".to_string());
+
+        let mut config = make_config(None, None);
+        config.model = "mock-model".to_string();
+        config.provider_registry = Some(Arc::new(registry));
+        config.auto_compact = auto_compact;
+
+        let mut messages = history;
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_query_loop(
+                &client,
+                &mut messages,
+                &noop_tools(),
+                &ctx,
+                &config,
+                claurst_core::cost::CostTracker::new(),
+                None,
+                tokio_util::sync::CancellationToken::new(),
+                None,
+            ),
+        )
+        .await
+        .expect("loop must not hang");
+
+        let log = log.lock().unwrap().clone();
+        (outcome, log, messages)
+    }
+
+    /// Over the threshold, the history is compacted through the active
+    /// (non-Anthropic) provider before the request is sent.
+    #[tokio::test]
+    async fn compaction_triggers_at_threshold_before_request() {
+        // 11 × 30k chars ≈ 110k estimated tokens > 75k threshold.
+        let (outcome, log, msgs) =
+            drive_compaction_loop(long_history(11, 30_000), vec![MainStep::Reply], true).await;
+
+        assert!(matches!(outcome, QueryOutcome::EndTurn { .. }));
+        assert_eq!(log, vec!["summary", "main:compacted"]);
+        assert!(msgs[0].get_all_text().contains("Earlier work, condensed."));
+        assert!(msgs.len() < 11, "history must shrink, got {} messages", msgs.len());
+    }
+
+    #[tokio::test]
+    async fn no_compaction_below_threshold() {
+        let (_outcome, log, _msgs) =
+            drive_compaction_loop(long_history(3, 1_000), vec![MainStep::Reply], true).await;
+        assert_eq!(log, vec!["main:plain"]);
+    }
+
+    /// `--no-auto-compact` (auto_compact = false) leaves an over-threshold
+    /// history alone.
+    #[tokio::test]
+    async fn auto_compact_disabled_skips_threshold_compaction() {
+        let (_outcome, log, msgs) =
+            drive_compaction_loop(long_history(11, 30_000), vec![MainStep::Reply], false).await;
+        assert_eq!(log, vec!["main:plain"]);
+        assert_eq!(msgs.len(), 12, "history untouched plus the reply");
+    }
+
+    /// A context-window error compacts once and retries the request.
+    #[tokio::test]
+    async fn overflow_error_compacts_and_retries() {
+        // 7 × 20k chars ≈ 47k estimated tokens: under the threshold, so only
+        // the provider's overflow error triggers compaction.
+        let (outcome, log, msgs) = drive_compaction_loop(
+            long_history(7, 20_000),
+            vec![MainStep::Overflow, MainStep::Reply],
+            true,
+        )
+        .await;
+
+        assert!(matches!(outcome, QueryOutcome::EndTurn { .. }), "{:?}", outcome);
+        assert_eq!(log, vec!["main:plain", "summary", "main:compacted"]);
+        assert!(msgs[0].get_all_text().contains("<compact-summary>"));
+    }
+
+    /// A second overflow on the retried request surfaces the error.
+    #[tokio::test]
+    async fn repeated_overflow_surfaces_the_error() {
+        let (outcome, log, _msgs) = drive_compaction_loop(
+            long_history(7, 20_000),
+            vec![MainStep::Overflow, MainStep::Overflow],
+            true,
+        )
+        .await;
+
+        assert!(matches!(outcome, QueryOutcome::Error(_)), "{:?}", outcome);
+        assert_eq!(log, vec!["main:plain", "summary", "main:compacted"]);
+    }
+
+    #[tokio::test]
+    async fn overflow_with_auto_compact_disabled_surfaces_the_error() {
+        let (outcome, log, _msgs) = drive_compaction_loop(
+            long_history(7, 20_000),
+            vec![MainStep::Overflow],
+            false,
+        )
+        .await;
+
+        assert!(matches!(outcome, QueryOutcome::Error(_)), "{:?}", outcome);
+        assert_eq!(log, vec!["main:plain"]);
+    }
+
+    // ---- Issue #441: per-item tool-result cap -------------------------------
+
+    /// A read-only tool named like the one `RecordingProvider` calls, whose
+    /// output is far over the per-item cap.
+    struct BigOutputTool;
+
+    #[async_trait::async_trait]
+    impl Tool for BigOutputTool {
+        fn name(&self) -> &str { "noop_tool" }
+        fn description(&self) -> &str { "emits oversized output" }
+        fn permission_level(&self) -> PermissionLevel { PermissionLevel::ReadOnly }
+        fn input_schema(&self) -> Value { serde_json::json!({"type": "object"}) }
+        async fn execute(&self, _input: Value, _ctx: &ToolContext) -> ToolResult {
+            ToolResult::success(format!("FIRST LINE\n{}\nLAST LINE", "y".repeat(200_000)))
+        }
+    }
+
+    /// Each tool result is capped once, when appended: head and tail kept,
+    /// the omitted size noted.
+    #[tokio::test]
+    async fn tool_results_are_capped_head_and_tail_on_insert() {
+        let (_outcome, _recorded, msgs) = drive_loop_with_mock(
+            false,
+            1,
+            vec![Box::new(BigOutputTool)],
+            crate::continuation::ContinuationMode::Default,
+        )
+        .await;
+
+        let result = msgs
+            .iter()
+            .flat_map(|m| match &m.content {
+                claurst_core::types::MessageContent::Blocks(blocks) => blocks.as_slice(),
+                _ => &[],
+            })
+            .find_map(|b| match b {
+                ContentBlock::ToolResult { content: ToolResultContent::Text(t), .. } => Some(t),
+                _ => None,
+            })
+            .expect("tool result in history");
+        assert!(result.starts_with("FIRST LINE"));
+        assert!(result.ends_with("LAST LINE"));
+        assert!(result.contains("bytes omitted from the middle"));
+        assert!(result.len() <= DEFAULT_TOOL_RESULT_MAX_BYTES + 100, "{}", result.len());
     }
 }
