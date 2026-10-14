@@ -458,8 +458,9 @@ impl BedrockProvider {
 
         let status = resp.status().as_u16();
         if !(200..300).contains(&(status as usize)) {
+            let retry_after = crate::retry::retry_after(resp.headers());
             let text = resp.text().await.unwrap_or_default();
-            return Err(self.map_http_error(status, &text));
+            return Err(self.map_http_error(status, &text).with_retry_after(retry_after));
         }
 
         Ok(resp)

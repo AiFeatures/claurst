@@ -343,13 +343,12 @@ impl LlmProvider for MinimaxProvider {
 
         let status = resp.status().as_u16();
         if !resp.status().is_success() {
+            let retry_after = crate::retry::retry_after(resp.headers());
             let error_body = resp.text().await.unwrap_or_default();
-            return Err(ProviderError::Other {
-                provider: provider_id.clone(),
-                message: format!("API error: {}", error_body),
-                status: Some(status),
-                body: Some(error_body),
-            });
+            return Err(
+                crate::error_handling::parse_error_response(status, &error_body, &provider_id)
+                    .with_retry_after(retry_after),
+            );
         }
 
         let provider_id_inner = provider_id.clone();

@@ -376,6 +376,7 @@ impl Tool for AgentTool {
             // continuation — stop after one turn like every non-goal run.
             continuation: crate::continuation::ContinuationMode::Default,
             degradation_enabled: ctx.config.degradation_summary_enabled_or_default(),
+            retry: claurst_api::RetryConfig::with_max_retries(ctx.config.max_retries),
         };
         // -----------------------------------------------------------------------
         // Background mode: spawn and return agent_id immediately.
@@ -651,6 +652,7 @@ pub fn init_team_swarm_runner() {
                         agent_tools.iter().map(|t| t.name().to_string()).collect(),
                     ),
                     degradation_enabled: ctx.config.degradation_summary_enabled_or_default(),
+                    retry: claurst_api::RetryConfig::with_max_retries(ctx.config.max_retries),
                     ..Default::default()
                 };
 
