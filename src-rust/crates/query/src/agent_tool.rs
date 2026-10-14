@@ -358,7 +358,7 @@ impl Tool for AgentTool {
             working_directory: Some(working_dir_str),
             thinking_budget: None,
             temperature: None,
-            tool_result_budget: 50_000,
+            tool_result_max_chars: crate::DEFAULT_TOOL_RESULT_MAX_CHARS,
             effort_level: None,
             command_queue: None,
             skill_index: None,

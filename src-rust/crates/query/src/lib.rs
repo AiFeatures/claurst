@@ -111,10 +111,12 @@ pub struct QueryConfig {
     pub working_directory: Option<String>,
     pub thinking_budget: Option<u32>,
     pub temperature: Option<f32>,
-    /// Maximum cumulative character count of all tool results in the message
-    /// history before older results are replaced with a truncation notice.
-    /// Mirrors the TS `applyToolResultBudget` mechanism.  Default: 50_000.
-    pub tool_result_budget: usize,
+    /// Per-item cap, in bytes, applied to each tool result when it is
+    /// appended to the history: longer output keeps its head and tail with a
+    /// note giving the omitted size (issue #441). History is never rewritten
+    /// afterwards, so the prompt prefix stays stable. `0` disables the cap.
+    /// Default: [`DEFAULT_TOOL_RESULT_MAX_CHARS`] (~10k tokens).
+    pub tool_result_max_chars: usize,
     /// Optional effort level.  When set and `thinking_budget` is `None`,
     /// the effort level's `thinking_budget_tokens()` is used as the
     /// thinking budget.  Also provides a temperature override when the
@@ -197,7 +199,7 @@ impl Default for QueryConfig {
             working_directory: None,
             thinking_budget: None,
             temperature: None,
-            tool_result_budget: 50_000,
+            tool_result_max_chars: DEFAULT_TOOL_RESULT_MAX_CHARS,
             effort_level: None,
             command_queue: None,
             skill_index: None,
@@ -285,6 +287,10 @@ pub enum QueryEvent {
 // ---------------------------------------------------------------------------
 // Query loop
 // ---------------------------------------------------------------------------
+
+/// Default per-item cap for tool results appended to the history: 40k bytes,
+/// roughly 10k tokens (codex truncates tool output at 10k tokens on insert).
+pub const DEFAULT_TOOL_RESULT_MAX_CHARS: usize = 40_000;
 
 /// Maximum number of max_tokens continuation attempts before surfacing the
 /// partial response.  Mirrors `MAX_OUTPUT_TOKENS_RECOVERY_LIMIT` in query.ts.
@@ -619,30 +625,6 @@ pub async fn run_query_loop(
                     let tail = std::mem::take(messages);
                     messages.extend(injected);
                     messages.extend(tail);
-                }
-            }
-        }
-
-        // Apply tool-result budget: if the cumulative size of all tool results
-        // in the conversation exceeds the configured threshold, replace the
-        // oldest results with a placeholder until we're back under budget.
-        // This mirrors the TS `applyToolResultBudget` call in query.ts.
-        if config.tool_result_budget > 0 {
-            let (budgeted, truncated) =
-                apply_tool_result_budget(std::mem::take(messages), config.tool_result_budget);
-            *messages = budgeted;
-            if truncated > 0 {
-                info!(
-                    truncated,
-                    budget = config.tool_result_budget,
-                    "Tool-result budget exceeded: truncated {} result(s)",
-                    truncated
-                );
-                if let Some(ref tx) = event_tx {
-                    let _ = tx.send(QueryEvent::Status(format!(
-                        "[{} older tool result(s) truncated to save context]",
-                        truncated
-                    )));
                 }
             }
         }
@@ -1288,7 +1270,10 @@ pub async fn run_query_loop(
                             }
                             tool_results.push(ContentBlock::ToolResult {
                                 tool_use_id: tool_id,
-                                content: claurst_core::types::ToolResultContent::Text(result.content),
+                                content: tool_result_for_history(
+                                    result.content,
+                                    config.tool_result_max_chars,
+                                ),
                                 is_error: Some(result.is_error),
                             });
                         }
@@ -1949,7 +1934,10 @@ pub async fn run_query_loop(
 
                     result_blocks.push(ContentBlock::ToolResult {
                         tool_use_id: p.id.clone(),
-                        content: ToolResultContent::Text(result.content),
+                        content: tool_result_for_history(
+                            result.content,
+                            config.tool_result_max_chars,
+                        ),
                         is_error: if result.is_error { Some(true) } else { None },
                     });
                 }
@@ -2099,7 +2087,7 @@ mod tests {
             working_directory: None,
             thinking_budget: None,
             temperature: None,
-            tool_result_budget: 50_000,
+            tool_result_max_chars: DEFAULT_TOOL_RESULT_MAX_CHARS,
             effort_level: None,
             command_queue: None,
             skill_index: None,
@@ -3610,5 +3598,51 @@ mod tests {
 
         assert!(matches!(outcome, QueryOutcome::Error(_)), "{:?}", outcome);
         assert_eq!(log, vec!["main:plain"]);
+    }
+
+    // ---- Issue #441: per-item tool-result cap -------------------------------
+
+    /// A read-only tool named like the one `RecordingProvider` calls, whose
+    /// output is far over the per-item cap.
+    struct BigOutputTool;
+
+    #[async_trait::async_trait]
+    impl Tool for BigOutputTool {
+        fn name(&self) -> &str { "noop_tool" }
+        fn description(&self) -> &str { "emits oversized output" }
+        fn permission_level(&self) -> PermissionLevel { PermissionLevel::ReadOnly }
+        fn input_schema(&self) -> Value { serde_json::json!({"type": "object"}) }
+        async fn execute(&self, _input: Value, _ctx: &ToolContext) -> ToolResult {
+            ToolResult::success(format!("FIRST LINE\n{}\nLAST LINE", "y".repeat(200_000)))
+        }
+    }
+
+    /// Each tool result is capped once, when appended: head and tail kept,
+    /// the omitted size noted.
+    #[tokio::test]
+    async fn tool_results_are_capped_head_and_tail_on_insert() {
+        let (_outcome, _recorded, msgs) = drive_loop_with_mock(
+            false,
+            1,
+            vec![Box::new(BigOutputTool)],
+            crate::continuation::ContinuationMode::Default,
+        )
+        .await;
+
+        let result = msgs
+            .iter()
+            .flat_map(|m| match &m.content {
+                claurst_core::types::MessageContent::Blocks(blocks) => blocks.as_slice(),
+                _ => &[],
+            })
+            .find_map(|b| match b {
+                ContentBlock::ToolResult { content: ToolResultContent::Text(t), .. } => Some(t),
+                _ => None,
+            })
+            .expect("tool result in history");
+        assert!(result.starts_with("FIRST LINE"));
+        assert!(result.ends_with("LAST LINE"));
+        assert!(result.contains("bytes omitted from the middle"));
+        assert!(result.len() <= DEFAULT_TOOL_RESULT_MAX_CHARS + 100, "{}", result.len());
     }
 }
