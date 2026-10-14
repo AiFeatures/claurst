@@ -13,6 +13,8 @@
 //! The root paths are passed to `sandbox-exec` as `-D` parameters, never
 //! spliced into the policy text.
 
+use crate::ToolContext;
+use claurst_core::sandbox::SandboxMode;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
@@ -142,6 +144,35 @@ pub fn protected_paths(roots: &[PathBuf]) -> Vec<PathBuf> {
 /// exist (a missing root still gets a correct, if unusable, rule).
 pub fn canonical_root(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// The profile for a Bash command run from `ctx`, or `None` when the
+/// command runs unsandboxed (mode `off`, or no Seatbelt on this host).
+///
+/// Writable roots for `workspace-write`: the working directory, the
+/// configured workspace paths and `--add-dir` directories, `TMPDIR` and
+/// `/tmp`, all canonicalized.
+pub(crate) fn profile_for(ctx: &ToolContext) -> Option<SeatbeltProfile> {
+    let settings = &ctx.config.sandbox;
+    let roots = match settings.effective_mode() {
+        SandboxMode::Off => return None,
+        SandboxMode::ReadOnly => Vec::new(),
+        SandboxMode::WorkspaceWrite => {
+            let mut roots = Vec::new();
+            let temp = [
+                canonical_root(&std::env::temp_dir()),
+                canonical_root(Path::new("/tmp")),
+            ];
+            for root in ctx.workspace_roots().into_iter().chain(temp) {
+                if !roots.contains(&root) {
+                    roots.push(root);
+                }
+            }
+            roots
+        }
+    };
+    let protected = protected_paths(&roots);
+    Some(SeatbeltProfile::new(&roots, &protected, settings.network))
 }
 
 #[cfg(test)]

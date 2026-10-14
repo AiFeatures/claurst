@@ -10,9 +10,11 @@
 //  Windows → falls back to the existing cmd.exe approach; ConPTY is available
 //             in portable_pty but adds complexity for minimal gain on Windows.
 
+use crate::sandbox::SeatbeltProfile;
 use crate::{PermissionLevel, Tool, ToolContext, ToolResult, session_shell_state};
 use async_trait::async_trait;
 use claurst_core::bash_classifier::{BashRiskLevel, classify_bash_command};
+use claurst_core::sandbox::SEATBELT_EXECUTABLE;
 use claurst_core::tasks::{BackgroundTask, global_registry};
 use claurst_core::truncate::bound_head_tail;
 use crate::output_spill::{
@@ -194,6 +196,7 @@ async fn run_in_background(
     cwd: PathBuf,
     timeout_ms: u64,
     spill_dir: &Path,
+    sandbox: Option<SeatbeltProfile>,
 ) -> ToolResult {
     let task_name = format!("bg: {}", &command[..command.floor_char_boundary(60)]);
     let mut task = BackgroundTask::new(&task_name);
@@ -220,8 +223,16 @@ async fn run_in_background(
                     .kill_on_drop(true)
                     .spawn()
             } else {
-                Command::new("bash")
-                    .arg("-c")
+                // Sandboxed: `sandbox-exec <profile args> -- bash -c <command>`.
+                let mut bash = match &sandbox {
+                    Some(profile) => {
+                        let mut cmd = Command::new(SEATBELT_EXECUTABLE);
+                        cmd.args(profile.args()).arg("bash");
+                        cmd
+                    }
+                    None => Command::new("bash"),
+                };
+                bash.arg("-c")
                     .arg(&command_clone)
                     .current_dir(&cwd)
                     .envs(CHILD_ENV)
@@ -462,6 +473,7 @@ async fn run_in_pty(
     env_vars: &HashMap<String, String>,
     timeout: Duration,
     spill_path: PathBuf,
+    sandbox: Option<&SeatbeltProfile>,
 ) -> PtyOutcome {
     use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
@@ -477,7 +489,17 @@ async fn run_in_pty(
         Err(e) => return PtyOutcome::Failed(format!("Failed to open PTY: {}", e)),
     };
 
-    let mut cmd = CommandBuilder::new("bash");
+    // Sandboxed (#470): `sandbox-exec -p <profile> -D... -- bash -c <script>`.
+    // The wrapper script, its sentinel and the child env are unchanged.
+    let mut cmd = match sandbox {
+        Some(profile) => {
+            let mut cmd = CommandBuilder::new(SEATBELT_EXECUTABLE);
+            cmd.args(profile.args());
+            cmd.arg("bash");
+            cmd
+        }
+        None => CommandBuilder::new("bash"),
+    };
     cmd.args(["-c", script]);
     cmd.cwd(working_dir);
     // Restored shell vars go through the child's ENVIRONMENT, never its argv (#211).
@@ -990,7 +1012,8 @@ impl Tool for PtyBashTool {
                 let state = shell_state_arc.lock();
                 state.cwd.clone().unwrap_or_else(|| ctx.working_dir.clone())
             };
-            return run_in_background(params.command, cwd, timeout_ms, &spill_dir).await;
+            let sandbox = crate::sandbox::profile_for(ctx);
+            return run_in_background(params.command, cwd, timeout_ms, &spill_dir, sandbox).await;
         }
 
         debug!(command = %params.command, "Executing bash command via PTY");
@@ -1022,6 +1045,7 @@ impl Tool for PtyBashTool {
                 timeout_dur,
                 timeout_ms,
                 &spill_dir,
+                crate::sandbox::profile_for(ctx).as_ref(),
             )
             .await
         }
@@ -1030,6 +1054,7 @@ impl Tool for PtyBashTool {
 
 /// Run `command` in a PTY with the session's persisted shell state, fold the
 /// wrapper's state block back into that state, and render the bounded result.
+/// With a `sandbox` profile the shell runs under Seatbelt (#470).
 #[cfg(unix)]
 async fn run_pty_foreground(
     command: &str,
@@ -1038,6 +1063,7 @@ async fn run_pty_foreground(
     timeout_dur: Duration,
     timeout_ms: u64,
     spill_dir: &Path,
+    sandbox: Option<&SeatbeltProfile>,
 ) -> ToolResult {
     // Build the wrapper script that restores cwd + captures shell state.
     // Restored env vars are cloned out and later injected into the child's
@@ -1053,9 +1079,15 @@ async fn run_pty_foreground(
     // run_in_pty owns the timeout so it can KILL the child when it fires
     // (a bare outer timeout would just drop the future and orphan it) (#220).
     let spill_path = spill_dir.join(format!("{}.txt", uuid::Uuid::new_v4()));
-    let outcome =
-        run_in_pty(&script, &working_dir_str, &restored_env, timeout_dur, spill_path.clone())
-            .await;
+    let outcome = run_in_pty(
+        &script,
+        &working_dir_str,
+        &restored_env,
+        timeout_dur,
+        spill_path.clone(),
+        sandbox,
+    )
+    .await;
 
     match outcome {
         PtyOutcome::Completed(captured, exit_code) => {
@@ -1218,6 +1250,7 @@ mod tests {
             Duration::from_secs(30),
             30_000,
             spill_dir.path(),
+            None,
         )
         .await;
         assert_eq!(result.content, "foo");
@@ -1230,6 +1263,7 @@ mod tests {
             Duration::from_secs(30),
             30_000,
             spill_dir.path(),
+            None,
         )
         .await;
         assert_eq!(result.content, "a\n");
@@ -1315,6 +1349,7 @@ mod tests {
                 Duration::from_secs(30),
                 30_000,
                 spill_dir.path(),
+                None,
             )
             .await;
             assert!(!result.is_error, "{}", result.content);
@@ -1442,6 +1477,7 @@ mod tests {
             Duration::from_secs(120),
             120_000,
             spill_dir.path(),
+            None,
         )
         .await;
         assert!(
@@ -1481,7 +1517,7 @@ mod tests {
     /// Start `command` in the background and wait for its task to finish.
     async fn run_background_to_completion(command: &str, spill_dir: &Path) -> BackgroundTask {
         let started =
-            run_in_background(command.to_string(), std::env::temp_dir(), 60_000, spill_dir).await;
+            run_in_background(command.to_string(), std::env::temp_dir(), 60_000, spill_dir, None).await;
         let task_id = started
             .content
             .lines()
@@ -1550,6 +1586,7 @@ mod tests {
             Duration::from_secs(30),
             30_000,
             spill_dir.path(),
+            None,
         )
         .await;
         assert!(!result.is_error, "{}", result.content);
@@ -1605,6 +1642,67 @@ mod tests {
             "execute should return promptly after the direct child exits, took {:?}",
             elapsed
         );
+    }
+
+    /// A context for the Seatbelt tests: the default settings (sandbox
+    /// `workspace-write`, network off) rooted at `workspace`, with its own
+    /// session so no other test's shell state (cwd) leaks in.
+    #[cfg(target_os = "macos")]
+    fn sandboxed_context(workspace: &Path) -> ToolContext {
+        let mut ctx = crate::test_support::allow_all_context(workspace.to_path_buf());
+        ctx.session_id = format!("sandbox-test-{}", uuid::Uuid::new_v4());
+        ctx
+    }
+
+    /// #470: under the default `workspace-write` sandbox a command writes
+    /// inside the workspace but not outside it or into `.git`, and `git
+    /// status` still works.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn seatbelt_confines_writes_to_the_workspace() {
+        assert!(claurst_core::sandbox::seatbelt_available());
+        let workspace = tempfile::tempdir().unwrap();
+        let ctx = sandboxed_context(workspace.path());
+        let tool = PtyBashTool;
+
+        let inside = tool
+            .execute(json!({ "command": "echo inside > inside.txt" }), &ctx)
+            .await;
+        assert!(!inside.is_error, "{}", inside.content);
+        assert!(workspace.path().join("inside.txt").exists());
+
+        // Outside the workspace, TMPDIR and /tmp, and writable without a sandbox.
+        let outside = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("sandbox-probe-{}", uuid::Uuid::new_v4()));
+        let denied = tool
+            .execute(
+                json!({ "command": format!("echo outside > '{}'", outside.display()) }),
+                &ctx,
+            )
+            .await;
+        let leaked = outside.exists();
+        let _ = std::fs::remove_file(&outside);
+        assert!(!leaked, "the sandbox let a write outside the workspace through");
+        assert!(denied.is_error, "{}", denied.content);
+        assert!(denied.content.contains("Operation not permitted"), "{}", denied.content);
+
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(workspace.path())
+            .status()
+            .unwrap();
+        assert!(init.success());
+        let status = tool
+            .execute(json!({ "command": "git status --short" }), &ctx)
+            .await;
+        assert!(!status.is_error, "{}", status.content);
+        assert!(status.content.contains("inside.txt"), "{}", status.content);
+
+        let git_write = tool
+            .execute(json!({ "command": "touch .git/probe" }), &ctx)
+            .await;
+        assert!(git_write.is_error, "{}", git_write.content);
+        assert!(!workspace.path().join(".git/probe").exists());
     }
 }
 

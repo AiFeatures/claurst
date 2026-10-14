@@ -1138,6 +1138,10 @@ pub mod config {
         /// polled periodically and its stdout is shown in a status bar row.
         #[serde(default, rename = "statusLine", alias = "status_line", skip_serializing_if = "Option::is_none")]
         pub status_line: Option<StatusLineConfig>,
+        /// Shell sandbox settings, copied from the top-level `sandbox` block
+        /// of the global settings by [`Settings::effective_config`].
+        #[serde(skip)]
+        pub sandbox: crate::sandbox::SandboxSettings,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1364,6 +1368,10 @@ pub mod config {
         /// option. Loaded into the prefix allowlist at startup.
         #[serde(default, rename = "allowedBashPrefixes")]
         pub allowed_bash_prefixes: Vec<String>,
+        /// OS-level sandbox for Bash commands (#470). Global-only: a project
+        /// settings file cannot relax (or otherwise change) it.
+        #[serde(default)]
+        pub sandbox: crate::sandbox::SandboxSettings,
         /// App version at last launch — used to detect upgrades and show release notes.
         #[serde(default, rename = "lastSeenVersion")]
         pub last_seen_version: Option<String>,
@@ -1951,6 +1959,7 @@ pub mod config {
         ///   with the embedded config values taking precedence for keys already present.
         pub fn effective_config(&self) -> Config {
             let mut config = self.config.clone();
+            config.sandbox = self.sandbox.clone();
             // Top-level `provider` key overrides config.provider when set.
             if self.provider.is_some() && config.provider.is_none() {
                 config.provider = self.provider.clone();
@@ -2161,6 +2170,7 @@ pub mod config {
                 // arbitrary shell command — otherwise cloning a malicious repo would
                 // grant immediate RCE via sh -c execution.
                 status_line: base.config.status_line,
+                sandbox: base.config.sandbox,
                 degradation_summary_enabled: over.config.degradation_summary_enabled.or(base.config.degradation_summary_enabled),
             };
             Self {
@@ -2180,6 +2190,7 @@ pub mod config {
                 // pre-approve bash command prefixes.
                 skip_dangerous_mode_permission_prompt: base.skip_dangerous_mode_permission_prompt,
                 allowed_bash_prefixes: base.allowed_bash_prefixes,
+                sandbox: base.sandbox,
                 permission_rules: base.permission_rules,
                 enabled_plugins: base.enabled_plugins,
                 disabled_plugins: { let mut s = base.disabled_plugins; s.extend(over.disabled_plugins); s },
@@ -4873,6 +4884,7 @@ pub mod bash_classifier;
 pub mod ps_classifier;
 pub mod mcp_trust;
 pub mod paths;
+pub mod sandbox;
 
 // ---------------------------------------------------------------------------
 // tasks module — background task registry
