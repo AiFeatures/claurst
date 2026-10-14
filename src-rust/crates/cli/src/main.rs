@@ -43,66 +43,12 @@ use claurst_core::{
     cost::CostTracker,
     permissions::{AutoPermissionHandler, InteractivePermissionHandler, PermissionManager},
 };
-use async_trait::async_trait;
-use claurst_core::types::ToolDefinition;
-use claurst_tools::{PermissionLevel, Tool, ToolContext, ToolResult};
+use claurst_tools::ToolContext;
 use clap::{ArgAction, Parser, ValueEnum};
 use parking_lot::Mutex as ParkingMutex;
 use std::{path::PathBuf, sync::Arc};
 use tracing::{debug, info, warn};
 use tracing_subscriber::{fmt::writer::BoxMakeWriter, EnvFilter};
-
-// ---------------------------------------------------------------------------
-// MCP tool wrapper: makes MCP server tools look like native cc-tools.
-// ---------------------------------------------------------------------------
-
-struct McpToolWrapper {
-    /// Definition under the exposed `mcp__<server>__<tool>` name; the manager
-    /// routes calls by that name.
-    tool_def: ToolDefinition,
-    manager: Arc<claurst_mcp::McpManager>,
-}
-
-#[async_trait]
-impl Tool for McpToolWrapper {
-    fn name(&self) -> &str {
-        &self.tool_def.name
-    }
-
-    fn description(&self) -> &str {
-        &self.tool_def.description
-    }
-
-    fn permission_level(&self) -> PermissionLevel {
-        // MCP tools run external processes – treat as Execute.
-        PermissionLevel::Execute
-    }
-
-    fn input_schema(&self) -> serde_json::Value {
-        self.tool_def.input_schema.clone()
-    }
-
-    async fn execute(&self, input: serde_json::Value, ctx: &ToolContext) -> ToolResult {
-        let desc = format!("Run MCP tool {}", self.tool_def.name);
-        if let Err(e) = ctx.check_permission(self.name(), &desc, false) {
-            return ToolResult::error(e.to_string());
-        }
-
-        let args = if input.is_null() { None } else { Some(input) };
-
-        match self.manager.call_tool(&self.tool_def.name, args).await {
-            Ok(result) => {
-                let output = claurst_mcp::mcp_result_to_output(&result);
-                if result.is_error {
-                    ToolResult::error(output.text)
-                } else {
-                    ToolResult::success(output.text).with_images(output.images)
-                }
-            }
-            Err(e) => ToolResult::error(format!("MCP tool '{}' failed: {}", self.tool_def.name, e)),
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // CLI argument definition (matches TypeScript main.tsx flags)
@@ -603,20 +549,19 @@ async fn main() -> anyhow::Result<()> {
     let system_ctx = ctx_builder.build_system_context().await;
     let user_ctx = ctx_builder.build_user_context().await;
 
-    // Build system prompt
-    let mut system_parts = vec![
-        include_str!("system_prompt.txt").to_string(),
-        system_ctx,
-        user_ctx,
-    ];
-    if let Some(ref custom) = config.custom_system_prompt {
-        // replace base system prompt
-        system_parts[0] = custom.clone();
-    }
-    if let Some(ref append) = config.append_system_prompt {
-        system_parts.push(append.clone());
-    }
-    let system_prompt = system_parts.join("\n\n");
+    // Build system prompt. Only session-stable text goes here (it lands in
+    // the cached system block); `system_ctx` (date, git status, IDE context)
+    // is passed separately as `session_context` and sent in the dynamic block.
+    let base_prompt = config
+        .custom_system_prompt
+        .clone()
+        .unwrap_or_else(|| include_str!("system_prompt.txt").to_string());
+    let system_prompt = [Some(base_prompt), Some(user_ctx), config.append_system_prompt.clone()]
+        .into_iter()
+        .flatten()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
 
     // Initialize API client.
     // Try config/env first; fall back to saved OAuth tokens.
@@ -854,6 +799,7 @@ async fn main() -> anyhow::Result<()> {
     query_config.max_turns = cli.max_turns;
     query_config.system_prompt = Some(system_prompt);
     query_config.append_system_prompt = None;
+    query_config.session_context = Some(system_ctx);
     query_config.working_directory = Some(cwd.display().to_string());
     if let Some(tokens) = cli.thinking {
         query_config.thinking_budget = Some(tokens);
@@ -981,13 +927,7 @@ fn build_tools_with_mcp(
     v.push(Box::new(claurst_query::AgentTool));
 
     if let Some(ref manager_arc) = mcp_manager {
-        for entry in manager_arc.all_tool_definitions() {
-            let wrapper = McpToolWrapper {
-                tool_def: entry.definition,
-                manager: manager_arc.clone(),
-            };
-            v.push(Box::new(wrapper));
-        }
+        v.extend(claurst_tools::mcp_tools(manager_arc));
         debug!(total_tools = v.len(), "MCP tools registered");
     }
 
@@ -3151,7 +3091,6 @@ async fn run_interactive(
                         qcfg.max_tokens = cmd_ctx.config.effective_max_tokens();
                         // Session-local /turns override wins over agent and config caps.
                         qcfg.max_turns_override = app.max_turns_override;
-                        qcfg.append_system_prompt = cmd_ctx.config.append_system_prompt.clone();
                         qcfg.system_prompt = base_query_config.system_prompt.clone();
                         qcfg.output_style = cmd_ctx.config.effective_output_style();
                         qcfg.output_style_prompt = cmd_ctx.config.resolve_output_style_prompt();
