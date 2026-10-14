@@ -88,6 +88,21 @@ pub(crate) async fn execute_tool(
     }
 }
 
+/// Execute one call of a tool batch, unless the user already denied another
+/// call in it: then the call is rejected without running (reject cascade,
+/// #445). `ctx.batch_rejection` must be the batch's own.
+pub(crate) async fn execute_batch_call(
+    name: &str,
+    input: &Value,
+    tools: &[Box<dyn Tool>],
+    ctx: &ToolContext,
+) -> ToolResult {
+    if ctx.batch_rejection.is_rejected() {
+        return ToolResult::error(claurst_tools::BATCH_REJECTED_MSG);
+    }
+    execute_tool(name, input, tools, ctx).await
+}
+
 /// Run a batch of tool-execution futures concurrently, abandoning them promptly
 /// if `cancel_token` fires (issue #218).
 ///

@@ -805,6 +805,7 @@ async fn main() -> anyhow::Result<()> {
         // Placeholder token; `run_query_loop` rebinds it to the loop's actual
         // cancel token so the parallel tool executor honours Ctrl-C (issue #218).
         cancel_token: tokio_util::sync::CancellationToken::new(),
+        batch_rejection: Default::default(),
     };
 
     // Hourly shadow-snapshot GC loop: only runs when snapshot is explicitly enabled.
@@ -3226,6 +3227,13 @@ async fn run_interactive(
                         if claurst_tui::dialogs::handle_permission_key(pr, key) {
                             let tool_use_id = pr.tool_use_id.clone();
                             let selected_key = pr.options.get(pr.selected_option).map(|o| o.key);
+                            // The reason typed after choosing deny, if any,
+                            // goes back to the model with the denial.
+                            let feedback = pr
+                                .feedback
+                                .take()
+                                .map(|reason| reason.trim().to_string())
+                                .filter(|reason| !reason.is_empty());
                             let suggested_rules = match &mut pr.kind {
                                 claurst_tui::dialogs::PermissionDialogKind::Bash { suggested_rules, .. } => {
                                     std::mem::take(suggested_rules)
@@ -3235,8 +3243,11 @@ async fn run_interactive(
                             app.permission_request = None;
 
                             if let Some(mut pending) = pending_permissions.lock().waiting.remove(&tool_use_id) {
-                                let decision = match selected_key {
-                                    Some('n') => claurst_core::permissions::PermissionDecision::Deny,
+                                let decision = match (selected_key, feedback) {
+                                    (Some('n'), Some(reason)) => {
+                                        claurst_core::permissions::PermissionDecision::DenyWithFeedback(reason)
+                                    }
+                                    (Some('n'), None) => claurst_core::permissions::PermissionDecision::Deny,
                                     _ => claurst_core::permissions::PermissionDecision::Allow,
                                 };
 

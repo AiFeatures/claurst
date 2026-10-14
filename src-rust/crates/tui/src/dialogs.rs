@@ -66,7 +66,13 @@ pub struct PermissionRequest {
     pub kind: PermissionDialogKind,
     pub options: Vec<PermissionOption>,
     pub selected_option: usize,
+    /// `Some` while the user types the optional one-line reason for a deny;
+    /// the reason is returned to the model with the denial.
+    pub feedback: Option<String>,
 }
+
+/// Longest deny reason accepted in the permission dialog, in characters.
+const MAX_FEEDBACK_CHARS: usize = 200;
 
 impl PermissionRequest {
     /// Create a dialog with the default options (see
@@ -80,6 +86,7 @@ impl PermissionRequest {
             input_preview: None,
             kind: PermissionDialogKind::Generic,
             selected_option: 0,
+            feedback: None,
             options: Self::default_options(),
         }
     }
@@ -106,6 +113,7 @@ impl PermissionRequest {
             input_preview,
             kind: PermissionDialogKind::Generic,
             selected_option: 0,
+            feedback: None,
             options: Self::default_options(),
         }
     }
@@ -133,6 +141,7 @@ impl PermissionRequest {
             input_preview: Some(command),
             kind,
             selected_option: 0,
+            feedback: None,
             options,
         }
     }
@@ -151,6 +160,7 @@ impl PermissionRequest {
             input_preview: Some(command.clone()),
             kind: PermissionDialogKind::PowerShell { command },
             selected_option: 0,
+            feedback: None,
             options: Self::default_options(),
         }
     }
@@ -179,6 +189,7 @@ impl PermissionRequest {
             input_preview: Some(preview),
             kind,
             selected_option: 0,
+            feedback: None,
             options: Self::default_options(),
         }
     }
@@ -207,6 +218,7 @@ impl PermissionRequest {
             input_preview: Some(preview),
             kind,
             selected_option: 0,
+            feedback: None,
             options: Self::default_options(),
         }
     }
@@ -473,6 +485,18 @@ pub fn render_permission_dialog(frame: &mut Frame, pr: &PermissionRequest, area:
         .map(|lines| lines.len() as u16 + 2) // lines + blank before + blank after
         .unwrap_or(0);
 
+    // Deny-reason prompt (shown after choosing deny), with a text cursor.
+    let feedback_lines: Vec<String> = pr
+        .feedback
+        .as_ref()
+        .map(|reason| {
+            word_wrap(
+                &format!("Reason for the model (optional): {}\u{258F}", reason),
+                text_width.saturating_sub(2),
+            )
+        })
+        .unwrap_or_default();
+
     let content_lines: u16 = 2 // "  Tool: <name>"  +  blank
         + bash_block_height
         + desc_lines.len() as u16
@@ -480,6 +504,7 @@ pub fn render_permission_dialog(frame: &mut Frame, pr: &PermissionRequest, area:
         + preview_line_count
         + 1 // blank before options
         + pr.options.len() as u16
+        + if feedback_lines.is_empty() { 0 } else { feedback_lines.len() as u16 + 2 } // blank + prompt + hint
         + 1; // trailing blank
 
     let dialog_height = (content_lines + 2) // +2 for top/bottom border
@@ -580,6 +605,21 @@ pub fn render_permission_dialog(frame: &mut Frame, pr: &PermissionRequest, area:
         ]));
     }
 
+    // ---- Deny reason prompt -------------------------------------------------
+    if !feedback_lines.is_empty() {
+        lines.push(Line::from(""));
+        for feedback_line in feedback_lines {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(feedback_line, Style::default().fg(Color::Yellow)),
+            ]));
+        }
+        lines.push(Line::from(Span::styled(
+            "  Enter: deny with this reason   Esc: deny without a reason",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
     let (border_color, title_text) = match &pr.kind {
         PermissionDialogKind::Bash { .. } | PermissionDialogKind::PowerShell { .. } => {
             (Color::Yellow, " Permission Required ")
@@ -617,50 +657,69 @@ pub fn render_permission_dialog(frame: &mut Frame, pr: &PermissionRequest, area:
 ///
 /// Returns `true` if the dialog was confirmed/dismissed (caller should clear it).
 ///
-/// Digits select by position (1-based) and confirm; digits beyond the
-/// option count are ignored. Option keys (`y`, `Y`, `p`, `a`, `n`) select
-/// and confirm.
+/// Digits select by position (1-based); digits beyond the option count are
+/// ignored. Option keys (`y`, `Y`, `p`, `a`, `n`) select. Choosing an allow
+/// option confirms at once. Choosing deny (`n`, its digit, or Enter on it)
+/// opens a one-line reason prompt instead: typed text goes into
+/// `feedback`, Enter denies with that reason, Esc denies without one. Esc
+/// outside the prompt denies without a reason.
 pub fn handle_permission_key(pr: &mut PermissionRequest, key: KeyEvent) -> bool {
+    use crossterm::event::KeyModifiers;
+
+    if let Some(feedback) = pr.feedback.as_mut() {
+        match key.code {
+            KeyCode::Enter => return true,
+            KeyCode::Esc => {
+                feedback.clear();
+                return true;
+            }
+            KeyCode::Backspace => {
+                feedback.pop();
+            }
+            KeyCode::Char(c)
+                if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                    && feedback.chars().count() < MAX_FEEDBACK_CHARS =>
+            {
+                feedback.push(c);
+            }
+            _ => {}
+        }
+        return false;
+    }
+
     let option_count = pr.options.len();
-    match key.code {
-        KeyCode::Char(c) => {
-            if let Some(digit) = c.to_digit(10) {
-                let idx = (digit as usize).saturating_sub(1);
-                if idx < option_count {
-                    pr.selected_option = idx;
-                    return true; // confirmed via digit shortcut
-                }
-                // Reject digits beyond the option count silently.
-            } else {
-                for (i, opt) in pr.options.iter().enumerate() {
-                    if opt.key == c {
-                        pr.selected_option = i;
-                        return true;
-                    }
-                }
-            }
-        }
-        KeyCode::Enter => {
-            return true;
-        }
+    let chosen = match key.code {
+        KeyCode::Char(c) => match c.to_digit(10) {
+            Some(digit) => Some((digit as usize).saturating_sub(1)).filter(|&i| i < option_count),
+            None => pr.options.iter().position(|opt| opt.key == c),
+        },
+        KeyCode::Enter => Some(pr.selected_option),
         KeyCode::Up => {
-            if pr.selected_option > 0 {
-                pr.selected_option -= 1;
-            }
+            pr.selected_option = pr.selected_option.saturating_sub(1);
+            None
         }
         KeyCode::Down => {
             if pr.selected_option + 1 < option_count {
                 pr.selected_option += 1;
             }
+            None
         }
         KeyCode::Esc => {
-            // Move selection to the last option (deny) without confirming.
+            // Deny without a reason.
             pr.selected_option = option_count.saturating_sub(1);
             return true;
         }
-        _ => {}
+        _ => None,
+    };
+    let Some(index) = chosen else {
+        return false;
+    };
+    pr.selected_option = index;
+    if pr.options.get(index).is_some_and(|opt| opt.key == 'n') {
+        pr.feedback = Some(String::new());
+        return false;
     }
-    false
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -1521,17 +1580,94 @@ mod tests {
         assert_eq!(pr.options[pr.selected_option].key, 'a');
     }
 
+    /// #445: choosing deny opens a one-line reason prompt; Enter denies with
+    /// the typed reason.
     #[test]
-    fn permission_key_char_shortcut_confirms() {
+    fn deny_takes_an_optional_reason() {
         let mut pr = PermissionRequest::standard(
             "id".to_string(),
             "Bash".to_string(),
             "desc".to_string(),
         );
-        // Press 'n' → deny (last option).
-        let confirmed = handle_permission_key(&mut pr, key(KeyCode::Char('n')));
-        assert!(confirmed);
+        // 'n' selects deny and opens the prompt without confirming.
+        assert!(!handle_permission_key(&mut pr, key(KeyCode::Char('n'))));
         assert_eq!(pr.selected_option, 4);
+        assert_eq!(pr.feedback.as_deref(), Some(""));
+        // Option keys are now text, not shortcuts.
+        for c in "use rgx".chars() {
+            assert!(!handle_permission_key(&mut pr, key(KeyCode::Char(c))));
+        }
+        assert!(!handle_permission_key(&mut pr, key(KeyCode::Backspace)));
+        assert!(!handle_permission_key(&mut pr, key(KeyCode::Backspace)));
+        for c in "g".chars() {
+            assert!(!handle_permission_key(&mut pr, key(KeyCode::Char(c))));
+        }
+        assert!(handle_permission_key(&mut pr, key(KeyCode::Enter)));
+        assert_eq!(pr.feedback.as_deref(), Some("use rg"));
+        assert_eq!(pr.options[pr.selected_option].key, 'n');
+    }
+
+    #[test]
+    fn deny_reason_prompt_is_rendered() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut pr = PermissionRequest::standard(
+            "id".to_string(),
+            "Bash".to_string(),
+            "desc".to_string(),
+        );
+        handle_permission_key(&mut pr, key(KeyCode::Char('n')));
+        for c in "too slow".chars() {
+            handle_permission_key(&mut pr, key(KeyCode::Char(c)));
+        }
+        let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
+        terminal
+            .draw(|frame| render_permission_dialog(frame, &pr, frame.area()))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol().chars().next().unwrap_or(' '))
+            .collect();
+        assert!(text.contains("Reason for the model (optional): too slow"), "{text}");
+        assert!(text.contains("Esc: deny without a reason"), "{text}");
+    }
+
+    #[test]
+    fn deny_reason_prompt_esc_denies_without_reason() {
+        let mut pr = PermissionRequest::standard(
+            "id".to_string(),
+            "Bash".to_string(),
+            "desc".to_string(),
+        );
+        // Enter on the deny option opens the prompt as well.
+        pr.selected_option = 4;
+        assert!(!handle_permission_key(&mut pr, key(KeyCode::Enter)));
+        handle_permission_key(&mut pr, key(KeyCode::Char('x')));
+        assert!(handle_permission_key(&mut pr, key(KeyCode::Esc)));
+        assert_eq!(pr.feedback.as_deref(), Some(""));
+        assert_eq!(pr.options[pr.selected_option].key, 'n');
+    }
+
+    #[test]
+    fn deny_reason_is_capped_and_ignores_control_keys() {
+        let mut pr = PermissionRequest::standard(
+            "id".to_string(),
+            "Bash".to_string(),
+            "desc".to_string(),
+        );
+        handle_permission_key(&mut pr, key(KeyCode::Char('5')));
+        assert_eq!(pr.feedback.as_deref(), Some(""));
+        for _ in 0..MAX_FEEDBACK_CHARS + 20 {
+            handle_permission_key(&mut pr, key(KeyCode::Char('a')));
+        }
+        handle_permission_key(
+            &mut pr,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(pr.feedback.as_ref().map(|f| f.chars().count()), Some(MAX_FEEDBACK_CHARS));
+        assert!(pr.feedback.as_ref().is_some_and(|f| !f.contains('c')));
     }
 
     #[test]

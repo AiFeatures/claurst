@@ -3222,6 +3222,9 @@ pub mod permissions {
         Deny,
         /// Deny and remember permanently.
         DenyPermanently,
+        /// Denied by the user, with a one-line reason that is returned to
+        /// the model.
+        DenyWithFeedback(String),
         /// Ask the user (show dialog) with an explanation of why.
         Ask { reason: String },
     }
