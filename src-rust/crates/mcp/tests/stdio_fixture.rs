@@ -309,12 +309,12 @@ async fn structured_content_and_images_are_converted() -> Result<(), String> {
         .await
         .map_err(|e| format!("image: {e}"))?;
     let output = mcp_result_to_output(&image);
-    ensure(output.text == "chart\n[Image: image/png, 6 B]", || {
+    ensure(output.text == "chart\n[Image: image/png, 8 B]", || {
         format!("unexpected image placeholder text {:?}", output.text)
     })?;
     match output.images.as_slice() {
         [ContentBlock::Image { source }] => ensure(
-            source.data.as_deref() == Some("iVBORw0K") && source.media_type.as_deref() == Some("image/png"),
+            source.data.as_deref() == Some("iVBORw0KGgo=") && source.media_type.as_deref() == Some("image/png"),
             || format!("unexpected image source {source:?}"),
         ),
         other => Err(format!("expected one image block, got {other:?}")),
@@ -409,7 +409,7 @@ mod fake_server {
                     "image" => json!({
                         "content": [
                             { "type": "text", "text": "chart" },
-                            { "type": "image", "data": "iVBORw0K", "mimeType": "image/png" },
+                            { "type": "image", "data": "iVBORw0KGgo=", "mimeType": "image/png" },
                         ],
                     }),
                     tool => json!({

@@ -4350,8 +4350,10 @@ async fn run_interactive(
             let new_mcp_manager = start_mcp_manager(&decision.allowed);
             tool_ctx.mcp_manager = new_mcp_manager.clone();
             app.mcp_manager = new_mcp_manager.clone();
-            tools_arc = tools_for_session(new_mcp_manager.clone(), &base_query_config);
+            // Read the generation before building: a connect task that bumps
+            // it in between then still triggers a rebuild in the idle block.
             mcp_seen_generation = new_mcp_manager.as_ref().map(|manager| manager.generation());
+            tools_arc = tools_for_session(new_mcp_manager.clone(), &base_query_config);
             mcp_reported_failures.clear();
             if app.mcp_view.visible {
                 app.refresh_mcp_view();

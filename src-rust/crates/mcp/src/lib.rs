@@ -249,11 +249,17 @@ pub fn sanitize_tool_name_part(raw: &str) -> String {
 /// The exposed name for `tool` on `server`, unique within `used`.
 ///
 /// Normally `mcp__<server>__<tool>` with both parts sanitized. When that is
-/// longer than [`MAX_MCP_TOOL_NAME_LEN`] or already taken (two raw names that
-/// sanitize alike), it is truncated and suffixed with a hash of the raw
+/// longer than [`MAX_MCP_TOOL_NAME_LEN`], already taken, or `force_hash` is
+/// set (the server's sanitized name is shared with another configured
+/// server), it is truncated and suffixed with a hash of the raw
 /// `(server, tool)` pair. Calls are routed through the manager's map from
 /// exposed name to `(server, tool)`, never by parsing the name back.
-fn exposed_tool_name(server: &str, tool: &str, used: &mut std::collections::HashSet<String>) -> String {
+fn exposed_tool_name(
+    server: &str,
+    tool: &str,
+    force_hash: bool,
+    used: &mut std::collections::HashSet<String>,
+) -> String {
     use sha2::{Digest, Sha256};
 
     let base = format!(
@@ -262,7 +268,7 @@ fn exposed_tool_name(server: &str, tool: &str, used: &mut std::collections::Hash
         sanitize_tool_name_part(server),
         sanitize_tool_name_part(tool)
     );
-    if base.len() <= MAX_MCP_TOOL_NAME_LEN && used.insert(base.clone()) {
+    if !force_hash && base.len() <= MAX_MCP_TOOL_NAME_LEN && used.insert(base.clone()) {
         return base;
     }
     let mut attempt: u32 = 0;
@@ -287,13 +293,18 @@ fn exposed_tool_name(server: &str, tool: &str, used: &mut std::collections::Hash
 }
 
 /// Exposed tool entries for `clients` (sorted by server name), in a stable
-/// order: servers by name, tools in server order.
-fn build_tool_entries(clients: &[(String, Arc<McpClient>)]) -> Vec<McpToolEntry> {
+/// order: servers by name, tools in server order. Servers in
+/// `ambiguous_servers` always get hashed names.
+fn build_tool_entries(
+    clients: &[(String, Arc<McpClient>)],
+    ambiguous_servers: &std::collections::HashSet<String>,
+) -> Vec<McpToolEntry> {
     let mut used = std::collections::HashSet::new();
     let mut entries = Vec::new();
     for (server_name, client) in clients {
+        let force_hash = ambiguous_servers.contains(server_name);
         for tool in &client.tools {
-            let name = exposed_tool_name(server_name, &tool.name, &mut used);
+            let name = exposed_tool_name(server_name, &tool.name, force_hash, &mut used);
             entries.push(McpToolEntry {
                 server_name: server_name.clone(),
                 tool_name: tool.name.clone(),
@@ -1058,6 +1069,10 @@ struct ManagerState {
     tools: Vec<McpToolEntry>,
     /// Exposed tool name → index into `tools`.
     routes: HashMap<String, usize>,
+    /// Configured servers whose sanitized name collides with another
+    /// configured server's. Fixed at start so exposed names do not depend on
+    /// which of them connected first.
+    ambiguous_servers: std::collections::HashSet<String>,
 }
 
 impl ManagerState {
@@ -1068,7 +1083,7 @@ impl ManagerState {
             .map(|(name, client)| (name.clone(), Arc::clone(client)))
             .collect();
         clients.sort_by(|a, b| a.0.cmp(&b.0));
-        self.tools = build_tool_entries(&clients);
+        self.tools = build_tool_entries(&clients, &self.ambiguous_servers);
         self.routes = self
             .tools
             .iter()
@@ -1125,6 +1140,17 @@ impl McpManager {
             manager.state.get_mut().statuses.insert(config.name.clone(), status);
             manager.server_configs.insert(config.name.clone(), config.clone());
         }
+        let mut by_sanitized: HashMap<String, Vec<&String>> = HashMap::new();
+        for name in manager.server_configs.keys() {
+            by_sanitized.entry(sanitize_tool_name_part(name)).or_default().push(name);
+        }
+        let ambiguous: std::collections::HashSet<String> = by_sanitized
+            .into_values()
+            .filter(|names| names.len() > 1)
+            .flatten()
+            .cloned()
+            .collect();
+        manager.state.get_mut().ambiguous_servers = ambiguous;
 
         let manager = Arc::new(manager);
         let pending: Vec<McpServerConfig> = manager
@@ -1153,6 +1179,15 @@ impl McpManager {
     async fn connect_server(manager: Weak<Self>, config: McpServerConfig) {
         let name = config.name.clone();
         let expanded = expand_server_config(&config);
+        for (header, value) in &expanded.headers {
+            if value.contains("${") {
+                warn!(
+                    server = %name,
+                    header = %header,
+                    "MCP header value still contains an unexpanded ${{VAR}} after expansion"
+                );
+            }
+        }
         let timeouts = McpTimeouts::for_config(&expanded);
         let remote = matches!(expanded.server_type.as_str(), "sse" | "http");
         debug!(server = %name, transport = %expanded.server_type, "Connecting to MCP server");
@@ -1811,6 +1846,29 @@ fn image_part(data: &str, mime_type: &str, images: &mut Vec<ContentBlock>) -> St
             format_size(MAX_ATTACHED_IMAGE_BYTES)
         );
     }
+    // An image block the provider rejects stays in the history and fails
+    // every later request, so only attach data that decodes and whose
+    // signature matches the declared type.
+    use base64::Engine as _;
+    let decoded = match base64::engine::general_purpose::STANDARD.decode(data) {
+        Ok(decoded) => decoded,
+        Err(_) => {
+            return format!("[Image: {}, {}; not attached: invalid base64 data]", mime_type, size_label)
+        }
+    };
+    let signature_matches = match mime_type {
+        "image/png" => decoded.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "image/jpeg" => decoded.starts_with(&[0xFF, 0xD8, 0xFF]),
+        "image/gif" => decoded.starts_with(b"GIF87a") || decoded.starts_with(b"GIF89a"),
+        "image/webp" => decoded.len() >= 12 && decoded.starts_with(b"RIFF") && &decoded[8..12] == b"WEBP",
+        _ => false,
+    };
+    if !signature_matches {
+        return format!(
+            "[Image: {}, {}; not attached: data is not a valid {} image]",
+            mime_type, size_label, mime_type
+        );
+    }
     images.push(ContentBlock::Image {
         source: ImageSource {
             source_type: "base64".to_string(),
@@ -2013,18 +2071,18 @@ mod tests {
 
     #[test]
     fn test_result_output_image_is_attached_with_placeholder() {
-        // 8 base64 chars = 6 bytes.
+        // The 8-byte PNG signature.
         let out = mcp_result_to_output(&result(vec![McpContent::Image {
-            data: "iVBORw0K".to_string(),
+            data: "iVBORw0KGgo=".to_string(),
             mime_type: "image/png".to_string(),
         }]));
-        assert_eq!(out.text, "[Image: image/png, 6 B]");
+        assert_eq!(out.text, "[Image: image/png, 8 B]");
         assert_eq!(out.images.len(), 1);
         match &out.images[0] {
             ContentBlock::Image { source } => {
                 assert_eq!(source.source_type, "base64");
                 assert_eq!(source.media_type.as_deref(), Some("image/png"));
-                assert_eq!(source.data.as_deref(), Some("iVBORw0K"));
+                assert_eq!(source.data.as_deref(), Some("iVBORw0KGgo="));
             }
             other => panic!("expected an image block, got {:?}", other),
         }
@@ -2049,19 +2107,50 @@ mod tests {
     }
 
     #[test]
+    fn test_result_output_invalid_image_data_is_not_attached() {
+        // Not base64 at all: attaching it would get every later request
+        // rejected by the provider.
+        let garbage = mcp_result_to_output(&result(vec![McpContent::Image {
+            data: "not base64!!".to_string(),
+            mime_type: "image/png".to_string(),
+        }]));
+        assert!(garbage.images.is_empty());
+        assert!(garbage.text.contains("not attached: invalid base64 data"), "{}", garbage.text);
+
+        // Valid base64, but a JPEG signature declared as PNG.
+        let mismatched = mcp_result_to_output(&result(vec![McpContent::Image {
+            data: "/9j/4AAQ".to_string(),
+            mime_type: "image/png".to_string(),
+        }]));
+        assert!(mismatched.images.is_empty());
+        assert!(
+            mismatched.text.contains("not attached: data is not a valid image/png image"),
+            "{}",
+            mismatched.text
+        );
+
+        // The same bytes declared as JPEG are attached.
+        let jpeg = mcp_result_to_output(&result(vec![McpContent::Image {
+            data: "/9j/4AAQ".to_string(),
+            mime_type: "image/jpeg".to_string(),
+        }]));
+        assert_eq!(jpeg.images.len(), 1);
+    }
+
+    #[test]
     fn test_result_output_prefers_structured_content() {
         let mut r = result(vec![
             McpContent::Text {
                 text: "{\"temperature\": 22}".to_string(),
             },
             McpContent::Image {
-                data: "iVBORw0K".to_string(),
+                data: "iVBORw0KGgo=".to_string(),
                 mime_type: "image/png".to_string(),
             },
         ]);
         r.structured_content = Some(serde_json::json!({ "temperature": 22 }));
         let out = mcp_result_to_output(&r);
-        assert_eq!(out.text, "{\"temperature\":22}\n[Image: image/png, 6 B]");
+        assert_eq!(out.text, "{\"temperature\":22}\n[Image: image/png, 8 B]");
         assert_eq!(out.images.len(), 1);
     }
 
@@ -2086,7 +2175,7 @@ mod tests {
                     uri: "file:///img.png".to_string(),
                     mime_type: Some("image/png".to_string()),
                     text: None,
-                    blob: Some("iVBORw0K".to_string()),
+                    blob: Some("iVBORw0KGgo=".to_string()),
                 },
             },
             McpContent::Resource {
@@ -2098,7 +2187,7 @@ mod tests {
                 },
             },
         ]));
-        assert!(out.text.contains("[Resource: file:///img.png]\n[Image: image/png, 6 B]"), "{}", out.text);
+        assert!(out.text.contains("[Resource: file:///img.png]\n[Image: image/png, 8 B]"), "{}", out.text);
         assert!(out.text.contains("[Binary resource: application/octet-stream, 3 B]"), "{}", out.text);
         assert_eq!(out.images.len(), 1);
     }
@@ -2189,7 +2278,7 @@ mod tests {
             ("git".to_string(), Arc::new(test_client("git", &["lab_status"]))),
             ("git_lab".to_string(), Arc::new(test_client("git_lab", &["status"]))),
         ];
-        let entries = build_tool_entries(&clients);
+        let entries = build_tool_entries(&clients, &std::collections::HashSet::new());
         let names: Vec<&str> = entries.iter().map(|e| e.definition.name.as_str()).collect();
         assert_eq!(names, vec!["mcp__git__lab_status", "mcp__git_lab__status"]);
         assert_eq!(entries[0].server_name, "git");
@@ -2204,7 +2293,7 @@ mod tests {
             ("a.b".to_string(), Arc::new(test_client("a.b", &["t"]))),
             ("a_b".to_string(), Arc::new(test_client("a_b", &["t"]))),
         ];
-        let entries = build_tool_entries(&clients);
+        let entries = build_tool_entries(&clients, &std::collections::HashSet::new());
         assert_eq!(entries[0].definition.name, "mcp__a_b__t");
         assert_ne!(entries[1].definition.name, entries[0].definition.name);
         assert!(entries[1].definition.name.starts_with("mcp__a_b__t_"));
@@ -2214,14 +2303,39 @@ mod tests {
     }
 
     #[test]
+    fn test_ambiguous_servers_keep_their_names_across_connect_order() {
+        let ambiguous: std::collections::HashSet<String> =
+            ["a.b".to_string(), "a_b".to_string()].into_iter().collect();
+        let a_dot = ("a.b".to_string(), Arc::new(test_client("a.b", &["t"])));
+        let a_under = ("a_b".to_string(), Arc::new(test_client("a_b", &["t"])));
+
+        // Only `a_b` connected so far.
+        let early = build_tool_entries(std::slice::from_ref(&a_under), &ambiguous);
+        // Both connected.
+        let late = build_tool_entries(&[a_dot, a_under], &ambiguous);
+        let name_of = |entries: &[McpToolEntry], server: &str| {
+            entries
+                .iter()
+                .find(|e| e.server_name == server)
+                .map(|e| e.definition.name.clone())
+                .expect("server entry")
+        };
+        assert_eq!(name_of(&early, "a_b"), name_of(&late, "a_b"));
+        // Neither gets the clean name, so no exact rule can switch servers.
+        assert_ne!(name_of(&late, "a_b"), "mcp__a_b__t");
+        assert_ne!(name_of(&late, "a.b"), "mcp__a_b__t");
+        assert_ne!(name_of(&late, "a.b"), name_of(&late, "a_b"));
+    }
+
+    #[test]
     fn test_exposed_names_are_capped_and_stable() {
         let long_tool = "x".repeat(100);
         let mut used = std::collections::HashSet::new();
-        let first = exposed_tool_name("server", &long_tool, &mut used);
+        let first = exposed_tool_name("server", &long_tool, false, &mut used);
         assert!(first.len() <= MAX_MCP_TOOL_NAME_LEN, "{} chars", first.len());
         assert!(first.starts_with("mcp__server__xxx"));
         // Same raw identity → same name on a rebuild.
-        let again = exposed_tool_name("server", &long_tool, &mut std::collections::HashSet::new());
+        let again = exposed_tool_name("server", &long_tool, false, &mut std::collections::HashSet::new());
         assert_eq!(first, again);
     }
 
