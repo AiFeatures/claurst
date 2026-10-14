@@ -437,6 +437,7 @@ async fn main() -> anyhow::Result<()> {
                     remote_session_url: None,
                     mcp_manager: None,
                     mcp_auth_runner: None,
+                    permission_manager: None,
                 };
                 // Collect remaining args after the command name
                 let rest: Vec<&str> = raw_args[2..].iter().map(|s| s.as_str()).collect();
@@ -574,6 +575,28 @@ async fn main() -> anyhow::Result<()> {
         config.permission_mode = cli.permission_mode.into();
     }
     config.additional_dirs = cli.add_dir.clone();
+    // --allowed-tools / --disallowed-tools extend the configured lists for
+    // this session only; the permission manager turns them into rules.
+    for (flag, list, target) in [
+        ("--allowed-tools", cli.allowed_tools.as_deref(), &mut config.allowed_tools),
+        ("--disallowed-tools", cli.disallowed_tools.as_deref(), &mut config.disallowed_tools),
+    ] {
+        for spec in list.map(claurst_core::permissions::split_rule_specs).unwrap_or_default() {
+            if claurst_core::permissions::parse_rule_spec(
+                &spec,
+                claurst_core::permissions::PermissionAction::Allow,
+            )
+            .is_none()
+            {
+                anyhow::bail!(
+                    "Invalid {} entry {:?}: expected Tool, Tool(pattern) or *",
+                    flag,
+                    spec
+                );
+            }
+            target.push(spec);
+        }
+    }
     if cli.no_auto_compact {
         config.auto_compact = false;
     }
@@ -689,14 +712,15 @@ async fn main() -> anyhow::Result<()> {
     // by the repository root (or the working directory outside a repo).
     let permission_project_root =
         claurst_core::git_utils::get_repo_root(&cwd).unwrap_or_else(|| cwd.clone());
-    let permission_manager = Arc::new(std::sync::Mutex::new(
+    let mut permission_manager =
         PermissionManager::new(config.permission_mode.clone(), &settings).with_project_store(
             claurst_core::permissions::project_approvals_path(
                 &claurst_core::config::Settings::config_dir(),
                 &permission_project_root,
             ),
-        ),
-    ));
+        );
+    permission_manager.sync_config(&config);
+    let permission_manager = Arc::new(std::sync::Mutex::new(permission_manager));
 
     let permission_handler: Arc<dyn claurst_core::PermissionHandler> = if is_headless {
         Arc::new(AutoPermissionHandler::with_manager(permission_manager.clone()))
@@ -2210,6 +2234,7 @@ async fn run_interactive(
         remote_session_url: session.remote_session_url.clone(),
         mcp_manager: tool_ctx.mcp_manager.clone(),
         mcp_auth_runner: None,
+        permission_manager: tool_ctx.permission_manager.clone(),
     };
 
     // tools is already Arc<Vec<...>> — share it across spawned tasks without copying.
@@ -2784,6 +2809,13 @@ async fn run_interactive(
                                     normalize_provider_from_model(&mut applied_cfg);
                                     cmd_ctx.config = applied_cfg.clone();
                                     tool_ctx.config = applied_cfg.clone();
+                                    // Mode and tool allow/deny lists may have changed
+                                    // (e.g. /permissions); re-derive their rules.
+                                    if let Some(manager) = tool_ctx.permission_manager.as_ref() {
+                                        if let Ok(mut manager) = manager.lock() {
+                                            manager.sync_config(&applied_cfg);
+                                        }
+                                    }
                                     app.config = applied_cfg.clone();
                                     // Sync model/provider shown in the TUI header.
                                     if let Some(ref model) = applied_cfg.model {
@@ -2811,6 +2843,13 @@ async fn run_interactive(
                                     normalize_provider_from_model(&mut applied_cfg);
                                     cmd_ctx.config = applied_cfg.clone();
                                     tool_ctx.config = applied_cfg.clone();
+                                    // Mode and tool allow/deny lists may have changed
+                                    // (e.g. /permissions); re-derive their rules.
+                                    if let Some(manager) = tool_ctx.permission_manager.as_ref() {
+                                        if let Ok(mut manager) = manager.lock() {
+                                            manager.sync_config(&applied_cfg);
+                                        }
+                                    }
                                     // Sync model/provider + fast_mode visual indicator.
                                     if let Some(ref model) = applied_cfg.model {
                                         app.set_model(model.clone());

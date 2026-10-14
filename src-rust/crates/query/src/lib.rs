@@ -655,6 +655,7 @@ pub async fn run_query_loop(
         } else {
             tools
                 .iter()
+                .filter(|t| !tool_ctx.tool_is_disallowed(t.name()))
                 .map(|t| ApiToolDefinition::from(&t.to_definition()))
                 .collect()
         };
@@ -962,7 +963,11 @@ pub async fn run_query_loop(
                     // summary turn with no tools so the provider can only emit
                     // text (opencode's `toolChoice:"none"` equivalent).
                     let provider_tools: Vec<claurst_core::types::ToolDefinition> = if caps.tool_calling && !degradation_turn {
-                        tools.iter().map(|t| t.to_definition()).collect()
+                        tools
+                            .iter()
+                            .filter(|t| !tool_ctx.tool_is_disallowed(t.name()))
+                            .map(|t| t.to_definition())
+                            .collect()
                     } else {
                         Vec::new()
                     };
@@ -2692,6 +2697,38 @@ mod tests {
                 level
             );
         }
+    }
+
+    /// #445: a tool covered by `disallowed_tools` is refused before it runs,
+    /// even a read-only one the central backstop would not gate.
+    #[tokio::test]
+    async fn disallowed_tool_is_refused_before_running() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockTool {
+            name: "MockSafe",
+            level: PermissionLevel::ReadOnly,
+            self_gates: false,
+            ran: ran.clone(),
+        })];
+        let mut manager = claurst_core::permissions::PermissionManager::new(
+            claurst_core::config::PermissionMode::BypassPermissions,
+            &claurst_core::config::Settings::default(),
+        );
+        manager.sync_config(&claurst_core::config::Config {
+            permission_mode: claurst_core::config::PermissionMode::BypassPermissions,
+            disallowed_tools: vec!["MockSafe".to_string()],
+            ..Default::default()
+        });
+        let ctx = ToolContext {
+            permission_manager: Some(Arc::new(std::sync::Mutex::new(manager))),
+            ..deny_all_context()
+        };
+
+        assert!(ctx.tool_is_disallowed("MockSafe"));
+        let result = execute_tool("MockSafe", &serde_json::json!({}), &tools, &ctx).await;
+        assert!(result.is_error);
+        assert!(result.content.contains("disallowed"), "{}", result.content);
+        assert!(!ran.load(AtomicOrdering::SeqCst), "a disallowed tool must not run");
     }
 
     #[test]

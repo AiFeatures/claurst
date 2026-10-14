@@ -52,6 +52,16 @@ pub(crate) async fn execute_tool(
 ) -> ToolResult {
     let tool = tools.iter().find(|t| t.name() == name);
 
+    // A tool-wide deny rule refuses the call whatever the tool's own
+    // permission level, read-only tools included.
+    if tool.is_some() && ctx.tool_is_disallowed(name) {
+        warn!(tool = name, "Tool call refused: tool is disallowed by permission rules");
+        return ToolResult::error(format!(
+            "Tool '{}' is disallowed by the permission rules (disallowed_tools).",
+            name
+        ));
+    }
+
     match tool {
         Some(tool) => {
             debug!(tool = name, "Executing tool");

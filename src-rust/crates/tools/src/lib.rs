@@ -681,6 +681,16 @@ impl ToolContext {
         })
     }
 
+    /// Whether a tool-wide deny rule (`disallowed_tools`, `--disallowed-tools`,
+    /// `/permissions deny`) covers `tool_name`. Such tools are not offered to
+    /// the model and calls to them are refused before they run.
+    pub fn tool_is_disallowed(&self, tool_name: &str) -> bool {
+        self.permission_manager
+            .as_ref()
+            .and_then(|manager| manager.lock().ok())
+            .is_some_and(|manager| manager.denies_tool(tool_name))
+    }
+
     pub fn path_is_within_workspace(&self, path: &std::path::Path) -> bool {
         let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         self.workspace_roots().iter().any(|root| resolved.starts_with(root))

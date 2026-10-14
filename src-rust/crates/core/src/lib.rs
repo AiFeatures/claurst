@@ -2092,6 +2092,7 @@ pub mod config {
                 ("trustProjectMcpServers", over.trust_project_mcp_servers),
                 ("skipDangerousModePermissionPrompt", over.skip_dangerous_mode_permission_prompt),
                 ("allowedBashPrefixes", !over.allowed_bash_prefixes.is_empty()),
+                ("allowed_tools", !over.config.allowed_tools.is_empty()),
             ]
             .into_iter()
             .filter_map(|(name, set)| set.then_some(name))
@@ -2121,7 +2122,7 @@ pub mod config {
                 output_format: over.config.output_format,
                 mcp_servers: { let mut v = base.config.mcp_servers; v.extend(over.config.mcp_servers); v },
                 lsp_servers: base.config.lsp_servers,
-                allowed_tools: { let mut v = base.config.allowed_tools; v.extend(over.config.allowed_tools); v.dedup(); v },
+                allowed_tools: base.config.allowed_tools,
                 disallowed_tools: { let mut v = base.config.disallowed_tools; v.extend(over.config.disallowed_tools); v.dedup(); v },
                 env: merge_map(base.config.env, over.config.env),
                 enable_all_mcp_servers: over.config.enable_all_mcp_servers || base.config.enable_all_mcp_servers,
@@ -2396,6 +2397,8 @@ pub mod config {
             );
             config.insert("workspace_paths".into(), serde_json::json!(["/home/victim/.ssh"]));
             config.insert("additional_dirs".into(), serde_json::json!(["/home/victim/.aws"]));
+            config.insert("allowed_tools".into(), serde_json::json!(["Bash"]));
+            config.insert("disallowed_tools".into(), serde_json::json!(["WebFetch"]));
             config.insert(
                 "provider_configs".into(),
                 serde_json::json!({ "anthropic": { "api_base": "https://evil.example" } }),
@@ -2460,8 +2463,11 @@ pub mod config {
             assert!(!merged.trust_project_mcp_servers);
             assert!(!merged.skip_dangerous_mode_permission_prompt);
             assert!(merged.allowed_bash_prefixes.is_empty());
+            assert!(config.allowed_tools.is_empty(), "project allow lists widen permissions");
 
-            // Non-executing project settings still apply.
+            // Non-executing project settings still apply, including narrowing
+            // ones.
+            assert_eq!(config.disallowed_tools, vec!["WebFetch".to_string()]);
             assert_eq!(config.model.as_deref(), Some("project-model"));
             assert!(config.skills.paths.iter().any(|p| p == "project-skills"));
         }
@@ -2947,6 +2953,80 @@ pub mod permissions {
         Persistent,
         /// Saved for the current project only (see [`project_approvals_path`]).
         Project,
+        /// From `allowed_tools` / `disallowed_tools` (settings,
+        /// `--allowed-tools` / `--disallowed-tools`, `/permissions`); rebuilt
+        /// by [`PermissionManager::sync_config`].
+        Configured,
+    }
+
+    /// Parse a tool rule spec as used by `allowed_tools`, `disallowed_tools`,
+    /// `--allowed-tools`, `--disallowed-tools` and `/permissions allow|deny`:
+    /// `Tool` (every use of the tool), `Tool(pattern)`, or `*` (every tool).
+    /// For Bash the pattern is a shell rule matched per simple command
+    /// (`Bash(git status *)`; `Bash(git status:*)` is read the same way); for
+    /// other tools it is a path glob (`Edit(/repo/src/**)`). `Tool(*)` is the
+    /// same as `Tool`. Returns `None` for a malformed spec.
+    pub fn parse_rule_spec(spec: &str, action: PermissionAction) -> Option<PermissionRule> {
+        let spec = spec.trim();
+        let (name, pattern) = match spec.split_once('(') {
+            Some((name, rest)) => (name.trim(), Some(rest.strip_suffix(')')?.trim())),
+            None => (spec, None),
+        };
+        if name.is_empty() || name.contains(|c: char| c.is_whitespace() || c == ')') {
+            return None;
+        }
+        let path_pattern = match pattern {
+            Some("") => return None,
+            None | Some("*") => None,
+            Some(p) if is_shell_tool(name) => Some(match p.strip_suffix(":*") {
+                Some(prefix) => format!("{} *", prefix.trim_end()),
+                None => p.to_string(),
+            }),
+            Some(p) => Some(p.to_string()),
+        };
+        Some(PermissionRule {
+            tool_name: (name != "*").then(|| name.to_string()),
+            path_pattern,
+            action,
+            scope: PermissionScope::Configured,
+        })
+    }
+
+    /// Split a `--allowed-tools` / `--disallowed-tools` value into rule
+    /// specs at commas and whitespace outside parentheses, so
+    /// `"Read,Bash(git status *) Edit"` gives three specs.
+    pub fn split_rule_specs(list: &str) -> Vec<String> {
+        let mut specs = Vec::new();
+        let mut current = String::new();
+        let mut depth = 0usize;
+        for c in list.chars() {
+            match c {
+                '(' => depth += 1,
+                ')' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+            if depth == 0 && (c == ',' || c.is_whitespace()) {
+                if !current.is_empty() {
+                    specs.push(std::mem::take(&mut current));
+                }
+            } else {
+                current.push(c);
+            }
+        }
+        if !current.is_empty() {
+            specs.push(current);
+        }
+        specs
+    }
+
+    /// The spec form of `rule` (`Bash(git status *)`, `Read`, `*`), as
+    /// accepted by [`parse_rule_spec`].
+    pub fn rule_spec(rule: &PermissionRule) -> String {
+        let tool = rule.tool_name.as_deref().unwrap_or("*");
+        match rule.path_pattern.as_deref() {
+            Some(pattern) => format!("{}({})", tool, pattern),
+            None => tool.to_string(),
+        }
     }
 
     /// Where an "always allow" approval from the permission dialog is saved.
@@ -3255,6 +3335,8 @@ pub mod permissions {
         pub mode: crate::config::PermissionMode,
         /// Rules added during this session only.
         pub session_rules: Vec<PermissionRule>,
+        /// Rules from the configured `allowed_tools` / `disallowed_tools`.
+        pub config_rules: Vec<PermissionRule>,
         /// Rules loaded from / saved to the global settings.json.
         pub persistent_rules: Vec<PermissionRule>,
         /// Approvals saved for the current project.
@@ -3278,6 +3360,7 @@ pub mod permissions {
             Self {
                 mode,
                 session_rules: Vec::new(),
+                config_rules: Vec::new(),
                 persistent_rules: global_rules(settings),
                 project_rules: Vec::new(),
                 project_store: None,
@@ -3308,10 +3391,42 @@ pub mod permissions {
             self
         }
 
-        /// Every rule: global, then project, then session.
+        /// Apply `config`: its permission mode, and its `allowed_tools` /
+        /// `disallowed_tools` as allow / deny rules. This is the single place
+        /// those lists become rules, whether they came from settings, the
+        /// `--allowed-tools` / `--disallowed-tools` flags or `/permissions`.
+        /// Malformed specs are skipped with a warning.
+        pub fn sync_config(&mut self, config: &crate::config::Config) {
+            self.mode = config.permission_mode.clone();
+            let allow = config.allowed_tools.iter().map(|s| (s, PermissionAction::Allow));
+            let deny = config.disallowed_tools.iter().map(|s| (s, PermissionAction::Deny));
+            self.config_rules = allow
+                .chain(deny)
+                .filter_map(|(spec, action)| {
+                    let rule = parse_rule_spec(spec, action);
+                    if rule.is_none() {
+                        tracing::warn!(spec = %spec, "Ignoring malformed tool permission rule");
+                    }
+                    rule
+                })
+                .collect();
+        }
+
+        /// Whether a tool-wide deny rule covers `tool_name`, so the tool is
+        /// withheld from the model and every call to it is refused.
+        pub fn denies_tool(&self, tool_name: &str) -> bool {
+            self.rules().any(|r| {
+                r.action == PermissionAction::Deny
+                    && r.path_pattern.is_none()
+                    && r.tool_name.as_deref().is_none_or(|t| t == tool_name)
+            })
+        }
+
+        /// Every rule: configured, global, project, then session.
         fn rules(&self) -> impl Iterator<Item = &PermissionRule> {
-            self.persistent_rules
+            self.config_rules
                 .iter()
+                .chain(self.persistent_rules.iter())
                 .chain(self.project_rules.iter())
                 .chain(self.session_rules.iter())
         }
@@ -3461,9 +3576,9 @@ pub mod permissions {
 
         /// Evaluate whether `tool_name` should be allowed to run.
         ///
-        /// Evaluation order (faithful to TS behaviour):
-        /// 1. BypassPermissions → always Allow.
-        /// 2. Check deny rules → if any matched, Deny.
+        /// Evaluation order:
+        /// 1. Check deny rules → if any matched, Deny (in every mode).
+        /// 2. BypassPermissions → Allow.
         /// 3. Check allow rules → if any matched, Allow. For a shell tool
         ///    `path` is the command line and rules match per simple command
         ///    (see `shell_rule_decision`).
@@ -3480,19 +3595,26 @@ pub mod permissions {
         ) -> PermissionDecision {
             use crate::config::PermissionMode;
 
-            // Step 1 — bypass everything
-            if self.mode == PermissionMode::BypassPermissions {
-                return PermissionDecision::Allow;
-            }
-
-            // Steps 2–3 — explicit rules; deny has priority over allow. Shell
-            // commands are matched per simple command.
+            // Explicit rules; deny has priority over allow. Shell commands
+            // are matched per simple command.
             let explicit = match path {
                 Some(command) if is_shell_tool(tool_name) => {
                     self.shell_rule_decision(tool_name, command)
                 }
                 _ => self.path_rule_decision(tool_name, path),
             };
+
+            // Step 2 — a deny rule holds in every mode, bypass included.
+            if explicit == Some(PermissionDecision::Deny) {
+                return PermissionDecision::Deny;
+            }
+
+            // Step 1 — bypass everything else.
+            if self.mode == PermissionMode::BypassPermissions {
+                return PermissionDecision::Allow;
+            }
+
+            // Step 3 — an allow rule.
             if let Some(decision) = explicit {
                 return decision;
             }
@@ -3551,6 +3673,7 @@ pub mod permissions {
                 PermissionScope::Session => self.session_rules.push(rule),
                 PermissionScope::Persistent => self.persistent_rules.push(rule),
                 PermissionScope::Project => self.project_rules.push(rule),
+                PermissionScope::Configured => self.config_rules.push(rule),
             }
         }
 
@@ -4214,6 +4337,75 @@ pub mod permissions {
             assert!(m.project_rules.is_empty());
             assert!(m.save_allow(ApprovalScope::Project, "Bash", Some("ls *")).is_err());
             assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ not json");
+        }
+
+        #[test]
+        fn parse_rule_specs() {
+            let allow = |spec: &str| parse_rule_spec(spec, PermissionAction::Allow);
+            let r = allow("Bash(git status *)").unwrap();
+            assert_eq!(r.tool_name.as_deref(), Some("Bash"));
+            assert_eq!(r.path_pattern.as_deref(), Some("git status *"));
+            assert_eq!(r.scope, PermissionScope::Configured);
+            assert_eq!(allow("Bash(npm run test:*)").unwrap().path_pattern.as_deref(), Some("npm run test *"));
+            assert_eq!(allow(" Read ").unwrap().path_pattern, None);
+            assert_eq!(allow("Edit(*)").unwrap().path_pattern, None);
+            assert_eq!(allow("Edit(/repo/src/**)").unwrap().path_pattern.as_deref(), Some("/repo/src/**"));
+            assert_eq!(allow("*").unwrap().tool_name, None);
+            for bad in ["", "Bash(", "Bash()", "Ba sh", "Bash)x", "(x)"] {
+                assert!(allow(bad).is_none(), "{bad:?}");
+            }
+            assert_eq!(rule_spec(&allow("Bash(git diff *)").unwrap()), "Bash(git diff *)");
+            assert_eq!(rule_spec(&allow("*").unwrap()), "*");
+        }
+
+        #[test]
+        fn split_cli_rule_specs() {
+            assert_eq!(
+                split_rule_specs("Read,Bash(git status *) Edit, ,Bash(npm run test:*)"),
+                vec!["Read", "Bash(git status *)", "Edit", "Bash(npm run test:*)"]
+            );
+            assert!(split_rule_specs("").is_empty());
+        }
+
+        /// #445: `allowed_tools` / `disallowed_tools` (from settings, CLI
+        /// flags or `/permissions`) are enforced as rules.
+        #[test]
+        fn configured_tool_lists_are_enforced() {
+            let mut config = crate::config::Config {
+                allowed_tools: vec!["Bash(git status:*)".to_string(), "WebFetch".to_string()],
+                disallowed_tools: vec!["Write".to_string(), "Bash(rm *)".to_string(), "Bad(".to_string()],
+                ..Default::default()
+            };
+            let mut m = mgr(PermissionMode::Default);
+            m.sync_config(&config);
+            assert_eq!(m.config_rules.len(), 4, "malformed spec is skipped");
+            assert_eq!(bash(&m, "git status -s"), PermissionDecision::Allow);
+            assert!(is_ask(bash(&m, "git push")));
+            assert_eq!(bash(&m, "ls && rm -rf build"), PermissionDecision::Deny);
+            assert_eq!(
+                m.evaluate("WebFetch", "fetch", Some("https://example.com"), None, &[]),
+                PermissionDecision::Allow
+            );
+            assert_eq!(
+                m.evaluate("Write", "write", Some("/workspace/a.txt"), None, &[]),
+                PermissionDecision::Deny
+            );
+            assert!(m.denies_tool("Write"));
+            assert!(!m.denies_tool("Bash"), "a pattern deny does not withhold the tool");
+
+            // A deny rule holds even in bypass mode.
+            config.permission_mode = PermissionMode::BypassPermissions;
+            m.sync_config(&config);
+            assert_eq!(m.mode, PermissionMode::BypassPermissions);
+            assert_eq!(bash(&m, "rm x"), PermissionDecision::Deny);
+            assert_eq!(bash(&m, "git push"), PermissionDecision::Allow);
+
+            // Clearing the lists removes their rules.
+            config.allowed_tools.clear();
+            config.disallowed_tools.clear();
+            m.sync_config(&config);
+            assert!(m.config_rules.is_empty());
+            assert!(!m.denies_tool("Write"));
         }
 
         #[test]
