@@ -173,6 +173,13 @@ impl App {
             }
             _ => {}
         }
+        // Any progress or terminal event ends the "Reconnecting" state.
+        if matches!(
+            event,
+            QueryEvent::Stream(_) | QueryEvent::TurnComplete { .. } | QueryEvent::Error(_)
+        ) {
+            self.retry_status = None;
+        }
 
         match event {
             QueryEvent::Stream(stream_evt) => {
@@ -313,6 +320,23 @@ impl App {
                 self.status_message = Some(msg);
             }
 
+            QueryEvent::Retry { attempt, max_attempts, delay_ms, reason } => {
+                // The failed attempt's partial output is discarded by the
+                // loop; drop it from the live view too.
+                self.streaming_text.clear();
+                self.streaming_thinking.clear();
+                self.stall_start = None;
+                self.retry_status = Some((attempt, max_attempts));
+                self.status_message = Some(format!(
+                    "Reconnecting {}/{} in {:.1}s: {}",
+                    attempt,
+                    max_attempts,
+                    delay_ms as f64 / 1000.0,
+                    reason
+                ));
+                self.invalidate_transcript();
+            }
+
             QueryEvent::Error(msg) => {
                 self.is_streaming = false;
                 self.spinner_verb = None;
@@ -352,6 +376,12 @@ impl App {
                     _ => {}
                 }
             }
+            QueryEvent::Compacted(record) => {
+                // The model now sees the compacted history: track its size so
+                // the context meter and warnings start from the new baseline.
+                self.context_used_tokens = record.tokens_after;
+                self.token_warning_threshold_shown = 0;
+            }
             QueryEvent::RateLimits { primary_used_percent, secondary_used_percent } => {
                 if primary_used_percent.is_some() {
                     self.rate_limit_5h_pct = primary_used_percent;
@@ -360,6 +390,10 @@ impl App {
                     self.rate_limit_7day_pct = secondary_used_percent;
                 }
             }
+            // The TUI renders from the stream and syncs the history when the
+            // query task finishes; committed messages are for headless output.
+            // The loop also reports the cap through a Status message.
+            QueryEvent::MessageCommitted(_) | QueryEvent::MaxTurnsReached { .. } => {}
         }
 
         // Update token count from tracker.

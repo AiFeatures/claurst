@@ -104,5 +104,9 @@ rusqlite = { workspace = true }
 # Optional: real audio capture for voice input (gated behind the `voice` feature)
 cpal = { version = "0.15", optional = true }
 
+# Kills a timed-out hook's process group (hooks.rs).
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }

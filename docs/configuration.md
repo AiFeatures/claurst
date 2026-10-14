@@ -128,6 +128,7 @@ The `config` object holds runtime behaviour options.
 | `max_tokens` | integer \| null | 8192 | Maximum tokens per model response. |
 | `provider` | string \| null | `"anthropic"` | Active provider. See the [Providers](#providers) section. |
 | `effort` | string \| null | unset | Reasoning effort for new turns: `"none"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`, or `"ultracode"`. When unset, no thinking-budget or temperature override is applied at all — this is not the same as `"medium"`, which has its own explicit values. |
+| `maxRetries` | integer \| null | null (5) | Retries after a model request fails transiently: HTTP 408/409/425/429/5xx, dropped connections, and streams that stall or end before completion. Waits follow the server's `retry-after-ms` / `Retry-After` header, otherwise exponential back-off with jitter, each capped at 60 s. Auth, quota/billing and invalid-request errors are never retried. `0` disables retrying. Note the camelCase key. |
 | `degradationSummaryEnabled` | boolean \| null | null (on) | When set to `false`, exceeding `max_turns` returns the last assistant message immediately instead of running one final tool-less degradation summary turn. Applies to sub-agents as well. Unset means enabled. Note the camelCase key. |
 
 ### Permission mode
@@ -145,7 +146,7 @@ See [Permission Modes](#permission-modes) for a full description of each value.
 |-----|------|---------|-------------|
 | `theme` | string | `"default"` | Color theme for the TUI. One of `"default"`, `"dark"`, `"light"`, `"deuteranopia"`. |
 | `output_style` | string \| null | null | Named output style. Built-in values: `"default"`, `"concise"`, `"verbose"`. Custom styles can be added as Markdown files under `~/.claurst/output-styles/`. |
-| `output_format` | string | `"text"` | Output format for headless (`--print`) mode. One of `"text"`, `"json"`, `"stream-json"`. |
+| `output_format` | string | `"text"` | Not used by headless runs: `--output-format` (default `text`) decides. See [Headless mode](advanced.md#headless-mode) for the `json` and `stream-json` shapes. |
 | `verbose` | boolean | false | Enable debug-level log output. |
 
 ### Context compaction
@@ -160,7 +161,7 @@ See [Permission Modes](#permission-modes) for a full description of each value.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `custom_system_prompt` | string \| null | null | Replace the default Claurst system prompt entirely with this text. |
-| `append_system_prompt` | string \| null | null | Append this text to the end of the assembled system prompt (after AGENTS.md content). |
+| `append_system_prompt` | string \| null | null | Append this text to the base system prompt (before the instruction files and the skill listing). |
 
 ### Tool access
 
@@ -174,8 +175,11 @@ tool). For `Bash` the pattern is a shell rule matched per command
 (`Bash(git status *)`, `Bash(npm run test:*)`); for other tools it is a path
 glob (`Edit(/repo/src/**)`). Tool names match the internal names: `Bash`,
 `Read`, `Write`, `Edit`, `NotebookEdit`, `BatchEdit`, `ApplyPatch`, `Glob`,
-`Grep`, `WebSearch`, `WebFetch`, and MCP tool names prefixed with their server
-name (`myserver_toolname`). The `--allowed-tools` / `--disallowed-tools` flags
+`Grep`, `WebSearch`, `WebFetch`, and MCP tool names in the form
+`mcp__<server>__<tool>` (see [MCP tool names](mcp.md#mcp-tool-names));
+`mcp__<server>` or `mcp__<server>__*` covers every tool of that server, so
+`disallowed_tools: ["mcp__github"]` hides all of them. The
+`--allowed-tools` / `--disallowed-tools` flags
 and `/permissions allow|deny` use the same syntax. See
 [Permission Rules and Approvals](#permission-rules-and-approvals).
 
@@ -214,41 +218,24 @@ case `command` is the base URL).
 
 ### Hooks
 
-Hooks let you run shell commands in response to lifecycle events. They are
-defined as a map from event name to an array of hook entries.
+Hooks run shell commands on session events (before and after tool calls,
+prompt submission, stop, session start and end, and more), using Claude Code's
+hook format. They are global-only. See [Hooks](hooks.md) for the events, the
+JSON input and output, and examples.
 
 ```json
 "hooks": {
   "PreToolUse": [
-    { "command": "echo tool=$TOOL_NAME", "blocking": false }
-  ],
-  "PostToolUse": [
-    { "command": "/path/to/my-logger.sh", "tool_filter": "Bash", "blocking": false }
+    {
+      "matcher": "Bash",
+      "hooks": [{ "type": "command", "command": "~/.claurst/hooks/check-bash.sh", "timeout": 10 }]
+    }
   ],
   "Stop": [
-    { "command": "notify-send 'Claurst done'", "blocking": false }
+    { "hooks": [{ "type": "command", "command": "notify-send 'Claurst done'" }] }
   ]
 }
 ```
-
-Available events:
-
-| Event | When it fires |
-|-------|--------------|
-| `PreToolUse` | Before a tool executes. Receives event JSON on stdin. |
-| `PostToolUse` | After a tool returns its result. |
-| `Stop` | When the model finishes its turn (stop reason). |
-| `PostModelTurn` | After the model samples a response, before tool execution. |
-| `UserPromptSubmit` | When the user submits a prompt. |
-| `Notification` | General-purpose notification event. |
-
-Hook entry fields:
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `command` | string | Shell command to execute. |
-| `tool_filter` | string \| null | Only run for this tool name (`PreToolUse`/`PostToolUse` only). |
-| `blocking` | boolean | If true, a non-zero exit code blocks the operation. Default: false. |
 
 ### External status line
 
@@ -295,7 +282,9 @@ tool calls are approved.
 
 Read-only operations (file reads, searches, glob) are permitted automatically.
 Write and execute operations (file writes, shell commands) prompt the user for
-confirmation in the TUI, or are denied in headless mode.
+confirmation in the TUI. In headless mode (`--print`) nobody can answer the
+prompt: the call is rejected, the tool result tells the model why, and the run
+continues (see [Headless mode](advanced.md#headless-mode)).
 
 ### `acceptEdits`
 
@@ -421,85 +410,167 @@ reads your reason.
 
 ---
 
-## AGENTS.md Memory Files
+## Instruction Files (AGENTS.md / CLAUDE.md)
 
-AGENTS.md files are plain Markdown documents that Claurst injects into the
-system prompt at startup. They let you give the model persistent context about
-your project, coding standards, or personal preferences without repeating
-yourself in every session.
+Instruction files are plain Markdown documents that Claurst loads once at
+session start and sends in the cached part of the system prompt. They give the
+model standing context about your project, coding standards, or personal
+preferences.
 
-### File locations and priority
+### File locations and order
 
-Claurst loads AGENTS.md files from four locations. They are processed in the
-following order (earlier = higher priority, later content is appended below):
+Files are loaded in this order; later files are more specific and win when
+two conflict:
 
-| Scope | Path | Description |
-|-------|------|-------------|
-| Managed | `~/.claurst/rules/*.md` | Global policy files. All `.md` files in this directory are loaded in alphabetical order. |
-| User | `~/.claurst/AGENTS.md` | Your personal preferences and instructions, applied to all projects. |
-| Project | `<project-root>/AGENTS.md` | Project-level context: architecture notes, conventions, workflows. Typically committed to version control. |
-| Local | `<project-root>/.claurst/AGENTS.md` | Local overrides not committed to version control (add `.claurst/` to `.gitignore`). |
+1. **Global**: `~/.claurst/` (the Claurst config directory), then `~/.claude/`
+   (Claude Code's global `CLAUDE.md`).
+2. **Project**: each directory from the git root down to the working
+   directory, outermost first.
 
-Files from all four locations are concatenated (separated by blank lines) into
-a single system-prompt fragment. If the same instruction appears at multiple
-levels, the narrower scope (Project/Local) effectively wins because it appears
-later in the prompt.
+The project walk stops at the directory that contains `.git` and never goes
+above it. When the working directory is not inside a git repository, only the
+working directory itself is read, so a stray `~/AGENTS.md` or `/AGENTS.md` is
+never picked up.
 
-### CLAUDE.md compatibility
+In each directory:
 
-Files named `CLAUDE.md` in the same locations are treated identically to
-`AGENTS.md`. Both names are supported for compatibility with the TypeScript
-Claude Code CLI.
+| File | Behaviour |
+|------|-----------|
+| `AGENTS.override.md` | When present, it is the only file loaded from that directory. Use it for local overrides you do not commit. |
+| `AGENTS.md` | Loaded first. |
+| `CLAUDE.md` | Loaded second, for compatibility with Claude Code. |
+| `.claude/CLAUDE.md` | Loaded third (Claude Code's alternative project location). |
+| `.claurst/AGENTS.md` | Loaded last. Session memories are saved here. |
+
+A file that is the same file as, or has the same content as, a file already
+loaded is skipped (for example a `CLAUDE.md` symlinked to `AGENTS.md`).
+
+Each file is sent as its own block, labelled with its path:
+
+```
+Instructions from: /home/me/project/AGENTS.md
+<file content>
+```
+
+### Size budget
+
+All instruction files together are limited to 32 KiB. The file that crosses
+the limit is truncated with a note telling the model to read the rest from
+disk; files after it are replaced by a note naming them. Global files are
+loaded first, so a large global file leaves less room for project files.
 
 ### YAML frontmatter
 
-AGENTS.md files may begin with optional YAML frontmatter to control loading:
-
-```markdown
----
-memory_type: project
-priority: 10
-scope: project
----
-
-# My Project Notes
-
-Always use 4-space indentation. Prefer `anyhow` for error handling.
-```
-
-Frontmatter fields:
-
-| Field | Description |
-|-------|-------------|
-| `memory_type` | Informal label (currently informational only). |
-| `priority` | Integer sort priority (lower numbers are prepended first within the same scope). |
-| `scope` | Informational label for documentation purposes. |
+A leading YAML frontmatter block (`---` ... `---`) is stripped before the file
+is sent. Its fields are ignored.
 
 ### @include directives
 
-AGENTS.md files support `@include` to pull in content from other files:
+Instruction files can pull in other files with `@include` lines:
 
 ```markdown
 # Project Guide
 
 @include ./docs/architecture.md
-@include ~/shared-notes/coding-standards.md
+@include docs/coding-standards.md
 ```
 
-Paths may be relative to the including file, absolute, or tilde-expanded.
-Circular includes are detected and skipped. Files larger than 40 KB are
-skipped with a warning comment.
+Paths may be relative to the including file, absolute, or `~/`-prefixed, but
+the target must stay inside the project root (the git root, or the working
+directory without git) for project files, or inside the global directory the
+file came from (`~/.claurst/` or `~/.claude/`) for global files. Anything outside is skipped with a comment, so a repository cannot pull
+files such as `~/.ssh/config` into the prompt. Circular includes are detected
+and skipped, nesting stops after 10 levels, and included files larger than
+40 KB are skipped with a comment. Included content counts toward the 32 KiB
+budget.
 
-### Disabling AGENTS.md loading
+Claude Code's bare `@path` import syntax is not recognised; only lines
+starting with `@include ` are expanded.
 
-To skip all AGENTS.md files for a session:
+### Disabling instruction files
+
+To skip all instruction files for a session:
 
 ```bash
 claurst --no-claude-md "your prompt"
 ```
 
-Or in a session, use the `--bare` flag to disable AGENTS.md, hooks, and
-plugins simultaneously.
+The `--bare` flag also disables them (together with hooks, plugins and
+project skill directories).
+
+---
+
+## Skills
+
+A skill is a Markdown file of instructions for a specific task. Claurst
+lists every available skill (name and one-line description) to the model in
+the cached part of the system prompt, inside an `<available_skills>` block, and
+the model loads one with the `Skill` tool when a task matches. Skills loaded
+from disk can also be run directly as slash commands (`/<name> args`).
+
+### Skill files
+
+A skill is either a directory with a `SKILL.md` file (`deploy/SKILL.md`, named
+after the directory) or a flat `<name>.md` file. Optional frontmatter sets the
+name and description:
+
+```markdown
+---
+name: deploy
+description: Deploy the service to staging or production.
+---
+
+Run `scripts/deploy.sh $ARGUMENTS` and report the result.
+```
+
+`$ARGUMENTS` is replaced with the arguments passed to the skill. Without a
+`description`, the skill is listed as "Custom skill".
+
+When the model loads a skill, the `Skill` tool returns the body wrapped in
+`<skill_content name="..." base_dir="...">`, where `base_dir` is the skill's
+directory, with a note that relative paths in the skill (for example
+`scripts/`) resolve against it.
+
+### Search locations
+
+Skills are discovered once at session start, in the background: the TUI
+opens at once, and the first request waits for discovery to finish (only a
+first-time `skills.urls` clone takes noticeable time). For a given name the
+first match wins, in this order:
+
+1. Project: `.claurst/skills/`, `.agents/skills/` and `.claude/skills/` in
+   each directory from the working directory up to the git root (nearer
+   directories win; without git, only the working directory).
+2. Global: `~/.claurst/skills/`, `~/.agents/skills/`, `~/.claude/skills/`.
+3. `skills.paths`: extra directories (relative paths resolve against the
+   working directory; `~/` is expanded).
+4. `skills.urls`: git repositories, cloned once (`--depth=1`) into the system
+   cache directory; skills are read from the repository root and its
+   `skills/` subdirectory.
+5. Bundled skills shipped with Claurst (`simplify`, `debug`, `batch`, ...). A
+   skill found on disk with the same name replaces the bundled one.
+
+```json
+"skills": {
+  "paths": ["~/my-skills", "tools/skills"],
+  "urls": ["https://github.com/example/skills.git"]
+}
+```
+
+`skills.urls` is global-only (see above); `skills.paths` from a project file
+is merged with the global list. `--bare` skips the project skill directories
+(step 1); global, configured and bundled skills stay.
+
+`.claurst/commands/*.md` files are no longer read as skills; move them to
+`.claurst/skills/`.
+
+### Listing budget
+
+The `<available_skills>` block uses the first line of each description,
+capped at 250 characters, and stops adding descriptions at about 3k tokens;
+the remaining skills are listed by name only. The block is omitted when the
+`Skill` tool is not enabled for the session. `/skills` lists every skill with
+its source file.
 
 ---
 
@@ -767,9 +838,6 @@ matches. They are defined in the `formatter` map:
     // Show debug logs
     "verbose": false,
 
-    // Plain text output in --print mode
-    "output_format": "text",
-
     // Add a custom instruction to every session
     "append_system_prompt": "Always explain your reasoning before making changes.",
 
@@ -781,13 +849,10 @@ matches. They are defined in the `formatter` map:
       "MY_PROJECT_TOKEN": "{env:HOME}/.project_token"
     },
 
-    // Run a script after every tool use
+    // Run a script after every tool use (see docs/hooks.md)
     "hooks": {
       "PostToolUse": [
-        {
-          "command": "/home/user/scripts/audit-log.sh",
-          "blocking": false
-        }
+        { "hooks": [{ "type": "command", "command": "/home/user/scripts/audit-log.sh" }] }
       ]
     },
 

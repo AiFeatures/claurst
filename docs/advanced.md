@@ -51,7 +51,7 @@ The context window has a finite size. Auto-compaction automatically summarises t
 
 Claurst tracks token usage after every model turn. When usage crosses the auto-compact threshold — which is the effective context window size minus a 13,000-token buffer — it runs `compactConversation` to summarise the history and replaces the messages with a compact summary plus any trailing context.
 
-The `PreCompact` hook fires before compaction (exit code 2 blocks it). The `PostCompact` hook fires after.
+The `PreCompact` hook fires before compaction, with `trigger` set to `auto` or `manual`; it cannot block it. There is no `PostCompact` hook. See [Hooks](hooks.md).
 
 ### Controlling auto-compaction
 
@@ -159,15 +159,6 @@ Subagents spawned via the `Agent` tool can operate in isolated git worktrees to 
 
 - `EnterWorktreeTool` — checks out a new worktree and switches the agent's working directory to it.
 - `ExitWorktreeTool` — removes the worktree and returns the agent to the original directory.
-
-### Custom worktree backends
-
-For non-git repositories or specialised isolation requirements, the `WorktreeCreate` and `WorktreeRemove` hook events let you substitute an external worktree manager:
-
-- `WorktreeCreate` receives `{"name": "<slug>"}` and must write the absolute path of the created directory to stdout.
-- `WorktreeRemove` receives `{"worktree_path": "<path>"}` and is responsible for cleanup.
-
-This means worktrees can be Docker containers, virtual machines, or any directory-backed isolation primitive.
 
 ---
 
@@ -361,56 +352,109 @@ Resets to the model's standard response style. Any active mode (caveman or rocky
 
 ## Headless mode
 
-Headless mode runs Claurst non-interactively, suitable for scripts, CI pipelines, and programmatic orchestration.
-
-### --print flag
+Headless mode runs Claurst non-interactively for scripts, CI pipelines and programmatic orchestration. A positional prompt or `-p` / `--print` selects it.
 
 ```bash
-claurst --print "refactor this function to use async/await"
 claurst -p "summarise the changes in this PR"
-```
-
-Processes the prompt and exits after printing the final response to stdout. No interactive UI is shown.
-
-Input can also be piped via stdin:
-
-```bash
 cat my_prompt.txt | claurst --print
-echo "explain this code" | claurst -p
+claurst -p --output-format stream-json "fix the failing test" | jq -c .
 ```
 
-### --output-format
+With no positional prompt, the prompt is read from stdin. `--input-format stream-json` reads newline-delimited `{"role":"user"|"assistant","content":"..."}` messages from stdin instead.
+
+### Output formats
+
+| `--output-format` | stdout |
+|---|---|
+| `text` (default) | The text of each assistant message, printed once the message is complete. Tool progress (`[Bash...]`), retries and the stop reason go to stderr. |
+| `json` | One `result` object (below) when the run ends. |
+| `stream-json` | One JSON event per line, in the order below, ending with the `result` event. |
+
+Text is printed per completed message rather than per streamed token, so output from an attempt that fails and is retried never reaches stdout.
+
+### stream-json events
+
+The events follow Claude Code's `stream-json` shape. Every event carries `session_id`.
+
+```jsonl
+{"type":"system","subtype":"init","session_id":"3f0c...","model":"claude-sonnet-4-6","cwd":"/repo","tools":["Bash","Read","Edit"],"permissionMode":"default"}
+{"type":"assistant","message":{"id":"msg_01...","role":"assistant","content":[{"type":"text","text":"Running the tests."},{"type":"tool_use","id":"toolu_01...","name":"Bash","input":{"command":"cargo test"}}]},"parent_tool_use_id":null,"session_id":"3f0c..."}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01...","content":"test result: ok. 12 passed"}]},"parent_tool_use_id":null,"session_id":"3f0c..."}
+{"type":"retry","attempt":1,"max_attempts":5,"delay_ms":2000,"reason":"HTTP 529 overloaded","session_id":"3f0c..."}
+{"type":"compacted","at":"2026-10-14T10:00:00Z","trigger":"threshold","summary_uuid":"...","messages_before":80,"messages_after":12,"tokens_before":180000,"tokens_after":24000,"summarised":true,"session_id":"3f0c..."}
+{"type":"assistant","message":{"id":"msg_02...","role":"assistant","content":[{"type":"text","text":"All 12 tests pass."}]},"parent_tool_use_id":null,"session_id":"3f0c..."}
+{"type":"result","subtype":"success","is_error":false,"result":"All 12 tests pass.","stop_reason":"end_turn","session_id":"3f0c...","num_turns":2,"duration_ms":18340,"total_cost_usd":0.0412,"usage":{"input_tokens":20510,"output_tokens":388,"cache_creation_input_tokens":0,"cache_read_input_tokens":11264}}
+```
+
+| Event | When |
+|---|---|
+| `system` (`subtype: "init"`) | First, before the model is called: session id, model, working directory, tool names, permission mode. |
+| `assistant` | Each assistant message, once complete, with all content blocks (`text`, `thinking`, `tool_use` with its `id`). |
+| `user` | Each message of tool results (`tool_result` blocks with `tool_use_id`; `is_error: true` marks a failed or rejected call). |
+| `retry` | A model request failed transiently and is retried after `delay_ms`. Output from the failed attempt is discarded. |
+| `compacted` | The history was compacted; the fields are the session's compaction record. |
+| `result` | Last line of the run. |
+
+`result` fields: `subtype`, `is_error`, `result` (text of the last assistant message), `stop_reason`, `error` (when the run did not succeed), `session_id`, `num_turns` (assistant messages in this run), `duration_ms`, `total_cost_usd`, `usage` (run totals), and `structured_output` (with `--json-schema`).
+
+This replaces the earlier `text_delta` / `tool_start` / `result` stream.
+
+### Exit codes
+
+| Code | `subtype` | `stop_reason` | Meaning |
+|---|---|---|---|
+| 0 | `success` | `end_turn` | The model finished. |
+| 1 | `error_during_execution` | `error` | An error ended the run (`error` has the message). |
+| 2 | `error_max_turns` | `max_turns` | The turn cap was reached (after one tool-less summary turn). |
+| 2 | `error_max_budget_usd` | `budget` | `--max-budget-usd` was reached. |
+| 2 | `error_max_tokens` | `max_tokens` | The response hit the output-token limit after recovery attempts. |
+| 130 | `cancelled` | `cancelled` | Interrupted with Ctrl-C. |
+
+Every case writes a `result` (`json` / `stream-json`) or the reason on stderr (`text`). A bad flag, an unreadable `--json-schema` or a missing session exits 1 before the run starts.
+
+The subtypes `success`, `error_max_turns`, `error_max_budget_usd` and `error_during_execution` match Claude Code; `error_max_tokens` and `cancelled` are claurst additions.
+
+On non-Anthropic providers, `--max-budget-usd` is not enforced and a response that stops at the output-token limit ends the run as `success` (exit 0): both checks exist only on the Anthropic request path so far.
+
+### Sessions
+
+Headless runs are saved like interactive ones (`~/.claurst/sessions/<id>.json`), so a later run or the TUI can continue them.
+
+| Flag | Effect |
+|---|---|
+| `-c`, `--continue` | Continue the most recently updated session. With no saved session, a new one is started. |
+| `--resume <id>` | Continue session `<id>`; exits 1 if it does not exist. `--resume` without an id is `-c`. |
+| `--session-id <id>` | Continue session `<id>` if it exists, otherwise create it with that id. Cannot be combined with `-c` / `--resume`. |
+
+The new prompt is appended to the saved history, and a continued session keeps its saved model unless `--model` is given. Session ids may contain letters, digits, `-`, `_` and `.`.
+
+### Permissions
+
+Headless runs never prompt. A tool call that would ask for approval in the TUI (for example a write in `default` mode) is rejected, and the tool result tells the model why and not to retry; the run continues. Use `--permission-mode`, permission rules, or `--dangerously-skip-permissions` to allow more. `--allowed-tools` / `--disallowed-tools` are parsed but not applied yet.
+
+### Structured output
 
 ```bash
-claurst --print --output-format json "..."
-claurst --print --output-format stream-json --verbose "..."
+claurst -p --output-format json \
+  --json-schema '{"type":"object","properties":{"verdict":{"type":"string"}},"required":["verdict"]}' \
+  "Is this branch ready to merge?"
 ```
 
-| Format | Description |
-|---|---|
-| (default) | Plain text output — only the final assistant message. |
-| `json` | Full message array as JSON (requires `--verbose`). |
-| `stream-json` | Newline-delimited JSON stream of messages as they arrive (requires `--verbose`). |
-
-`stream-json` is the format used by the Agent SDK transport. It emits every message event as it arrives, making it suitable for real-time processing pipelines.
+`--json-schema` takes inline JSON or a path to a JSON file. The schema must have `"type": "object"`. It adds the `StructuredOutput` tool with that schema as its input; a call whose top-level properties do not match (missing `required` keys, wrong property `type`) is returned to the model as an error. The input of the last accepted call is the result's `structured_output`. If the model never calls the tool, the field is absent.
 
 ---
 
 ## Budget control
 
-Limit resource consumption per invocation using CLI flags:
+Limit resource consumption per invocation:
 
 ```bash
-claurst --max-budget-usd 2.00 "..."   # Stop after spending $2.00
-claurst --max-turns 10 "..."          # Stop after 10 model turns
-claurst --max-tokens 50000 "..."      # Stop after 50,000 output tokens
+claurst -p --max-budget-usd 2.00 "..."   # stop once the run has spent $2.00
+claurst -p --max-turns 30 "..."          # stop after 30 model turns (default 100)
+claurst -p --max-tokens 8000 "..."       # cap each response at 8,000 output tokens
 ```
 
-When a limit is reached, Claurst exits with a corresponding error message:
-- `Error: Reached max turns (<n>)`
-- `Error: Exceeded USD budget (<amount>)`
-
-These flags are intended for automated use where runaway sessions would be costly.
+`--max-turns` defaults to 100. When the cap is reached, the model gets one final turn without tools to summarise what it did and where it stopped; the run then ends with `error_max_turns` and exit code 2. `--max-budget-usd` ends the run with `error_max_budget_usd` and exit code 2. See [Exit codes](#exit-codes).
 
 ---
 
@@ -504,19 +548,11 @@ SSH sessions work similarly: `claurst --ssh` enables a remote-accessible session
 
 ---
 
-## AGENTS.md hierarchical memory
+## Instruction files
 
-Claurst reads instruction files from the filesystem before every session and whenever a relevant file changes. The lookup order is:
+Claurst loads `AGENTS.md` / `CLAUDE.md` instruction files once at session start: the global `~/.claurst/` and `~/.claude/` directories first, then each directory from the git root down to the working directory (never above the git root; only the working directory when there is no `.git`). In each directory `AGENTS.override.md` replaces the other files; otherwise `AGENTS.md`, `CLAUDE.md`, `.claude/CLAUDE.md` and `.claurst/AGENTS.md` are loaded. `@include` lines are expanded within the project root, and all files share a 32 KiB budget. Each file is sent as an `Instructions from: <path>` block in the cached part of the system prompt.
 
-1. **Managed** — `/etc/claude-code/AGENTS.md` and `/etc/claude-code/CLAUDE.md` (administrator-controlled, always loaded).
-2. **User** — `~/.claurst/AGENTS.md` then `~/.claurst/CLAUDE.md` (personal global instructions).
-3. **Project** — `AGENTS.md`, `CLAUDE.md`, `.claurst/AGENTS.md`, and `.claurst/CLAUDE.md` in each directory from the filesystem root down to the current working directory. Files are loaded from the root toward the CWD so that parent-directory rules are visible when processing child-directory rules.
-
-`AGENTS.md` is preferred (universal cross-tool standard); `CLAUDE.md` is loaded next at every scope for compatibility with other Claude tooling. If both exist at the same scope, both are loaded.
-
-Files can `@include` other files using a frontmatter include directive. Included files are resolved relative to the including file.
-
-The `InstructionsLoaded` hook event fires for every file that is loaded, with the `load_reason` field indicating why (e.g. `session_start`, `nested_traversal`, `path_glob_match`, `include`, `compact`).
+See [Instruction Files](configuration.md#instruction-files-agentsmd--claudemd) for the full rules.
 
 The `/memory` command opens the memory management UI for viewing, editing, and organising instruction files.
 
@@ -533,7 +569,7 @@ The `/memory` command opens the memory management UI for viewing, editing, and o
 | `autoAccept` | Accepts all tool calls without prompting. Use with caution. |
 | `bypassPermissions` | Skips the permission system entirely. Intended for trusted automation only. |
 
-The active mode is set with `--permission-mode <mode>` or via the `PermissionRequest` hook.
+The active mode is set with `--permission-mode <mode>`.
 
 ### Tool risk classification
 
@@ -551,7 +587,7 @@ Every tool is classified into a risk tier that determines the default permission
 
 Within `BashTool`, commands are further classified by analysing the command string against known patterns. Commands matching dangerous patterns (e.g. `rm -rf`, `dd if=`, pipe chains with destructive intent) receive a higher risk rating and may be blocked depending on the active permission mode.
 
-The `PermissionRequest` hook can intercept any tool call before the user prompt is displayed, allowing automated allow/deny decisions based on context.
+A `PreToolUse` hook can decide a tool call before the permission prompt: `allow` skips the prompt, `ask` forces it, `deny` blocks the call. See [Hooks](hooks.md).
 
 ---
 
@@ -594,18 +630,18 @@ Custom commands appear alongside built-in commands in the `/` menu.
 
 ## Formatters
 
-Auto-formatters run automatically after file writes when configured. The typical setup uses a `PostToolUse` hook on `FileWrite` or `FileEdit`:
+Auto-formatters run automatically after file writes when configured. A `PostToolUse` hook on `Write` and `Edit` works too:
 
 ```json
 {
   "hooks": {
     "PostToolUse": [
       {
-        "matcher": "FileWrite",
+        "matcher": "Edit|Write",
         "hooks": [
           {
             "type": "command",
-            "command": "bash -c 'FILE=$(jq -r .inputs.file_path); prettier --write \"$FILE\" 2>/dev/null || true'"
+            "command": "f=$(jq -r .tool_input.file_path); prettier --write \"$f\" 2>/dev/null || true"
           }
         ]
       }
@@ -621,7 +657,7 @@ Common formatters:
 - **gofmt** (`gofmt -w <file>`) — Go.
 - **clang-format** (`clang-format -i <file>`) — C/C++.
 
-The hook exit code does not affect the tool call result; formatters should suppress non-zero exits for unknown file types (`|| true`).
+A `PostToolUse` hook cannot undo the tool call; a non-zero exit other than 2 is only logged. Suppress failures for unknown file types (`|| true`).
 
 ---
 
@@ -649,8 +685,6 @@ Environment variables can be set in `.claude/settings.json` under an `env` key. 
   }
 }
 ```
-
-The `CwdChanged` hook can also write environment exports to `$CLAUDE_ENV_FILE` to propagate dynamic values into subsequent Bash commands within the same session.
 
 ---
 

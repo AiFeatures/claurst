@@ -379,16 +379,13 @@ A rule is `Tool`, `Tool(pattern)` or `*`, e.g. `Bash(git status *)` or `Edit(/re
 
 ### /hooks
 
-Manage event hooks. Hooks are shell commands or scripts that execute when lifecycle events fire (e.g., before/after tool calls, on session start/end).
+Browse the hooks that will run, read-only: event, matcher, command, timeout and source (settings or a plugin). Edit `~/.claurst/settings.json` to change them; see [Hooks](hooks.md).
 
 ```
 /hooks
-/hooks list
-/hooks add <event> <command>
-/hooks remove <hook-id>
 ```
 
-Available events: `pre-tool`, `post-tool`, `session-start`, `session-end`, `message-send`, `message-receive`.
+Events: `PreToolUse`, `PostToolUse`, `UserPromptSubmit`, `Stop`, `SubagentStop`, `SessionStart`, `SessionEnd`, `Notification`, `PreCompact`, `PostModelTurn`.
 
 ---
 
@@ -842,14 +839,10 @@ Documented above under [Configuration & Settings](#configuration--settings).
 
 ### /skills
 
-List and manage skills. Skills are bundled prompt-commands that extend Claurst's capabilities without writing code. They appear alongside built-in commands in the registry.
+List the skills available to this session (discovered and bundled) with each skill's description and source file. Skills loaded from disk can be run as `/<name> args`; the model loads any listed skill with the `Skill` tool. See [Skills](configuration.md#skills).
 
 ```
 /skills
-/skills list
-/skills enable <skill-name>
-/skills disable <skill-name>
-/skills reload
 ```
 
 ---
