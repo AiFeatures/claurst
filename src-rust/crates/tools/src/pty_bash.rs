@@ -794,7 +794,15 @@ impl Tool for PtyBashTool {
         }
 
         // Security classifier — block Critical-risk commands unconditionally.
-        if classify_bash_command(&params.command) == BashRiskLevel::Critical {
+        // Each simple command of a compound line is classified on its own so
+        // `ls; rm -rf /` is caught as well as `rm -rf /`.
+        let critical_segment = match claurst_core::shell_scan::scan(&params.command) {
+            claurst_core::shell_scan::Scan::Commands(commands) => commands
+                .iter()
+                .any(|c| classify_bash_command(&c.text()) == BashRiskLevel::Critical),
+            claurst_core::shell_scan::Scan::Opaque(_) => false,
+        };
+        if critical_segment || classify_bash_command(&params.command) == BashRiskLevel::Critical {
             return ToolResult::error(format!(
                 "Command blocked: classified as Critical risk by the bash security classifier.\n\
                  Refusing to execute: {}",
@@ -1020,6 +1028,18 @@ mod tests {
             user_question_tx: None,
             cancel_token: tokio_util::sync::CancellationToken::new(),
         }
+    }
+
+    /// #445: a Critical command behind a harmless first command is still
+    /// blocked before anything runs.
+    #[tokio::test]
+    async fn critical_segment_of_compound_command_is_blocked() {
+        let ctx = allow_all_context();
+        let result = PtyBashTool
+            .execute(json!({ "command": "ls; rm -rf /" }), &ctx)
+            .await;
+        assert!(result.is_error);
+        assert!(result.content.contains("Critical"), "{}", result.content);
     }
 
     /// #220: a command that exceeds its timeout must have its child KILLED, not

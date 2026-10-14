@@ -4874,6 +4874,7 @@ pub mod keywords;
 pub mod prompt_history;
 pub mod bash_classifier;
 pub mod ps_classifier;
+pub mod shell_scan;
 pub mod mcp_trust;
 pub mod paths;
 
