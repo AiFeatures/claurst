@@ -422,6 +422,8 @@ mod tests {
         assert_eq!(arg_strings(&profile)[2..], ["--"]);
     }
 
+    // `protected_paths` joins with the host separator; Seatbelt paths are POSIX.
+    #[cfg(unix)]
     #[test]
     fn snapshot_workspace_write_with_protected_entries() {
         let roots = vec![PathBuf::from("/work/repo"), PathBuf::from("/private/tmp")];
