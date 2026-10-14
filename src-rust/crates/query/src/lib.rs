@@ -303,6 +303,10 @@ pub enum QueryEvent {
     /// (after any retry settled, with its final content blocks and tool-use
     /// ids) or the user message carrying a turn's tool results (#473).
     MessageCommitted(Message),
+    /// The turn cap was reached: the loop either runs one final tool-less
+    /// summary turn or returns at once (#473). May repeat when that summary
+    /// turn is retried.
+    MaxTurnsReached { max_turns: u32 },
 }
 
 // ---------------------------------------------------------------------------
@@ -537,6 +541,11 @@ pub async fn run_query_loop(
         // dispatched exactly once, and re-exceeding the cap afterwards returns
         // cold. Applies to both goal and non-goal runs.
         let degradation_turn = if turn > effective_max_turns {
+            if !degradation_done {
+                if let Some(ref tx) = event_tx {
+                    let _ = tx.send(QueryEvent::MaxTurnsReached { max_turns: effective_max_turns });
+                }
+            }
             if !config.degradation_enabled || degradation_done {
                 info!(
                     turns = turn,

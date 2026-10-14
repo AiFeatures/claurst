@@ -392,7 +392,8 @@ impl App {
             }
             // The TUI renders from the stream and syncs the history when the
             // query task finishes; committed messages are for headless output.
-            QueryEvent::MessageCommitted(_) => {}
+            // The loop also reports the cap through a Status message.
+            QueryEvent::MessageCommitted(_) | QueryEvent::MaxTurnsReached { .. } => {}
         }
 
         // Update token count from tracker.

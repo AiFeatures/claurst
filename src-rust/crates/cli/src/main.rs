@@ -1558,7 +1558,15 @@ async fn run_headless(
         permission_mode: &tool_ctx.permission_mode,
     })?;
 
+    // Ctrl-C cancels the loop; the run still reports a `cancelled` result
+    // and exits 130.
     let cancel = CancellationToken::new();
+    let interrupt = cancel.clone();
+    let ctrl_c = tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            interrupt.cancel();
+        }
+    });
     let (outcome, _messages) = headless::drive(
         client,
         tools,
@@ -1570,6 +1578,7 @@ async fn run_headless(
         &mut sink,
     )
     .await?;
+    ctrl_c.abort();
 
     let result = sink.result(&outcome, &cost_tracker, started.elapsed());
     sink.finish(&result)?;
@@ -1582,11 +1591,7 @@ async fn run_headless(
         );
     }
 
-    Ok(match result.subtype {
-        headless::ResultSubtype::ErrorDuringExecution => 1,
-        headless::ResultSubtype::ErrorBudget => 2,
-        _ => 0,
-    })
+    Ok(result.subtype.exit_code())
 }
 
 // ---------------------------------------------------------------------------

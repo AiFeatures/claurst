@@ -45,6 +45,19 @@ pub(crate) enum ResultSubtype {
     ErrorDuringExecution,
 }
 
+impl ResultSubtype {
+    /// Process exit code: 0 on success, 1 on error, 2 when a limit (turns,
+    /// budget, output tokens) stopped the run, 130 on Ctrl-C.
+    pub(crate) fn exit_code(self) -> i32 {
+        match self {
+            Self::Success => 0,
+            Self::ErrorDuringExecution => 1,
+            Self::ErrorMaxTurns | Self::ErrorBudget | Self::ErrorMaxTokens => 2,
+            Self::Cancelled => 130,
+        }
+    }
+}
+
 /// Cumulative token usage for the run.
 #[derive(Debug, Serialize)]
 pub(crate) struct ResultUsage {
@@ -145,6 +158,7 @@ pub(crate) struct HeadlessSink<W: Write, E: Write> {
     num_turns: u32,
     last_assistant_text: String,
     printed_text: bool,
+    max_turns: Option<u32>,
     compactions: Vec<CompactionRecord>,
 }
 
@@ -158,6 +172,7 @@ impl<W: Write, E: Write> HeadlessSink<W, E> {
             num_turns: 0,
             last_assistant_text: String::new(),
             printed_text: false,
+            max_turns: None,
             compactions: Vec::new(),
         }
     }
@@ -220,6 +235,10 @@ impl<W: Write, E: Write> HeadlessSink<W, E> {
                 self.compactions.push(record);
                 Ok(())
             }
+            QueryEvent::MaxTurnsReached { max_turns } => {
+                self.max_turns = Some(max_turns);
+                Ok(())
+            }
             _ => Ok(()),
         }
     }
@@ -256,7 +275,7 @@ impl<W: Write, E: Write> HeadlessSink<W, E> {
         cost_tracker: &claurst_core::cost::CostTracker,
         duration: std::time::Duration,
     ) -> RunResult {
-        let (subtype, stop_reason, error) = classify(outcome);
+        let (subtype, stop_reason, error) = classify(outcome, self.max_turns);
         RunResult {
             subtype,
             is_error: subtype != ResultSubtype::Success,
@@ -310,9 +329,18 @@ fn write_event<W: Write>(out: &mut W, event: &HeadlessEvent<'_>) -> std::io::Res
 }
 
 /// Map a loop outcome to the result subtype, stop reason and error text.
-fn classify(outcome: &QueryOutcome) -> (ResultSubtype, &'static str, Option<String>) {
+/// `max_turns` is set when the loop reported reaching its turn cap; the loop
+/// still ends with `EndTurn` then (after the tool-less summary turn).
+fn classify(outcome: &QueryOutcome, max_turns: Option<u32>) -> (ResultSubtype, &'static str, Option<String>) {
     match outcome {
-        QueryOutcome::EndTurn { .. } => (ResultSubtype::Success, "end_turn", None),
+        QueryOutcome::EndTurn { .. } => match max_turns {
+            Some(max) => (
+                ResultSubtype::ErrorMaxTurns,
+                "max_turns",
+                Some(format!("reached the maximum number of turns ({})", max)),
+            ),
+            None => (ResultSubtype::Success, "end_turn", None),
+        },
         QueryOutcome::MaxTokens { .. } => (
             ResultSubtype::ErrorMaxTokens,
             "max_tokens",
@@ -735,5 +763,95 @@ mod tests {
         assert!(run.stderr.contains("Reconnecting 1/3"), "{}", run.stderr);
         assert_eq!(run.result.num_turns, 1);
         assert_eq!(run.messages.len(), 2, "the user prompt plus one assistant reply");
+    }
+
+    #[tokio::test]
+    async fn end_turn_exits_0() {
+        let run = run(CliOutputFormat::Json, Vec::new(), Vec::new()).await;
+        assert_eq!(run.result.subtype, ResultSubtype::Success);
+        assert_eq!(run.result.subtype.exit_code(), 0);
+    }
+
+    #[tokio::test]
+    async fn error_exits_1_with_the_error_in_the_result() {
+        let error = claurst_api::parse_error_response(401, "invalid x-api-key", &pid());
+        let run = run(CliOutputFormat::Json, vec![Step::Fail(error)], Vec::new()).await;
+        let events = lines(&run.stdout);
+        assert_eq!(events[0]["subtype"], "error_during_execution");
+        assert_eq!(events[0]["is_error"], true);
+        assert_eq!(events[0]["stop_reason"], "error");
+        assert!(events[0]["error"].as_str().is_some(), "{}", run.stdout);
+        assert_eq!(run.result.subtype.exit_code(), 1);
+    }
+
+    #[tokio::test]
+    async fn max_turns_exits_2_after_the_summary_turn() {
+        let mut config = scripted_config(vec![Step::Stream(tool_turn("call-1", "ping", "{}"))]);
+        config.max_turns = 1;
+        let run = run_with(
+            CliOutputFormat::StreamJson,
+            config,
+            vec![Box::new(PingTool)],
+            context(std::path::PathBuf::from("/workspace"), allow_all()),
+            vec![Message::user("start")],
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+        assert!(matches!(run.outcome, QueryOutcome::EndTurn { .. }));
+        let events = lines(&run.stdout);
+        let result = events.last().unwrap();
+        assert_eq!(result["subtype"], "error_max_turns", "{}", run.stdout);
+        assert_eq!(result["stop_reason"], "max_turns");
+        assert_eq!(result["result"], "final answer", "the summary turn's text is the result");
+        assert_eq!(run.result.subtype.exit_code(), 2);
+    }
+
+    #[tokio::test]
+    async fn cancel_exits_130_with_a_cancelled_result() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        let run = run_with(
+            CliOutputFormat::Json,
+            scripted_config(Vec::new()),
+            Vec::new(),
+            context(std::path::PathBuf::from("/workspace"), allow_all()),
+            vec![Message::user("start")],
+            cancel,
+        )
+        .await;
+        assert!(matches!(run.outcome, QueryOutcome::Cancelled));
+        assert_eq!(lines(&run.stdout)[0]["subtype"], "cancelled");
+        assert_eq!(run.result.subtype.exit_code(), 130);
+    }
+
+    #[test]
+    fn budget_and_max_tokens_exit_2_with_a_reason() {
+        let budget = QueryOutcome::BudgetExceeded { cost_usd: 1.5, limit_usd: 1.0 };
+        let (subtype, stop_reason, error) = classify(&budget, None);
+        assert_eq!((subtype, stop_reason), (ResultSubtype::ErrorBudget, "budget"));
+        assert!(error.unwrap().contains("$1.0000"));
+        assert_eq!(subtype.exit_code(), 2);
+
+        let max_tokens = QueryOutcome::MaxTokens {
+            partial_message: Message::assistant("cut"),
+            usage: UsageInfo::default(),
+        };
+        let (subtype, stop_reason, error) = classify(&max_tokens, None);
+        assert_eq!((subtype, stop_reason), (ResultSubtype::ErrorMaxTokens, "max_tokens"));
+        assert!(error.is_some());
+        assert_eq!(subtype.exit_code(), 2);
+    }
+
+    #[test]
+    fn text_mode_reports_a_limit_on_stderr() {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let mut sink = HeadlessSink::new(CliOutputFormat::Text, "s".to_string(), &mut out, &mut err);
+        let outcome = QueryOutcome::BudgetExceeded { cost_usd: 1.5, limit_usd: 1.0 };
+        let result = sink.result(&outcome, &claurst_core::cost::CostTracker::new(), std::time::Duration::ZERO);
+        sink.finish(&result).unwrap();
+        drop(sink);
+        assert!(out.is_empty());
+        assert!(String::from_utf8(err).unwrap().contains("budget limit $1.0000 reached"));
     }
 }
