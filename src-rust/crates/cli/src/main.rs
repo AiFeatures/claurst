@@ -3339,7 +3339,6 @@ async fn run_interactive(
                 }
                 Event::FocusGained => app.terminal_focused = true,
                 Event::FocusLost => app.terminal_focused = false,
-                _ => {}
             }
         }
 
