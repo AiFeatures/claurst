@@ -190,6 +190,7 @@ async fn provider_for_config(config: &Config) -> Option<std::sync::Arc<dyn claur
             use_bearer_auth: anthropic_auth
                 .as_ref()
                 .is_some_and(|(_, use_bearer)| *use_bearer),
+            retry: claurst_api::RetryConfig::with_max_retries(config.max_retries),
             ..Default::default()
         },
     );

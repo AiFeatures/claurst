@@ -373,10 +373,14 @@ impl Tool for AgentTool {
             // Progressive tool disclosure (issue #233): the sub-agent's system
             // prompt only needs guideline blocks for the tools it actually has.
             enabled_tools: Some(agent_tools.iter().map(|t| t.name().to_string()).collect()),
+            // Filled from the sub-agent's tool context by the query loop.
+            permission_mode: None,
+            additional_dirs: Vec::new(),
             // Sub-agents run to their own completion and never drive goal
             // continuation — stop after one turn like every non-goal run.
             continuation: crate::continuation::ContinuationMode::Default,
             degradation_enabled: ctx.config.degradation_summary_enabled_or_default(),
+            retry: claurst_api::RetryConfig::with_max_retries(ctx.config.max_retries),
             auto_compact: true,
             // A sub-agent's history is not the parent session's.
             session_journal: None,
@@ -655,6 +659,7 @@ pub fn init_team_swarm_runner() {
                         agent_tools.iter().map(|t| t.name().to_string()).collect(),
                     ),
                     degradation_enabled: ctx.config.degradation_summary_enabled_or_default(),
+                    retry: claurst_api::RetryConfig::with_max_retries(ctx.config.max_retries),
                     ..Default::default()
                 };
 

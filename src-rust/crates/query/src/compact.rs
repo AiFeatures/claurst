@@ -2517,6 +2517,7 @@ mod tests {
                     status: Some(500),
                     message: "boom".to_string(),
                     is_retryable: true,
+                    retry_after: None,
                 });
             };
             let events = vec![

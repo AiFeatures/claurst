@@ -533,35 +533,53 @@ async fn main() -> anyhow::Result<()> {
             .api_base = Some(base.clone());
     }
 
-    // --dump-system-prompt fast path
-    if cli.dump_system_prompt {
-        let ctx = ContextBuilder::new(cwd.clone())
-            .disable_claude_mds(config.disable_claude_mds);
-        let sys = ctx.build_system_context().await;
-        let user = ctx.build_user_context().await;
-        println!("{}\n\n{}", sys, user);
-        return Ok(());
-    }
-
     // Build context
     let ctx_builder = ContextBuilder::new(cwd.clone())
         .disable_claude_mds(config.disable_claude_mds);
     let system_ctx = ctx_builder.build_system_context().await;
     let user_ctx = ctx_builder.build_user_context().await;
 
-    // Build system prompt. Only session-stable text goes here (it lands in
-    // the cached system block); `system_ctx` (date, git status, IDE context)
-    // is passed separately as `session_context` and sent in the dynamic block.
-    let base_prompt = config
-        .custom_system_prompt
-        .clone()
-        .unwrap_or_else(|| include_str!("system_prompt.txt").to_string());
-    let system_prompt = [Some(base_prompt), Some(user_ctx), config.append_system_prompt.clone()]
+    // Session-stable additions to the default prompt, which
+    // `claurst_core::system_prompt::build_system_prompt` assembles on its own
+    // (identity, capabilities, guidelines). Only session-stable text goes here
+    // (it lands in the cached system block); `system_ctx` (git status, IDE
+    // context) is passed separately as `session_context` and sent in the
+    // dynamic block.
+    let system_prompt = [config.custom_system_prompt.clone(), Some(user_ctx), config.append_system_prompt.clone()]
         .into_iter()
         .flatten()
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
         .join("\n\n");
+
+    // --dump-system-prompt fast path: print the stable and dynamic blocks
+    // assembled the way the first turn of this session would send them.
+    if cli.dump_system_prompt {
+        let opts = claurst_core::system_prompt::SystemPromptOptions {
+            custom_system_prompt: (!system_prompt.is_empty()).then_some(system_prompt),
+            session_context: Some(system_ctx),
+            output_style: config.effective_output_style(),
+            custom_output_style_prompt: config.resolve_output_style_prompt(),
+            working_directory: Some(cwd.display().to_string()),
+            additional_dirs: config
+                .additional_dirs
+                .iter()
+                .map(|dir| dir.display().to_string())
+                .collect(),
+            enabled_tools: Some(
+                claurst_tools::all_tools()
+                    .iter()
+                    .map(|tool| tool.name().to_string())
+                    .collect(),
+            ),
+            permission_mode: Some(config.permission_mode.clone()),
+            ..Default::default()
+        };
+        let prompt = claurst_core::system_prompt::build_system_prompt(&opts);
+        let (stable, dynamic) = claurst_core::system_prompt::split_at_dynamic_boundary(&prompt);
+        println!("{stable}\n\n{dynamic}");
+        return Ok(());
+    }
 
     // Initialize API client.
     // Try config/env first; fall back to saved OAuth tokens.
@@ -600,6 +618,7 @@ async fn main() -> anyhow::Result<()> {
         api_key: api_key.clone(),
         api_base: config.resolve_anthropic_api_base(),
         use_bearer_auth,
+        retry: claurst_api::RetryConfig::with_max_retries(config.max_retries),
         ..Default::default()
     };
     let client = Arc::new(
@@ -680,7 +699,16 @@ async fn main() -> anyhow::Result<()> {
             );
         }
     }
-    let mcp_manager_arc = connect_mcp_manager_arc(&mcp_decision.allowed).await;
+    // Servers connect concurrently in the background; the TUI draws
+    // immediately and picks up tools as servers finish. Headless runs have no
+    // later turn to pick them up, so they wait (bounded by the per-server
+    // connect/catalog timeouts) before the tool list is built.
+    let mcp_manager_arc = start_mcp_manager(&mcp_decision.allowed);
+    if is_headless {
+        if let Some(manager) = mcp_manager_arc.as_ref() {
+            manager.wait_until_settled().await;
+        }
+    }
 
     let pending_permissions = Arc::new(ParkingMutex::new(claurst_tools::PendingPermissionStore::default()));
 
@@ -788,7 +816,7 @@ async fn main() -> anyhow::Result<()> {
     let mut query_config = claurst_query::QueryConfig::from_config_with_registry(&config, &model_registry);
     query_config.model_registry = Some(model_registry.clone());
     query_config.max_turns = cli.max_turns;
-    query_config.system_prompt = Some(system_prompt);
+    query_config.system_prompt = (!system_prompt.is_empty()).then_some(system_prompt);
     query_config.append_system_prompt = None;
     query_config.session_context = Some(system_ctx);
     query_config.working_directory = Some(cwd.display().to_string());
@@ -888,7 +916,7 @@ async fn main() -> anyhow::Result<()> {
     result
 }
 
-async fn connect_mcp_manager_arc(
+fn start_mcp_manager(
     servers: &[claurst_core::config::McpServerConfig],
 ) -> Option<Arc<claurst_mcp::McpManager>> {
     if servers.is_empty() {
@@ -896,9 +924,20 @@ async fn connect_mcp_manager_arc(
     }
 
     info!(count = servers.len(), "Connecting to MCP servers");
-    let mcp_manager = Arc::new(claurst_mcp::McpManager::connect_all(servers).await);
-    mcp_manager.clone().spawn_notification_poll_loop();
-    Some(mcp_manager)
+    Some(claurst_mcp::McpManager::start(servers))
+}
+
+/// The session tool list: built-ins, Agent and every connected MCP tool,
+/// narrowed by the active agent's access level.
+fn tools_for_session(
+    mcp_manager: Option<Arc<claurst_mcp::McpManager>>,
+    query_config: &claurst_query::QueryConfig,
+) -> Arc<Vec<Box<dyn claurst_tools::Tool>>> {
+    let tools = build_tools_with_mcp(mcp_manager);
+    match query_config.agent_definition.as_ref() {
+        Some(def) => filter_tools_for_agent(tools, &def.access),
+        None => tools,
+    }
 }
 
 fn build_tools_with_mcp(
@@ -1311,6 +1350,7 @@ async fn refresh_provider_runtime_state(
         api_key,
         api_base: config.resolve_anthropic_api_base(),
         use_bearer_auth,
+        retry: claurst_api::RetryConfig::with_max_retries(config.max_retries),
         ..Default::default()
     };
     let client = Arc::new(
@@ -1356,6 +1396,7 @@ async fn reload_provider_runtime_state(
         api_key,
         api_base: config.resolve_anthropic_api_base(),
         use_bearer_auth,
+        retry: claurst_api::RetryConfig::with_max_retries(config.max_retries),
         ..Default::default()
     };
     let client = Arc::new(
@@ -1578,6 +1619,29 @@ async fn run_headless(
                     eprintln!("{}", ev);
                 } else {
                     eprintln!("\nError: {}", msg);
+                }
+            }
+            QueryEvent::Retry { attempt, max_attempts, delay_ms, reason } => {
+                let ev = serde_json::json!({
+                    "type": "retry",
+                    "attempt": attempt,
+                    "max_attempts": max_attempts,
+                    "delay_ms": delay_ms,
+                    "reason": reason,
+                });
+                if is_stream_json {
+                    println!("{}", ev);
+                } else if is_json_output {
+                    // `json` keeps stdout for the final result object.
+                    eprintln!("{}", ev);
+                } else {
+                    eprintln!(
+                        "\n[Reconnecting {}/{} in {:.1}s: {}]",
+                        attempt,
+                        max_attempts,
+                        *delay_ms as f64 / 1000.0,
+                        reason
+                    );
                 }
             }
             _ => {}
@@ -2186,10 +2250,14 @@ async fn run_interactive(
     };
 
     // tools is already Arc<Vec<...>> — share it across spawned tasks without copying.
-    // Keep the full unfiltered tool set so agent-mode switching can re-filter.
-    let all_tools_arc: Arc<Vec<Box<dyn claurst_tools::Tool>>> =
-        Arc::new(claurst_tools::all_tools());
+    // Agent-mode switches and MCP catalog changes rebuild it via `tools_for_session`.
     let mut tools_arc = tools;
+    // MCP manager generation the current `tools_arc` was built from; `None`
+    // forces a rebuild on the first idle pass.
+    let mut mcp_seen_generation: Option<u64> = None;
+    // Servers whose startup failure was already reported in the status line.
+    let mut mcp_reported_failures: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
 
     // Current cancel token (replaced each turn)
     let mut cancel: Option<CancellationToken> = None;
@@ -3314,13 +3382,12 @@ async fn run_interactive(
                             if let Some(turns) = def.max_turns {
                                 base_query_config.max_turns = turns;
                             }
-                            tools_arc = filter_tools_for_agent(all_tools_arc.clone(), &def.access);
                         } else {
                             // "build" with no explicit definition = full access, no agent
                             base_query_config.agent_name = None;
                             base_query_config.agent_definition = None;
-                            tools_arc = all_tools_arc.clone();
                         }
+                        tools_arc = tools_for_session(tool_ctx.mcp_manager.clone(), &base_query_config);
                     }
                     // A /rewind into a compaction's replaced head restores the
                     // pre-compaction history (issue #449); the next turn's
@@ -4213,6 +4280,7 @@ async fn run_interactive(
             if let Some((handle, msgs_arc)) = current_query.take() {
                 // Get the outcome and handle errors
                 let result = handle.await;
+                let aborted = matches!(result, Ok(QueryOutcome::Cancelled));
                 app.last_turn_outcome = claurst_tui::TurnOutcome::from_query_result(&result);
                 if let Ok(QueryOutcome::Error(err)) = result {
                     while app.notifications.current_is_error() {
@@ -4226,6 +4294,12 @@ async fn run_interactive(
                 }
                 // Sync the updated conversation back to our local vector
                 messages = msgs_arc.lock().await.clone();
+                // Tell the next turn that this one was interrupted on purpose.
+                if aborted {
+                    messages.push(claurst_core::types::Message::user(
+                        claurst_core::system_prompt::TURN_ABORTED_MESSAGE,
+                    ));
+                }
                 session.messages = messages.clone();
                 session.updated_at = chrono::Utc::now();
                 session.model = claurst_api::effective_model_for_config(&cmd_ctx.config, &model_registry);
@@ -4386,27 +4460,53 @@ async fn run_interactive(
                 &app.mcp_session_trusted,
                 &store,
             );
-            let new_mcp_manager = connect_mcp_manager_arc(&decision.allowed).await;
+            let new_mcp_manager = start_mcp_manager(&decision.allowed);
             tool_ctx.mcp_manager = new_mcp_manager.clone();
             app.mcp_manager = new_mcp_manager.clone();
-            tools_arc = build_tools_with_mcp(new_mcp_manager.clone());
+            // Read the generation before building: a connect task that bumps
+            // it in between then still triggers a rebuild in the idle block.
+            mcp_seen_generation = new_mcp_manager.as_ref().map(|manager| manager.generation());
+            tools_arc = tools_for_session(new_mcp_manager.clone(), &base_query_config);
+            mcp_reported_failures.clear();
             if app.mcp_view.visible {
                 app.refresh_mcp_view();
             }
 
-            let connected = new_mcp_manager
-                .as_ref()
-                .map(|manager| manager.server_count())
-                .unwrap_or(0);
             app.status_message = Some(if cmd_ctx.config.mcp_servers.is_empty() {
                 "No MCP servers configured.".to_string()
             } else {
+                let starting = decision.allowed.len();
                 format!(
-                    "Reconnected MCP runtime ({} connected server{}).",
-                    connected,
-                    if connected == 1 { "" } else { "s" }
+                    "Reconnecting MCP runtime ({} server{})...",
+                    starting,
+                    if starting == 1 { "" } else { "s" }
                 )
             });
+        }
+
+        // MCP servers connect in the background and may change their tool
+        // lists at runtime (`tools/list_changed`). Rebuild the tool list
+        // between turns whenever the manager reports a change, and surface
+        // servers that failed to start.
+        if !app.is_streaming && current_query.is_none() {
+            if let Some(manager) = tool_ctx.mcp_manager.clone() {
+                let generation = manager.generation();
+                if mcp_seen_generation != Some(generation) {
+                    mcp_seen_generation = Some(generation);
+                    tools_arc = tools_for_session(Some(manager.clone()), &base_query_config);
+                    if app.mcp_view.visible {
+                        app.refresh_mcp_view();
+                    }
+                    for (server, error) in manager.failed_servers() {
+                        if mcp_reported_failures.insert(server.clone()) {
+                            app.status_message = Some(format!(
+                                "MCP server '{}' failed to start: {} (see /mcp)",
+                                server, error
+                            ));
+                        }
+                    }
+                }
+            }
         }
 
         // Prompt for any project-defined MCP servers awaiting approval (#123).

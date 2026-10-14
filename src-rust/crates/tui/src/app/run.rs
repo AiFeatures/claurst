@@ -173,6 +173,13 @@ impl App {
             }
             _ => {}
         }
+        // Any progress or terminal event ends the "Reconnecting" state.
+        if matches!(
+            event,
+            QueryEvent::Stream(_) | QueryEvent::TurnComplete { .. } | QueryEvent::Error(_)
+        ) {
+            self.retry_status = None;
+        }
 
         match event {
             QueryEvent::Stream(stream_evt) => {
@@ -311,6 +318,23 @@ impl App {
 
             QueryEvent::Status(msg) => {
                 self.status_message = Some(msg);
+            }
+
+            QueryEvent::Retry { attempt, max_attempts, delay_ms, reason } => {
+                // The failed attempt's partial output is discarded by the
+                // loop; drop it from the live view too.
+                self.streaming_text.clear();
+                self.streaming_thinking.clear();
+                self.stall_start = None;
+                self.retry_status = Some((attempt, max_attempts));
+                self.status_message = Some(format!(
+                    "Reconnecting {}/{} in {:.1}s: {}",
+                    attempt,
+                    max_attempts,
+                    delay_ms as f64 / 1000.0,
+                    reason
+                ));
+                self.invalidate_transcript();
             }
 
             QueryEvent::Error(msg) => {
