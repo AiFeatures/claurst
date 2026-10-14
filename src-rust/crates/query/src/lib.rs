@@ -276,6 +276,10 @@ pub enum QueryEvent {
     /// `state` is Warning (≥ 80 %) or Critical (≥ 95 %).
     /// `pct_used` is the fraction of the context window consumed (0.0–1.0).
     TokenWarning { state: TokenWarningState, pct_used: f64 },
+    /// A model request failed transiently and will be retried after
+    /// `delay_ms` (#439). `attempt` is 1-based and at most `max_attempts`.
+    /// Output streamed by the failed attempt is discarded.
+    Retry { attempt: u32, max_attempts: u32, delay_ms: u64, reason: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -604,13 +608,12 @@ pub async fn run_query_loop(
                         "Transient model-request failure; retrying"
                     );
                     if let Some(ref tx) = event_tx {
-                        let _ = tx.send(QueryEvent::Status(format!(
-                            "Reconnecting {}/{} in {:.1}s: {}",
-                            retry_attempt,
-                            config.retry.max_retries,
-                            delay.as_secs_f64(),
-                            reason
-                        )));
+                        let _ = tx.send(QueryEvent::Retry {
+                            attempt: retry_attempt,
+                            max_attempts: config.retry.max_retries,
+                            delay_ms: delay.as_millis() as u64,
+                            reason,
+                        });
                     }
                     tokio::select! {
                         _ = cancel_token.cancelled() => return QueryOutcome::Cancelled,
@@ -3720,7 +3723,8 @@ mod tests {
         assert!(
             run.events.iter().any(|e| matches!(
                 e,
-                QueryEvent::Status(s) if s.starts_with("Reconnecting 1/5")
+                QueryEvent::Retry { attempt: 1, max_attempts: 5, reason, .. }
+                    if reason.contains("503")
             )),
             "the retry must be reported: {:?}",
             run.events
@@ -3756,6 +3760,13 @@ mod tests {
         assert!(
             started.elapsed() >= std::time::Duration::from_millis(20),
             "the loop must wait at least the server-requested Retry-After"
+        );
+        assert!(
+            run.events
+                .iter()
+                .any(|e| matches!(e, QueryEvent::Retry { delay_ms: 20, .. })),
+            "the Retry event carries the server-requested delay: {:?}",
+            run.events
         );
     }
 

@@ -1647,6 +1647,29 @@ async fn run_headless(
                     eprintln!("\nError: {}", msg);
                 }
             }
+            QueryEvent::Retry { attempt, max_attempts, delay_ms, reason } => {
+                let ev = serde_json::json!({
+                    "type": "retry",
+                    "attempt": attempt,
+                    "max_attempts": max_attempts,
+                    "delay_ms": delay_ms,
+                    "reason": reason,
+                });
+                if is_stream_json {
+                    println!("{}", ev);
+                } else if is_json_output {
+                    // `json` keeps stdout for the final result object.
+                    eprintln!("{}", ev);
+                } else {
+                    eprintln!(
+                        "\n[Reconnecting {}/{} in {:.1}s: {}]",
+                        attempt,
+                        max_attempts,
+                        *delay_ms as f64 / 1000.0,
+                        reason
+                    );
+                }
+            }
             _ => {}
         }
     }
