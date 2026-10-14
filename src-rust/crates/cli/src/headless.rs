@@ -711,8 +711,10 @@ mod tests {
         working_dir: std::path::PathBuf,
         handler: Arc<dyn claurst_core::PermissionHandler>,
     ) -> ToolContext {
-        let mut config = claurst_core::config::Config::default();
-        config.provider = Some("scriptprov".to_string());
+        let config = claurst_core::config::Config {
+            provider: Some("scriptprov".to_string()),
+            ..Default::default()
+        };
         ToolContext {
             working_dir,
             permission_mode: claurst_core::config::PermissionMode::Default,
