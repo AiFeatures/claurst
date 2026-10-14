@@ -11,7 +11,7 @@ pub(crate) use prompt::*;
 pub(crate) mod stream;
 pub(crate) use stream::*;
 pub(crate) mod hooks;
-pub use hooks::*;
+pub(crate) use hooks::*;
 pub(crate) mod compaction;
 pub(crate) use compaction::*;
 pub(crate) mod route;

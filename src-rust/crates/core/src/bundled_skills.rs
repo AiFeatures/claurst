@@ -285,7 +285,7 @@ Modify Claurst configuration by updating settings.json files.
 | File | Scope | Use For |
 |------|-------|---------|
 | `~/.claurst/settings.json` | Global | Personal preferences for all projects |
-| `.claurst/settings.json` | Project | Team-wide hooks, permissions, plugins |
+| `.claurst/settings.json` | Project | Project preferences (hooks, permissions and other global-only keys are ignored here) |
 | `.claurst/settings.local.json` | Project (local) | Personal overrides for this project |
 
 Settings load in order: user → project → local (later overrides earlier).
@@ -295,9 +295,12 @@ Settings load in order: user → project → local (later overrides earlier).
 Always read the existing settings file before making changes.
 Merge new settings with existing ones — never replace the entire file.
 
-## Hook Events
+## Hooks
 
-PreToolUse, PostToolUse, PreCompact, PostCompact, Stop, Notification, SessionStart
+Hooks go in the global `~/.claurst/settings.json` only, under a top-level `hooks` key, in Claude Code's format:
+`{"hooks": {"PreToolUse": [{"matcher": "Edit|Write", "hooks": [{"type": "command", "command": "...", "timeout": 60}]}]}}`
+
+Events: PreToolUse, PostToolUse, UserPromptSubmit, Stop, SubagentStop, SessionStart, SessionEnd, Notification, PreCompact, PostModelTurn. A hook gets the event JSON on stdin; exit 2 blocks (stderr is the reason); stdout JSON may set `decision` (allow/deny/ask), `reason`, `updatedInput` and `additionalContext`.
 
 ## User Request
 
