@@ -1272,10 +1272,51 @@ pub mod config {
         /// polled periodically and its stdout is shown in a status bar row.
         #[serde(default, rename = "statusLine", alias = "status_line", skip_serializing_if = "Option::is_none")]
         pub status_line: Option<StatusLineConfig>,
+        /// Which background-task completions wake an idle session with a
+        /// `<subagent>` / `<shell>` notice (#444). Unset keeps the defaults:
+        /// sub-agents on, shell off unless the command asked with `notify`.
+        #[serde(default, rename = "completionWakeups", alias = "completion_wakeups", skip_serializing_if = "Option::is_none")]
+        pub completion_wakeups: Option<CompletionWakeups>,
         /// Shell sandbox settings, copied from the top-level `sandbox` block
         /// of the global settings by [`Settings::effective_config`].
         #[serde(skip)]
         pub sandbox: crate::sandbox::SandboxSettings,
+    }
+
+    /// `completionWakeups`: per-kind switches for background completion
+    /// notices (#444). A notice is delivered at the next step boundary of a
+    /// running turn, or starts a turn when the session is idle.
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    pub struct CompletionWakeups {
+        /// Background sub-agents (Agent tool, `run_in_background`). Default on.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub subagents: Option<bool>,
+        /// Background Bash commands. Default off: only a command started with
+        /// `notify: true` notifies. `false` is a hard off, even for those;
+        /// with `true`, `notify: false` still opts a command out.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub shell: Option<bool>,
+    }
+
+    impl Config {
+        /// Whether a finished background sub-agent should notify the session.
+        pub fn subagent_completion_wakeups(&self) -> bool {
+            self.completion_wakeups
+                .as_ref()
+                .and_then(|w| w.subagents)
+                .unwrap_or(true)
+        }
+
+        /// Whether a finished background Bash command should notify the
+        /// session. `requested` is the command's own `notify` argument. An
+        /// explicit `shell: false` is a hard off that the model cannot
+        /// override; otherwise `requested` wins over the setting.
+        pub fn shell_completion_wakeups(&self, requested: Option<bool>) -> bool {
+            match self.completion_wakeups.as_ref().and_then(|w| w.shell) {
+                Some(false) => false,
+                setting => requested.or(setting).unwrap_or(false),
+            }
+        }
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1340,6 +1381,16 @@ pub mod config {
         fn unset_status_line_is_not_serialized() {
             let value = serde_json::to_value(Settings::default()).unwrap();
             assert!(value["config"].get("statusLine").is_none());
+        }
+        #[test]
+        fn project_cannot_set_completion_wakeups() {
+            let mut project = Settings::default();
+            project.config.completion_wakeups = Some(CompletionWakeups {
+                subagents: Some(true),
+                shell: Some(true),
+            });
+            let merged = Settings::merge(Settings::default(), project);
+            assert!(merged.config.completion_wakeups.is_none());
         }
         #[test]
         fn project_cannot_override_global_status_line() {
@@ -2334,6 +2385,9 @@ pub mod config {
                 status_line: base.config.status_line,
                 sandbox: base.config.sandbox,
                 degradation_summary_enabled: over.config.degradation_summary_enabled.or(base.config.degradation_summary_enabled),
+                // Global-only: a project file must not be able to turn on
+                // autonomous wake-up turns.
+                completion_wakeups: base.config.completion_wakeups,
             };
             Self {
                 config: merged_config,
@@ -5416,6 +5470,32 @@ mod tests {
         let back: crate::config::Config = serde_json::from_str(&json).unwrap();
         assert_eq!(back.degradation_summary_enabled, Some(false));
         assert!(!back.degradation_summary_enabled_or_default());
+    }
+
+    #[test]
+    fn test_completion_wakeups_defaults_and_overrides() {
+        // Defaults (#444): sub-agents notify, shell commands only on request.
+        let cfg = crate::config::Config::default();
+        assert!(cfg.subagent_completion_wakeups());
+        assert!(!cfg.shell_completion_wakeups(None));
+        assert!(cfg.shell_completion_wakeups(Some(true)));
+
+        // `Config` has no blanket `#[serde(default)]`: start from a full one.
+        let mut value = serde_json::to_value(crate::config::Config::default()).unwrap();
+        value["completionWakeups"] = serde_json::json!({ "subagents": false, "shell": true });
+        let cfg: crate::config::Config = serde_json::from_value(value).unwrap();
+        assert!(!cfg.subagent_completion_wakeups());
+        assert!(cfg.shell_completion_wakeups(None));
+        assert!(!cfg.shell_completion_wakeups(Some(false)), "a command can opt out");
+
+        // An explicit `shell: false` is a hard off the model cannot override.
+        let mut value = serde_json::to_value(crate::config::Config::default()).unwrap();
+        value["completionWakeups"] = serde_json::json!({ "shell": false });
+        let cfg: crate::config::Config = serde_json::from_value(value).unwrap();
+        assert!(!cfg.shell_completion_wakeups(Some(true)));
+
+        let json = serde_json::to_string(&crate::config::Config::default()).unwrap();
+        assert!(!json.contains("completionWakeups"));
     }
 
     #[test]

@@ -128,12 +128,13 @@ pub struct QueryConfig {
     /// thinking budget.  Also provides a temperature override when the
     /// level specifies one.
     pub effort_level: Option<claurst_core::effort::EffortLevel>,
-    /// T1-4: Optional shared command queue.
+    /// Optional shared command queue (#444).
     ///
-    /// When set, the query loop drains this queue before each API call and
-    /// injects any resulting messages into the conversation.  The queue is
-    /// shared (Arc-backed) so the TUI input thread can push commands while the
-    /// loop is waiting for a model response.
+    /// When set, the query loop drains this queue before each API call (each
+    /// step boundary) and appends the resulting messages to the conversation,
+    /// emitting [`QueryEvent::InputInjected`]. The queue is shared
+    /// (Arc-backed) so the TUI can push steers, and background tasks their
+    /// completion notices, while the loop is running.
     pub command_queue: Option<CommandQueue>,
     /// Optional USD spend cap. The query loop checks accumulated cost after
     /// each turn and aborts with `QueryOutcome::BudgetExceeded` when exceeded.
@@ -313,6 +314,11 @@ pub enum QueryEvent {
     /// Provider-reported subscription usage (0-100 per window), e.g. the
     /// Codex `x-codex-*` rate-limit headers.
     RateLimits { primary_used_percent: Option<f32>, secondary_used_percent: Option<f32> },
+    /// Queued input drained from [`QueryConfig::command_queue`] at a step
+    /// boundary and appended to the history as user messages, in order
+    /// (#444): steers typed during the turn and background-task completion
+    /// notices.
+    InputInjected(Vec<String>),
     /// A message was appended to the history for good: an assistant reply
     /// (after any retry settled, with its final content blocks and tool-use
     /// ids) or the user message carrying a turn's tool results (#473).
@@ -734,18 +740,21 @@ pub async fn run_query_loop(
             }
         }
 
-        // T1-4: Drain the priority command queue (if wired up) and prepend any
-        // resulting messages to the conversation before the API call.
-        // Mirrors the TS `messageQueueManager` priority-queue drain.
+        // Step boundary (#444): deliver queued input — steers typed while the
+        // turn ran and background-task completion notices — before the next
+        // model request. They are appended after the last tool results, in
+        // queue order, and reported so the UI can show them where they landed.
         if let Some(ref cq) = config.command_queue {
             if !cq.is_empty() {
                 let injected = drain_command_queue(cq);
                 if !injected.is_empty() {
                     debug!(count = injected.len(), "Injecting command-queue messages");
-                    // Prepend so that higher-priority commands appear first.
-                    let tail = std::mem::take(messages);
+                    if let Some(ref tx) = event_tx {
+                        let _ = tx.send(QueryEvent::InputInjected(
+                            injected.iter().map(Message::get_all_text).collect(),
+                        ));
+                    }
                     messages.extend(injected);
-                    messages.extend(tail);
                 }
             }
         }
@@ -3719,7 +3728,7 @@ mod tests {
         max_retries: u32,
         tools: Vec<Box<dyn Tool>>,
     ) -> ScriptedRun {
-        drive_scripted_with(steps, max_retries, tools, None, Vec::new(), None).await
+        drive_scripted_with(steps, max_retries, tools, None, Vec::new(), None, None).await
     }
 
     /// [`drive_scripted`] with an explicit turn cap and queued user messages
@@ -3731,6 +3740,7 @@ mod tests {
         max_turns: Option<u32>,
         mut pending: Vec<String>,
         history: Option<Vec<Message>>,
+        command_queue: Option<CommandQueue>,
     ) -> ScriptedRun {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let provider = Arc::new(ScriptedProvider {
@@ -3762,6 +3772,7 @@ mod tests {
         if let Some(max_turns) = max_turns {
             config.max_turns = max_turns;
         }
+        config.command_queue = command_queue;
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut messages = history.unwrap_or_else(|| vec![Message::user("start")]);
@@ -4014,6 +4025,7 @@ mod tests {
             noop_tools(),
             Some(0),
             vec!["typed during the attempt".to_string()],
+            None,
             None,
         )
         .await;
@@ -4356,6 +4368,7 @@ mod tests {
             None,
             Vec::new(),
             Some(long_history(7, 20_000)),
+            None,
         )
         .await;
         assert_eq!(run.calls, 3, "overflow, summary, retried request");
@@ -4371,6 +4384,136 @@ mod tests {
             "exactly one compaction: {:?}",
             run.events
         );
+    }
+
+    // ---- Issue #444: steering through the command queue ---------------------
+
+    /// A tool that, while it runs, does what the TUI does when the user
+    /// presses Enter mid-turn: push steers into the shared queue.
+    struct SteerWhileRunningTool {
+        queue: CommandQueue,
+        steers: Vec<&'static str>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for SteerWhileRunningTool {
+        fn name(&self) -> &str { "noop_tool" }
+        fn description(&self) -> &str { "pushes steers while running" }
+        fn permission_level(&self) -> PermissionLevel { PermissionLevel::ReadOnly }
+        fn input_schema(&self) -> Value { serde_json::json!({"type": "object"}) }
+        async fn execute(&self, _input: Value, _ctx: &ToolContext) -> ToolResult {
+            for steer in &self.steers {
+                self.queue.push(
+                    QueuedCommand::InjectUserMessage((*steer).to_string()),
+                    CommandPriority::Normal,
+                );
+            }
+            ToolResult::success("tool done")
+        }
+    }
+
+    fn texts_of(messages: &[Message]) -> Vec<(Role, String)> {
+        messages.iter().map(|m| (m.role.clone(), m.get_all_text())).collect()
+    }
+
+    #[tokio::test]
+    async fn steer_is_delivered_after_tool_results_before_the_next_request() {
+        let queue = CommandQueue::new();
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(SteerWhileRunningTool {
+            queue: queue.clone(),
+            steers: vec!["also check the docs", "and the tests"],
+        })];
+        let run = drive_scripted_with(
+            vec![ScriptStep::Stream(tool_call_turn("{}"))],
+            0,
+            tools,
+            None,
+            Vec::new(),
+            None,
+            Some(queue.clone()),
+        )
+        .await;
+        assert!(matches!(run.outcome, QueryOutcome::EndTurn { .. }));
+        assert_eq!(run.calls, 2, "the steers ride the request after the tool batch");
+        assert!(queue.is_empty(), "the step boundary drained the queue");
+
+        let history = texts_of(&run.messages);
+        let result_at = run
+            .messages
+            .iter()
+            .position(|m| !m.get_tool_result_blocks().is_empty())
+            .expect("tool result in history");
+        assert_eq!(
+            &history[result_at + 1..result_at + 3],
+            &[
+                (Role::User, "also check the docs".to_string()),
+                (Role::User, "and the tests".to_string()),
+            ],
+            "steers follow the tool results in the order typed: {history:?}"
+        );
+        assert_eq!(history.last().map(|(role, _)| role.clone()), Some(Role::Assistant));
+
+        let injected: Vec<&Vec<String>> = run
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                QueryEvent::InputInjected(texts) => Some(texts),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            injected,
+            [&vec!["also check the docs".to_string(), "and the tests".to_string()]]
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_input_is_drained_before_the_first_request_of_a_turn() {
+        // The idle wake-up path: a turn starts with only a queued notice, and
+        // the loop delivers it before its first request.
+        let queue = CommandQueue::new();
+        queue.push(
+            QueuedCommand::InjectUserMessage(
+                "<background-shell id=\"t1\" state=\"completed\">ok</background-shell>".into(),
+            ),
+            CommandPriority::Normal,
+        );
+        let history = vec![Message::user("start"), Message::assistant("started it")];
+        let run = drive_scripted_with(
+            Vec::new(),
+            0,
+            noop_tools(),
+            None,
+            Vec::new(),
+            Some(history),
+            Some(queue.clone()),
+        )
+        .await;
+        assert!(matches!(run.outcome, QueryOutcome::EndTurn { .. }));
+        assert_eq!(run.calls, 1);
+        assert!(queue.is_empty());
+        let history = texts_of(&run.messages);
+        assert_eq!(history[2].0, Role::User);
+        assert!(history[2].1.starts_with("<background-shell "), "{history:?}");
+        assert_eq!(history[3], (Role::Assistant, "final answer".to_string()));
+    }
+
+    #[tokio::test]
+    async fn an_empty_queue_injects_nothing() {
+        let queue = CommandQueue::new();
+        let run = drive_scripted_with(
+            vec![ScriptStep::Stream(tool_call_turn("{}"))],
+            0,
+            noop_tools(),
+            None,
+            Vec::new(),
+            None,
+            Some(queue),
+        )
+        .await;
+        assert!(matches!(run.outcome, QueryOutcome::EndTurn { .. }));
+        assert!(!run.events.iter().any(|e| matches!(e, QueryEvent::InputInjected(_))));
+        assert_eq!(run.messages.iter().filter(|m| m.role == Role::User).count(), 2);
     }
 }
 

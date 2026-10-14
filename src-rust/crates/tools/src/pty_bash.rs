@@ -11,7 +11,7 @@
 //             in portable_pty but adds complexity for minimal gain on Windows.
 
 use crate::sandbox::SeatbeltProfile;
-use crate::{PermissionLevel, Tool, ToolContext, ToolResult, session_shell_state};
+use crate::{CompletionNotifier, PermissionLevel, Tool, ToolContext, ToolResult, session_shell_state};
 use async_trait::async_trait;
 use claurst_core::bash_classifier::{BashRiskLevel, classify_bash_command};
 use claurst_core::sandbox::SEATBELT_EXECUTABLE;
@@ -73,6 +73,10 @@ struct BashInput {
     timeout: u64,
     #[serde(default)]
     run_in_background: bool,
+    /// Background only: whether finishing should notify the session (#444).
+    /// `None` follows the `completionWakeups.shell` setting (default off).
+    #[serde(default)]
+    notify: Option<bool>,
 }
 
 fn default_timeout() -> u64 {
@@ -197,6 +201,7 @@ async fn run_in_background(
     timeout_ms: u64,
     spill_dir: &Path,
     sandbox: Option<SeatbeltProfile>,
+    notifier: Option<CompletionNotifier>,
 ) -> ToolResult {
     let task_name = format!("bg: {}", &command[..command.floor_char_boundary(60)]);
     let mut task = BackgroundTask::new(&task_name);
@@ -204,6 +209,7 @@ async fn run_in_background(
     let task_id = global_registry().register(task);
     let task_id_clone = task_id.clone();
     let command_clone = command.clone();
+    let notify = notifier.is_some();
     let spill_path = spill_dir.join(format!("{task_id}.txt"));
     let term = std::env::var_os("TERM").unwrap_or_else(|| DEFAULT_TERM.into());
 
@@ -334,11 +340,31 @@ async fn run_in_background(
                 )),
             );
         }
+
+        // Completion wake-up (#444). A task cancelled through the monitor
+        // tool was stopped on purpose and does not report back.
+        if let Some(notifier) = notifier {
+            if let Some(task) = global_registry().get(&task_id_clone) {
+                if task.status != claurst_core::tasks::TaskStatus::Cancelled {
+                    let state = task.status.to_string();
+                    notifier.notify(crate::completion_notice(
+                        "background-shell",
+                        &[("id", &task.id), ("state", &state), ("command", &command_clone)],
+                        &task.render_output(),
+                    ));
+                }
+            }
+        }
     });
 
+    let follow_up = if notify {
+        "You will be notified with its output when it finishes; do not poll or sleep for it."
+    } else {
+        "Check on it with the monitor tool."
+    };
     ToolResult::success(format!(
-        "Command started in background.\nTask ID: {}\nCommand: {}",
-        task_id, command
+        "Command started in background.\nTask ID: {}\nCommand: {}\n{}",
+        task_id, command, follow_up
     ))
 }
 
@@ -962,6 +988,10 @@ impl Tool for PtyBashTool {
                 "run_in_background": {
                     "type": "boolean",
                     "description": "Set to true to run command in the background"
+                },
+                "notify": {
+                    "type": "boolean",
+                    "description": "With run_in_background: set to true to be sent the command's output automatically when it finishes, instead of checking with the monitor tool. Use it for builds and tests you are waiting on; leave it off for servers and watchers."
                 }
             },
             "required": ["command"]
@@ -1020,7 +1050,12 @@ impl Tool for PtyBashTool {
                 state.cwd.clone().unwrap_or_else(|| ctx.working_dir.clone())
             };
             let sandbox = crate::sandbox::profile_for(ctx, &params.command);
-            return run_in_background(params.command, cwd, timeout_ms, &spill_dir, sandbox).await;
+            let notifier = if ctx.config.shell_completion_wakeups(params.notify) {
+                ctx.completion_notifier.clone()
+            } else {
+                None
+            };
+            return run_in_background(params.command, cwd, timeout_ms, &spill_dir, sandbox, notifier).await;
         }
 
         debug!(command = %params.command, "Executing bash command via PTY");
@@ -1649,7 +1684,8 @@ mod tests {
     /// Start `command` in the background and wait for its task to finish.
     async fn run_background_to_completion(command: &str, spill_dir: &Path) -> BackgroundTask {
         let started =
-            run_in_background(command.to_string(), std::env::temp_dir(), 60_000, spill_dir, None).await;
+            run_in_background(command.to_string(), std::env::temp_dir(), 60_000, spill_dir, None, None)
+                .await;
         let task_id = started
             .content
             .lines()
@@ -1665,6 +1701,35 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "background task never finished");
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    /// #444: a background command started with a notifier reports back with
+    /// a `<background-shell>` notice carrying its state and output.
+    #[tokio::test]
+    async fn background_completion_sends_a_shell_notice() {
+        let spill_dir = tempfile::tempdir().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let notifier = CompletionNotifier::new(move |msg| {
+            let _ = tx.send(msg);
+        });
+        let started = run_in_background(
+            "echo done-marker".to_string(),
+            std::env::temp_dir(),
+            60_000,
+            spill_dir.path(),
+            None,
+            Some(notifier),
+        )
+        .await;
+        assert!(started.content.contains("You will be notified"), "{}", started.content);
+        let notice = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+            .await
+            .expect("notice within 30s")
+            .expect("notifier called");
+        assert!(notice.starts_with("<background-shell id=\""), "{notice}");
+        assert!(notice.contains(" state=\"completed\""), "{notice}");
+        assert!(notice.contains(" command=\"echo done-marker\">"), "{notice}");
+        assert!(notice.contains("\ndone-marker\n</background-shell>"), "{notice}");
     }
 
     /// #442 (Monitor path): a chatty background task keeps bounded windows in

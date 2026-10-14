@@ -107,6 +107,24 @@ OSC 7501 reports use the root record with `app=claurst`:
 
 On a normal exit Claurst sends `state=clear` to remove its record. If it crashes it reports `state=error` instead, so the tab still shows that something went wrong.
 
+### Attention notifications
+
+`notifications` (top-level, default `true`, also in `/config`) rings the terminal bell and sends a desktop notification when a turn finishes, fails, or waits on you (tool permission, question, sign-in) while the terminal window is in the background. Focus comes from the terminal's focus reporting; terminals without it count as always focused and never alert.
+
+| Terminal | Sequence |
+|----------|----------|
+| iTerm2, WezTerm, Ghostty, kitty | OSC 9 |
+| Others | OSC 777 (`notify`), ignored where unsupported |
+| Inside tmux | The OSC wrapped in a DCS passthrough; needs `set -g allow-passthrough on`, and `set -g focus-events on` so tmux forwards focus changes |
+
+The bell is sent in every case.
+
+```json
+{
+  "notifications": false
+}
+```
+
 ```json
 {
   "terminalProgressBar": true,
@@ -130,6 +148,7 @@ The `config` object holds runtime behaviour options.
 | `provider` | string \| null | `"anthropic"` | Active provider. See the [Providers](#providers) section. |
 | `effort` | string \| null | unset | Reasoning effort for new turns: `"none"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`, or `"ultracode"`. When unset, no thinking-budget or temperature override is applied at all — this is not the same as `"medium"`, which has its own explicit values. |
 | `maxRetries` | integer \| null | null (5) | Retries after a model request fails transiently: HTTP 408/409/425/429/5xx, dropped connections, and streams that stall or end before completion. Waits follow the server's `retry-after-ms` / `Retry-After` header, otherwise exponential back-off with jitter, each capped at 60 s. Auth, quota/billing and invalid-request errors are never retried. `0` disables retrying. Note the camelCase key. |
+| `completionWakeups` | object \| null | null | Which background completions are delivered to the session as `<subagent …>` / `<background-shell …>` messages: at the next step of a running turn, or as a new turn when idle. `{"subagents": bool, "shell": bool}`; unset keys keep the defaults: sub-agents `true`, shell `false`. With `shell` unset or `true`, a Bash call's own `notify: true` / `false` decides for that command; `"shell": false` is a hard off that `notify: true` cannot override. Cancelled tasks never report. Global settings only: a project settings file cannot set it. Note the camelCase key. |
 | `degradationSummaryEnabled` | boolean \| null | null (on) | When set to `false`, exceeding `max_turns` returns the last assistant message immediately instead of running one final tool-less degradation summary turn. Applies to sub-agents as well. Unset means enabled. Note the camelCase key. |
 
 ### Permission mode

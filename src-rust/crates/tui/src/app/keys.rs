@@ -1222,6 +1222,10 @@ impl App {
         if let Some(keystroke) = key_event_to_keystroke(&key) {
             let had_pending_chord = self.keybindings.has_pending_chord();
             match self.keybindings.process(keystroke, &key_context) {
+                // Contextual actions that do not apply right now fall through,
+                // so their key keeps its ordinary meaning (Alt+Up scrolls when
+                // nothing is queued).
+                KeybindingResult::Action(action) if !self.keybinding_action_applies(&action) => {}
                 KeybindingResult::Action(action) => {
                     return self.handle_keybinding_action(&action);
                 }
@@ -1383,18 +1387,6 @@ impl App {
         }
 
         match key.code {
-            // ---- ESC: cancel streaming (status bar advertises "esc interrupt") ----
-            KeyCode::Esc if self.is_streaming => {
-                self.is_streaming = false;
-                self.spinner_verb = None;
-                self.streaming_text.clear();
-                self.streaming_thinking.clear();
-                self.tool_use_blocks.clear();
-                self.retry_status = None;
-                self.status_message = Some("Cancelled.".to_string());
-                self.complete_current_turn_snapshot(true);
-            }
-
             // ---- Quit / cancel ----------------------------------------
             // Accept both 'c' and 'C' so Shift+Ctrl+C also triggers copy
             // (issue #149 follow-up).
@@ -1410,15 +1402,8 @@ impl App {
                     if copied {
                         self.push_notification(NotificationKind::Info, "Copied to clipboard".to_string(), Some(2));
                     }
-                } else if self.is_streaming {
-                    // Cancel streaming.
-                    self.is_streaming = false;
-                    self.spinner_verb = None;
-                    self.streaming_text.clear();
-                    self.streaming_thinking.clear();
-                    self.tool_use_blocks.clear();
-                    self.status_message = Some("Cancelled.".to_string());
-                    self.complete_current_turn_snapshot(true);
+                } else if self.turn_running() {
+                    self.interrupt_turn();
                 } else {
                     // No text selected and not streaming: handle exit confirmation sequence.
                     // Always clear the prompt input on Ctrl+C.
@@ -2084,16 +2069,27 @@ impl App {
         self.exit_key_sequence_start = Some(key_char);
     }
 
+    /// Whether a contextual keybinding action has anything to act on.
+    /// Actions that do not apply leave the key to the hardcoded handlers.
+    fn keybinding_action_applies(&self, action: &str) -> bool {
+        match action {
+            "editQueued" | "removeQueued" => self.pending_prompts().next().is_some(),
+            // Idle Esc keeps its other meanings (vim, transcript focus). There
+            // is no backtrack picker, so Esc-Esc on an idle prompt does nothing.
+            "cancelTurn" => self.turn_running(),
+            _ => true,
+        }
+    }
+
     pub(super) fn handle_keybinding_action(&mut self, action: &str) -> bool {
         match action {
+            "cancelTurn" => {
+                self.interrupt_turn();
+                false
+            }
             "interrupt" => {
-                if self.is_streaming {
-                    self.is_streaming = false;
-                    self.spinner_verb = None;
-                    self.streaming_text.clear();
-                    self.streaming_thinking.clear();
-                    self.tool_use_blocks.clear();
-                    self.status_message = Some("Cancelled.".to_string());
+                if self.turn_running() {
+                    self.interrupt_turn();
                 } else {
                     // Handle exit confirmation: require two exit key presses within 2 seconds.
                     // Always clear the prompt input on Ctrl+C.
@@ -2400,6 +2396,23 @@ impl App {
                 if !self.is_streaming {
                     self.prompt_input.insert_newline();
                     self.refresh_prompt_input();
+                }
+                false
+            }
+            "editQueued" => {
+                self.edit_last_pending();
+                false
+            }
+            "removeQueued" => {
+                self.remove_last_pending();
+                false
+            }
+            "indent" if self.turn_running() && self.prompt_input.suggestions.is_empty() => {
+                // Tab during a turn: queue the prompt as a new turn for after
+                // this one ends (#444). Enter would steer it into this turn.
+                let input = self.take_input();
+                if !input.is_empty() {
+                    self.queued_messages.push_back(input);
                 }
                 false
             }

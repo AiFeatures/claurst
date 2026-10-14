@@ -297,19 +297,15 @@ fn resolve_bridge_config(
     bridge_config.is_active().then_some(bridge_config)
 }
 
-fn handle_exit_key(app: &mut claurst_tui::app::App, key: crossterm::event::KeyEvent, cancel: &Option<tokio_util::sync::CancellationToken>) -> bool {
+fn handle_exit_key(app: &mut claurst_tui::app::App, key: crossterm::event::KeyEvent) -> bool {
     if !key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
         return false;
     }
 
     match key.code {
         crossterm::event::KeyCode::Char('c') => {
-            // Cancel background task first, then let app handle state cleanup
-            if app.is_streaming {
-                if let Some(ref ct) = cancel {
-                    ct.cancel();
-                }
-            }
+            // During a turn the app interrupts it and sets `cancel_requested`;
+            // the main loop then cancels the token, as for Esc (#444).
             app.handle_key_event(key);
             true
         }
@@ -1963,6 +1959,23 @@ async fn run_interactive(
     if claurst_core::goals_enabled() {
         base_query_config.continuation = claurst_query::ContinuationMode::Goal;
     }
+    // One queue for the whole session (#444): Enter during a turn pushes
+    // steers, background tasks push completion notices, and every turn's loop
+    // drains it at each step boundary. When it is non-empty while idle, the
+    // main loop starts a turn to deliver it.
+    let command_queue = claurst_query::CommandQueue::new();
+    base_query_config.command_queue = Some(command_queue.clone());
+    // Background sub-agents and Bash commands report completion into the same
+    // queue as `<subagent>` / `<shell>` notices (gated by completionWakeups).
+    tool_ctx.completion_notifier = Some({
+        let queue = command_queue.clone();
+        claurst_tools::CompletionNotifier::new(move |notice| {
+            queue.push(
+                claurst_query::QueuedCommand::InjectUserMessage(notice),
+                claurst_query::CommandPriority::Normal,
+            );
+        })
+    });
     let mut live_config = config.clone();
     if !session.model.is_empty() {
         live_config.model = Some(session.model.clone());
@@ -1980,6 +1993,7 @@ async fn run_interactive(
     // state that would otherwise outlive a signalled exit and garble the shell.
     claurst_tui::spawn_signal_restore_watchers();
     let mut app = App::new(live_config.clone(), cost_tracker.clone());
+    app.command_queue = Some(command_queue.clone());
     // Startup skill discovery runs on the blocking pool so a cold
     // `skills.urls` clone never holds the terminal. When it finishes, the
     // main loop installs the slash commands for autocomplete and every query
@@ -2313,6 +2327,8 @@ async fn run_interactive(
             .map(|s| (s.terminal_progress_bar, s.terminal_program_status))
             .unwrap_or((true, true));
     let mut progress_shown = false;
+    // Set while an interrupted turn's task winds down (#444).
+    let mut discard_turn_events = false;
     'main: loop {
         app.frame_count = app.frame_count.wrapping_add(1);
         app.tick_rustle_pose();
@@ -2365,9 +2381,17 @@ async fn run_interactive(
         // Report OSC 7501 program status (idle / working / blocked / done /
         // error) so terminals and multiplexer UIs can show which session needs
         // attention. Written only on change; cleared in restore_terminal.
+        let program_status = app.program_status(current_query.is_some());
         if program_status_enabled {
-            claurst_tui::set_program_status(app.program_status(current_query.is_some()));
+            claurst_tui::set_program_status(program_status);
         }
+        // Bell + desktop notification when a turn finishes or waits on the
+        // user while the terminal is in the background (#444).
+        if let Some(attention) = app.attention_alert(program_status) {
+            claurst_tui::attention::emit(attention);
+        }
+
+        app.query_in_flight = current_query.is_some();
 
         // Poll for crossterm events (keyboard/mouse) with short timeout
         // unless an auto-submit (queued message) is pending — in which case
@@ -2420,7 +2444,7 @@ async fn run_interactive(
                     }
 
                     // Ctrl+C and Ctrl+D: exit confirmation handling
-                    if handle_exit_key(&mut app, key, &cancel) {
+                    if handle_exit_key(&mut app, key) {
                         if app.should_exit {
                             break 'main;
                         }
@@ -2463,23 +2487,23 @@ async fn run_interactive(
                         && !key.modifiers.contains(KeyModifiers::SHIFT)
                         && !key.modifiers.contains(KeyModifiers::ALT)
                         && !key.modifiers.contains(KeyModifiers::CONTROL);
-                    if plain_enter && app.is_streaming && !any_dialog_open {
-                        // Queue the message: it will auto-submit once the
-                        // current turn finishes (issue #149).
+                    // A turn is running until its task ends: `is_streaming`
+                    // drops between model requests and right after Esc.
+                    let turn_running = app.is_streaming || current_query.is_some();
+                    if plain_enter && turn_running && !any_dialog_open {
+                        // Steer (#444): the loop delivers the text before its
+                        // next model request. Slash commands cannot steer the
+                        // model, so they wait for the turn to end (issue #149).
+                        // Both show in the queued-prompt dock until delivered.
                         let input = app.take_input();
-                        if !input.is_empty() {
-                            let preview: String = input.chars().take(40).collect();
+                        if input.starts_with('/') {
                             app.queued_messages.push_back(input);
-                            let total = app.queued_messages.len();
-                            app.notifications.push(
-                                claurst_tui::NotificationKind::Info,
-                                format!("Queued ({}): {}", total, preview),
-                                Some(3),
-                            );
+                        } else if !input.is_empty() {
+                            app.steer(input);
                         }
                         continue;
                     }
-                    if plain_enter && !app.is_streaming && !any_dialog_open {
+                    if plain_enter && !turn_running && !any_dialog_open {
                         // If a file-ref suggestion is active, accept it instead of submitting.
                         if !app.prompt_input.suggestions.is_empty()
                             && app.prompt_input.suggestion_index.is_some_and(|index| {
@@ -2574,6 +2598,7 @@ async fn run_interactive(
                                 Some(CommandResult::ClearConversation) => {
                                     messages.clear();
                                     app.replace_messages(Vec::new());
+                                    app.context_used_tokens = 0;
                                     session.messages.clear();
                                     session.updated_at = chrono::Utc::now();
                                     app.status_message =
@@ -2596,6 +2621,7 @@ async fn run_interactive(
                                     );
                                     messages.clear();
                                     app.replace_messages(Vec::new());
+                                    app.context_used_tokens = 0;
                                     tool_ctx.session_id = session.id.clone();
                                     cmd_ctx.session_id = session.id.clone();
                                     cmd_ctx.session_title = None;
@@ -3166,7 +3192,7 @@ async fn run_interactive(
 
                         // Share the Arc so the spawned task can access all tools (incl. MCP).
                         let tools_arc_clone = tools_arc.clone();
-                        let mut ctx_clone = tool_ctx.clone();
+                        let ctx_clone = tool_ctx.clone();
                         let mut qcfg = base_query_config.clone();
                         qcfg.model = claurst_api::effective_model_for_config(&cmd_ctx.config, &model_registry);
                         qcfg.max_tokens = cmd_ctx.config.effective_max_tokens();
@@ -3182,16 +3208,6 @@ async fn run_interactive(
                         // Apply active effort level (set via /effort command).
                         if let Some(level) = current_effort {
                             qcfg.effort_level = Some(level);
-                        }
-                        // Wire completion_notifier if a command queue is available.
-                        if let Some(ref cq) = qcfg.command_queue {
-                            let cq = cq.clone();
-                            ctx_clone.completion_notifier = Some(claurst_tools::CompletionNotifier::new(move |msg| {
-                                cq.push(
-                                    claurst_query::QueuedCommand::InjectSystemMessage(msg),
-                                    claurst_query::CommandPriority::Normal,
-                                );
-                            }));
                         }
                         let tracker = cost_tracker.clone();
                         let tx = event_tx.clone();
@@ -3399,8 +3415,19 @@ async fn run_interactive(
                 Event::Resize(_, _) => {
                     // Terminal resize - will be handled on next draw
                 }
-                _ => {}
+                Event::FocusGained => app.terminal_focused = true,
+                Event::FocusLost => app.terminal_focused = false,
             }
+        }
+
+        // Esc / Ctrl+C interrupted the turn (#444): cancel its token, which
+        // stops the model request and running tools. Events the task already
+        // queued are dropped so they cannot restart the spinner.
+        if std::mem::take(&mut app.cancel_requested) {
+            if let Some(ref ct) = cancel {
+                ct.cancel();
+            }
+            discard_turn_events = current_query.is_some();
         }
 
         if app.permission_request.is_none() {
@@ -3466,6 +3493,9 @@ async fn run_interactive(
             // Record loop compactions in the session (issue #441).
             if let QueryEvent::Compacted(record) = &evt {
                 session.compactions.push(record.clone());
+            }
+            if discard_turn_events {
+                continue;
             }
             // Forward to bridge before consuming (clone only what we need).
             if let Some(ref runtime) = bridge_runtime {
@@ -4238,6 +4268,13 @@ async fn run_interactive(
             if let Some((handle, msgs_arc)) = current_query.take() {
                 // Get the outcome and handle errors
                 let result = handle.await;
+                if std::mem::take(&mut discard_turn_events) {
+                    while let Ok(evt) = event_rx.try_recv() {
+                        if let QueryEvent::Compacted(record) = evt {
+                            session.compactions.push(record);
+                        }
+                    }
+                }
                 let aborted = matches!(result, Ok(QueryOutcome::Cancelled));
                 app.last_turn_outcome = claurst_tui::TurnOutcome::from_query_result(&result);
                 if let Ok(QueryOutcome::Error(err)) = result {
@@ -4265,11 +4302,15 @@ async fn run_interactive(
                 app.is_streaming = false;
                 app.status_message = None;
                 // Drain one queued message into the prompt and request an
-                // auto-submit on the next loop iteration (issue #149).
-                if let Some(next) = app.queued_messages.pop_front() {
-                    app.prompt_input.text = next;
-                    app.prompt_input.cursor = app.prompt_input.text.len();
-                    app.pending_auto_submit = true;
+                // auto-submit on the next loop iteration (issue #149). Steers
+                // still undelivered go first: the idle wake-up below sends
+                // them, and the queued message follows that turn (#444).
+                if command_queue.is_empty() {
+                    if let Some(next) = app.queued_messages.pop_front() {
+                        app.prompt_input.text = next;
+                        app.prompt_input.cursor = app.prompt_input.text.len();
+                        app.pending_auto_submit = true;
+                    }
                 }
 
                 // Save session to JSONL (primary storage)
@@ -4323,6 +4364,59 @@ async fn run_interactive(
                         });
                 }
             }
+        }
+
+        // Idle wake-up (#444): queued input — a steer typed during the final
+        // request of the last turn, or a background task's completion notice —
+        // starts a turn that delivers it. The loop drains the queue before its
+        // first request and reports it through `QueryEvent::InputInjected`.
+        if current_query.is_none()
+            && !app.is_streaming
+            && !app.pending_auto_submit
+            && !app.any_modal_open()
+            && !command_queue.is_empty()
+        {
+            app.is_streaming = true;
+            app.streaming_text.clear();
+            let ct = CancellationToken::new();
+            cancel = Some(ct.clone());
+            let msgs_arc = Arc::new(tokio::sync::Mutex::new(messages.clone()));
+            let msgs_arc_clone = msgs_arc.clone();
+            let tools_arc_clone = tools_arc.clone();
+            let ctx_clone = tool_ctx.clone();
+            let mut qcfg = base_query_config.clone();
+            qcfg.model = claurst_api::effective_model_for_config(&cmd_ctx.config, &model_registry);
+            qcfg.max_tokens = cmd_ctx.config.effective_max_tokens();
+            qcfg.max_turns_override = app.max_turns_override;
+            qcfg.output_style = cmd_ctx.config.effective_output_style();
+            qcfg.output_style_prompt = cmd_ctx.config.resolve_output_style_prompt();
+            qcfg.working_directory = Some(tool_ctx.working_dir.display().to_string());
+            if let Some(level) = current_effort {
+                qcfg.effort_level = Some(level);
+            }
+            let tracker = cost_tracker.clone();
+            let tx = event_tx.clone();
+            let client_clone = client.clone();
+            let skill_listings = skill_listings.clone();
+            let handle = tokio::spawn(async move {
+                qcfg.available_skills = session_skill_listings(skill_listings).await;
+                let mut msgs = msgs_arc_clone.lock().await.clone();
+                let outcome = claurst_query::run_query_loop(
+                    client_clone.as_ref(),
+                    &mut msgs,
+                    tools_arc_clone.as_slice(),
+                    &ctx_clone,
+                    &qcfg,
+                    tracker,
+                    Some(tx),
+                    ct,
+                    None,
+                )
+                .await;
+                *msgs_arc_clone.lock().await = msgs;
+                outcome
+            });
+            current_query = Some((handle, msgs_arc));
         }
 
         if !app.is_streaming && current_query.is_none() {
