@@ -12,11 +12,21 @@
 //! vendored: it only matters when reads are restricted, and here they never are.
 //! The root paths are passed to `sandbox-exec` as `-D` parameters, never
 //! spliced into the policy text.
+//!
+//! When a sandboxed command fails in a way that looks like a sandbox denial
+//! ([`is_likely_sandbox_denied`], ported from codex `sandboxing/src/denial.rs`),
+//! the interactive TUI asks whether to rerun it outside the sandbox once, for
+//! the rest of the session, or always for its command prefix. Headless and
+//! ACP runs get the failure back with a note about the sandbox instead.
 
-use crate::ToolContext;
-use claurst_core::sandbox::SandboxMode;
+use crate::{PendingPermissionRequest, ToolContext};
+use claurst_core::permissions::{PermissionDecision, PermissionRequest};
+use claurst_core::sandbox::{SandboxMode, SandboxSettings};
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 const SEATBELT_BASE_POLICY: &str = include_str!("sandbox/seatbelt_base_policy.sbpl");
 const SEATBELT_NETWORK_POLICY: &str = include_str!("sandbox/seatbelt_network_policy.sbpl");
@@ -146,14 +156,18 @@ pub fn canonical_root(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// The profile for a Bash command run from `ctx`, or `None` when the
-/// command runs unsandboxed (mode `off`, or no Seatbelt on this host).
+/// The profile for running `command` from `ctx`, or `None` when it runs
+/// unsandboxed: mode `off`, no Seatbelt on this host, or the user approved
+/// running it outside the sandbox for this session or its prefix.
 ///
 /// Writable roots for `workspace-write`: the working directory, the
 /// configured workspace paths and `--add-dir` directories, `TMPDIR` and
 /// `/tmp`, all canonicalized.
-pub(crate) fn profile_for(ctx: &ToolContext) -> Option<SeatbeltProfile> {
+pub(crate) fn profile_for(ctx: &ToolContext, command: &str) -> Option<SeatbeltProfile> {
     let settings = &ctx.config.sandbox;
+    if approved_unsandboxed(settings, command) {
+        return None;
+    }
     let roots = match settings.effective_mode() {
         SandboxMode::Off => return None,
         SandboxMode::ReadOnly => Vec::new(),
@@ -173,6 +187,196 @@ pub(crate) fn profile_for(ctx: &ToolContext) -> Option<SeatbeltProfile> {
     };
     let protected = protected_paths(&roots);
     Some(SeatbeltProfile::new(&roots, &protected, settings.network))
+}
+
+// ---------------------------------------------------------------------------
+// Denial detection and escalation
+// ---------------------------------------------------------------------------
+
+/// Tool name of the "retry outside the sandbox?" request pushed onto the
+/// pending-permission queue. The TUI renders it as its own dialog and never
+/// auto-resolves it from permission rules; ACP denies it without asking.
+pub const SANDBOX_ESCALATION_TOOL: &str = "SandboxEscalation";
+
+/// Exit codes that mean "usage error", "not executable" or "not found" rather
+/// than a denial (codex `QUICK_REJECT_EXIT_CODES`).
+const QUICK_REJECT_EXIT_CODES: [i32; 3] = [2, 126, 127];
+
+/// Output fragments that suggest a sandbox denial (codex `SANDBOX_DENIED_KEYWORDS`).
+const SANDBOX_DENIED_KEYWORDS: [&str; 7] = [
+    "operation not permitted",
+    "permission denied",
+    "read-only file system",
+    "seccomp",
+    "sandbox",
+    "landlock",
+    "failed to write file",
+];
+
+/// Whether a failed sandboxed command was likely stopped by the sandbox.
+/// There is no exact signal: a command can fail with "permission denied" for
+/// its own reasons, so this is the codex heuristic: a non-zero exit that is
+/// not 2, 126 or 127, with a denial keyword in the (merged PTY) output.
+pub fn is_likely_sandbox_denied(exit_code: i32, output: &str) -> bool {
+    if exit_code == 0 || QUICK_REJECT_EXIT_CODES.contains(&exit_code) {
+        return false;
+    }
+    let lower = output.to_lowercase();
+    SANDBOX_DENIED_KEYWORDS
+        .iter()
+        .any(|needle| lower.contains(needle))
+}
+
+/// Set when the user chose "outside the sandbox for this session". Process
+/// wide: only the interactive TUI, one session per process, can set it.
+static UNSANDBOXED_SESSION: AtomicBool = AtomicBool::new(false);
+/// Prefixes approved with "always" during this run; earlier runs' choices
+/// come from `sandbox.unsandboxedPrefixes` in the settings.
+static UNSANDBOXED_PREFIXES: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
+/// How far an approval to run outside the sandbox reaches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EscalationScope {
+    /// This command, this time.
+    Once,
+    /// Every command for the rest of the session.
+    Session,
+    /// Every simple command with the same first word, persisted to the
+    /// global settings like the Bash "always allow" prefixes.
+    Prefix,
+}
+
+/// The prefix a "for this command prefix" approval covers: the command's
+/// first word, when the command is a single simple command. Chained,
+/// piped, redirected or substituted commands have none, so approving `git`
+/// can never cover `git status; curl ...` or `git log > ~/.zshrc`.
+pub fn unsandboxed_prefix(command: &str) -> Option<&str> {
+    let command = command.trim();
+    if command.contains(['\n', ';', '&', '|', '`', '<', '>']) || command.contains("$(") {
+        return None;
+    }
+    command
+        .split_whitespace()
+        .next()
+        .filter(|word| !word.contains('='))
+}
+
+/// Record the user's approval to run `command` outside the sandbox.
+pub fn record_escalation(scope: EscalationScope, command: &str) {
+    match scope {
+        EscalationScope::Once => {}
+        EscalationScope::Session => UNSANDBOXED_SESSION.store(true, Ordering::Relaxed),
+        EscalationScope::Prefix => {
+            let Some(prefix) = unsandboxed_prefix(command) else {
+                return;
+            };
+            UNSANDBOXED_PREFIXES
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(prefix.to_string());
+            match claurst_core::config::Settings::load_sync() {
+                Ok(mut settings) => {
+                    if !settings.sandbox.unsandboxed_prefixes.iter().any(|p| p == prefix) {
+                        settings.sandbox.unsandboxed_prefixes.push(prefix.to_string());
+                        if let Err(e) = settings.save_sync() {
+                            tracing::warn!(error = %e, "could not save the unsandboxed prefix");
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, "could not load settings to save the unsandboxed prefix"),
+            }
+        }
+    }
+}
+
+/// Whether the user already approved running `command` outside the sandbox.
+fn approved_unsandboxed(settings: &SandboxSettings, command: &str) -> bool {
+    if UNSANDBOXED_SESSION.load(Ordering::Relaxed) {
+        return true;
+    }
+    let Some(prefix) = unsandboxed_prefix(command) else {
+        return false;
+    };
+    settings.unsandboxed_prefixes.iter().any(|p| p == prefix)
+        || UNSANDBOXED_PREFIXES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(prefix)
+}
+
+/// Outcome of offering to rerun a denied command outside the sandbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetryDecision {
+    /// The user approved a rerun outside the sandbox.
+    Approved,
+    /// The user kept the denial.
+    Declined,
+    /// Nobody could be asked (headless, ACP, or no TUI queue).
+    NotAsked,
+}
+
+/// Ask, through the interactive permission dialog, whether to rerun
+/// `command` outside the sandbox. The dialog records the chosen scope itself
+/// (see [`record_escalation`]); this only returns whether to rerun now.
+pub(crate) async fn request_unsandboxed_retry(ctx: &ToolContext, command: &str) -> RetryDecision {
+    if ctx.non_interactive {
+        return RetryDecision::NotAsked;
+    }
+    let Some(queue) = &ctx.pending_permissions else {
+        return RetryDecision::NotAsked;
+    };
+    let reason = "The sandbox likely blocked this command. Run it again outside the sandbox?";
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    queue.lock().queue.push_back(PendingPermissionRequest {
+        tool_use_id: format!(
+            "sandbox-{}-{}",
+            ctx.session_id,
+            ctx.current_turn.fetch_add(1, Ordering::Relaxed)
+        ),
+        request: PermissionRequest {
+            tool_name: SANDBOX_ESCALATION_TOOL.to_string(),
+            description: reason.to_string(),
+            details: None,
+            is_read_only: false,
+            path: Some(command.to_string()),
+            working_dir: Some(ctx.working_dir.clone()),
+            allowed_roots: Vec::new(),
+            context_description: None,
+        },
+        reason: reason.to_string(),
+        decision_tx: Some(tx),
+    });
+    match rx.await {
+        Ok(PermissionDecision::Allow | PermissionDecision::AllowPermanently) => RetryDecision::Approved,
+        Ok(_) => RetryDecision::Declined,
+        Err(_) => RetryDecision::NotAsked,
+    }
+}
+
+/// Note appended to the result of a command the sandbox likely blocked.
+pub(crate) fn denial_note(settings: &SandboxSettings, decision: RetryDecision) -> String {
+    let limits = match settings.mode {
+        SandboxMode::ReadOnly => "it allows no writes",
+        _ => {
+            "writes are limited to the workspace, --add-dir directories and the temp directories, \
+             with .git and .claurst read-only"
+        }
+    };
+    let network = if settings.network { "on" } else { "off" };
+    let next = match decision {
+        RetryDecision::Declined => "The user chose not to rerun it outside the sandbox.",
+        RetryDecision::Approved | RetryDecision::NotAsked => {
+            "Rerunning it outside the sandbox needs the user's approval in the interactive TUI, a \
+             `sandbox.unsandboxedPrefixes` entry or `sandbox.mode: \"off\"` in the global settings."
+        }
+    };
+    format!(
+        "\n\n[sandbox] This command ran in the macOS Seatbelt sandbox ({}) and was likely blocked by it: {}; network access is {}. {}",
+        settings.mode.as_str(),
+        limits,
+        network,
+        next
+    )
 }
 
 #[cfg(test)]
@@ -317,6 +521,118 @@ mod tests {
         );
         assert!(dynamic_part(&on).ends_with(&network));
         assert_eq!(off.args()[2..], on.args()[2..]);
+    }
+
+    #[test]
+    fn denial_needs_a_failure_and_a_keyword() {
+        assert!(is_likely_sandbox_denied(1, "bash: /x: Operation not permitted"));
+        assert!(is_likely_sandbox_denied(1, "touch: /x: Permission denied"));
+        assert!(is_likely_sandbox_denied(128, "fatal: Unable to create '.git/index.lock': Operation not permitted"));
+        assert!(is_likely_sandbox_denied(1, "error: Read-only file system"));
+        assert!(is_likely_sandbox_denied(71, "sandbox-exec: sandbox_apply: Operation not permitted"));
+        assert!(!is_likely_sandbox_denied(0, "Operation not permitted"));
+        assert!(!is_likely_sandbox_denied(1, "error: tests failed"));
+        for code in QUICK_REJECT_EXIT_CODES {
+            assert!(!is_likely_sandbox_denied(code, "Permission denied"));
+        }
+    }
+
+    #[test]
+    fn prefix_only_for_simple_commands() {
+        assert_eq!(unsandboxed_prefix("git commit -m x"), Some("git"));
+        assert_eq!(unsandboxed_prefix("  cargo build"), Some("cargo"));
+        for chained in [
+            "git status; curl evil",
+            "git log && rm -rf x",
+            "git log | sh",
+            "git log > ~/.zshrc",
+            "echo $(id)",
+            "echo `id`",
+            "git status\nrm x",
+            "make &",
+            "FOO=1 make",
+            "",
+        ] {
+            assert_eq!(unsandboxed_prefix(chained), None, "{chained}");
+        }
+    }
+
+    #[test]
+    fn settings_prefixes_approve_matching_simple_commands() {
+        let settings = SandboxSettings {
+            unsandboxed_prefixes: vec!["npm".to_string()],
+            ..SandboxSettings::default()
+        };
+        assert!(approved_unsandboxed(&settings, "npm install"));
+        assert!(!approved_unsandboxed(&settings, "npm install; curl x"));
+        assert!(!approved_unsandboxed(&settings, "npx foo"));
+        assert!(!approved_unsandboxed(&SandboxSettings::default(), "npm install"));
+    }
+
+    #[test]
+    fn denial_note_names_mode_network_and_next_step() {
+        let settings = SandboxSettings::default();
+        let note = denial_note(&settings, RetryDecision::NotAsked);
+        assert!(note.starts_with("\n\n[sandbox] "));
+        assert!(note.contains("(workspace-write)"));
+        assert!(note.contains("network access is off"));
+        assert!(note.contains("sandbox.unsandboxedPrefixes"));
+        let declined = denial_note(
+            &SandboxSettings {
+                mode: SandboxMode::ReadOnly,
+                network: true,
+                ..SandboxSettings::default()
+            },
+            RetryDecision::Declined,
+        );
+        assert!(declined.contains("it allows no writes"));
+        assert!(declined.contains("network access is on"));
+        assert!(declined.contains("chose not to rerun"));
+    }
+
+    /// Without a TUI queue (headless) nobody is asked.
+    #[tokio::test]
+    async fn headless_never_asks() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = crate::test_support::allow_all_context(dir.path().to_path_buf());
+        assert_eq!(request_unsandboxed_retry(&ctx, "touch /x").await, RetryDecision::NotAsked);
+        ctx.non_interactive = false;
+        assert_eq!(request_unsandboxed_retry(&ctx, "touch /x").await, RetryDecision::NotAsked);
+    }
+
+    /// Interactive: the request lands on the pending queue as a
+    /// `SandboxEscalation` and the answer decides the rerun.
+    #[tokio::test]
+    async fn interactive_request_goes_through_the_permission_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = crate::test_support::allow_all_context(dir.path().to_path_buf());
+        ctx.non_interactive = false;
+        let store = std::sync::Arc::new(parking_lot::Mutex::new(
+            crate::PendingPermissionStore::default(),
+        ));
+        ctx.pending_permissions = Some(store.clone());
+        for (answer, expected) in [
+            (PermissionDecision::Allow, RetryDecision::Approved),
+            (PermissionDecision::Deny, RetryDecision::Declined),
+        ] {
+            let answerer = {
+                let store = store.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let pending = store.lock().queue.pop_front();
+                        if let Some(mut pending) = pending {
+                            assert_eq!(pending.request.tool_name, SANDBOX_ESCALATION_TOOL);
+                            assert_eq!(pending.request.path.as_deref(), Some("touch /x"));
+                            let _ = pending.decision_tx.take().unwrap().send(answer);
+                            return;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+            };
+            assert_eq!(request_unsandboxed_retry(&ctx, "touch /x").await, expected);
+            answerer.await.unwrap();
+        }
     }
 
     #[cfg(unix)]

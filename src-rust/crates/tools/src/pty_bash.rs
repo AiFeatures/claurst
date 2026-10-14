@@ -1012,7 +1012,7 @@ impl Tool for PtyBashTool {
                 let state = shell_state_arc.lock();
                 state.cwd.clone().unwrap_or_else(|| ctx.working_dir.clone())
             };
-            let sandbox = crate::sandbox::profile_for(ctx);
+            let sandbox = crate::sandbox::profile_for(ctx, &params.command);
             return run_in_background(params.command, cwd, timeout_ms, &spill_dir, sandbox).await;
         }
 
@@ -1038,25 +1038,50 @@ impl Tool for PtyBashTool {
         // ── Unix PTY path ────────────────────────────────────────────────────
         #[cfg(unix)]
         {
-            run_pty_foreground(
-                &params.command,
-                &shell_state_arc,
-                &ctx.working_dir,
-                timeout_dur,
-                timeout_ms,
-                &spill_dir,
-                crate::sandbox::profile_for(ctx).as_ref(),
-            )
-            .await
+            match crate::sandbox::profile_for(ctx, &params.command) {
+                Some(profile) => {
+                    run_pty_sandboxed(
+                        ctx,
+                        &profile,
+                        &params.command,
+                        &shell_state_arc,
+                        timeout_dur,
+                        timeout_ms,
+                        &spill_dir,
+                    )
+                    .await
+                }
+                None => {
+                    run_pty_foreground(
+                        &params.command,
+                        &shell_state_arc,
+                        &ctx.working_dir,
+                        timeout_dur,
+                        timeout_ms,
+                        &spill_dir,
+                        None,
+                    )
+                    .await
+                }
+            }
         }
     }
 }
 
-/// Run `command` in a PTY with the session's persisted shell state, fold the
-/// wrapper's state block back into that state, and render the bounded result.
-/// With a `sandbox` profile the shell runs under Seatbelt (#470).
+/// One finished PTY run, before its shell state is folded back.
 #[cfg(unix)]
-async fn run_pty_foreground(
+struct PtyRun {
+    output: String,
+    exit_code: i32,
+    state_lines: Vec<String>,
+}
+
+/// Run `command` once in a PTY with the session's persisted shell state and
+/// render the bounded output. With a `sandbox` profile the shell runs under
+/// Seatbelt (#470). The session's shell state is left untouched; timeouts and
+/// spawn failures come back as the finished error result.
+#[cfg(unix)]
+async fn run_pty_once(
     command: &str,
     shell_state: &parking_lot::Mutex<ShellState>,
     base_cwd: &PathBuf,
@@ -1064,7 +1089,7 @@ async fn run_pty_foreground(
     timeout_ms: u64,
     spill_dir: &Path,
     sandbox: Option<&SeatbeltProfile>,
-) -> ToolResult {
+) -> Result<PtyRun, ToolResult> {
     // Build the wrapper script that restores cwd + captures shell state.
     // Restored env vars are cloned out and later injected into the child's
     // environment (never its argv) — see `apply_restored_env` (#211).
@@ -1091,36 +1116,139 @@ async fn run_pty_foreground(
 
     match outcome {
         PtyOutcome::Completed(captured, exit_code) => {
-            let (mut output, state_lines) = render_pty_output(captured, &spill_path);
-
-            // Update persistent shell state
-            if let Some((new_cwd, env_delta)) = parse_shell_state_block(&state_lines) {
-                let mut state = shell_state.lock();
-                state.cwd = Some(new_cwd);
-                for (k, v) in env_delta {
-                    state.env_vars.insert(k, v);
-                }
-            }
-
-            // Fast-path export capture
-            let exports = extract_exports_from_command(command);
-            if !exports.is_empty() {
-                let mut state = shell_state.lock();
-                for (k, v) in exports {
-                    state.env_vars.insert(k, v);
-                }
-            }
-
-            if output.is_empty() {
-                output = "(no output)".to_string();
-            }
-            shell_result(output, exit_code)
+            let (output, state_lines) = render_pty_output(captured, &spill_path);
+            Ok(PtyRun {
+                output,
+                exit_code,
+                state_lines,
+            })
         }
-        PtyOutcome::Failed(e) => ToolResult::error(format!("PTY execution failed: {}", e)),
-        PtyOutcome::TimedOut => {
-            ToolResult::error(format!("Command timed out after {}ms", timeout_ms))
+        PtyOutcome::Failed(e) => Err(ToolResult::error(format!("PTY execution failed: {}", e))),
+        PtyOutcome::TimedOut => Err(ToolResult::error(format!(
+            "Command timed out after {}ms",
+            timeout_ms
+        ))),
+    }
+}
+
+/// Fold a run's state block back into the session's shell state and turn it
+/// into the tool result.
+#[cfg(unix)]
+fn finish_pty_run(
+    run: PtyRun,
+    command: &str,
+    shell_state: &parking_lot::Mutex<ShellState>,
+) -> ToolResult {
+    let PtyRun {
+        mut output,
+        exit_code,
+        state_lines,
+    } = run;
+
+    // Update persistent shell state
+    if let Some((new_cwd, env_delta)) = parse_shell_state_block(&state_lines) {
+        let mut state = shell_state.lock();
+        state.cwd = Some(new_cwd);
+        for (k, v) in env_delta {
+            state.env_vars.insert(k, v);
         }
     }
+
+    // Fast-path export capture
+    let exports = extract_exports_from_command(command);
+    if !exports.is_empty() {
+        let mut state = shell_state.lock();
+        for (k, v) in exports {
+            state.env_vars.insert(k, v);
+        }
+    }
+
+    if output.is_empty() {
+        output = "(no output)".to_string();
+    }
+    shell_result(output, exit_code)
+}
+
+/// Run `command` in a PTY with the session's persisted shell state, fold the
+/// wrapper's state block back into that state, and render the bounded result.
+/// With a `sandbox` profile the shell runs under Seatbelt (#470).
+#[cfg(unix)]
+async fn run_pty_foreground(
+    command: &str,
+    shell_state: &parking_lot::Mutex<ShellState>,
+    base_cwd: &PathBuf,
+    timeout_dur: Duration,
+    timeout_ms: u64,
+    spill_dir: &Path,
+    sandbox: Option<&SeatbeltProfile>,
+) -> ToolResult {
+    match run_pty_once(
+        command,
+        shell_state,
+        base_cwd,
+        timeout_dur,
+        timeout_ms,
+        spill_dir,
+        sandbox,
+    )
+    .await
+    {
+        Ok(run) => finish_pty_run(run, command, shell_state),
+        Err(result) => result,
+    }
+}
+
+/// Run `command` under `profile`; when it fails like a sandbox denial, offer
+/// to rerun it outside the sandbox (#470). An approved rerun starts from the
+/// shell state the denied run started from, so a `cd` in the denied run is
+/// not applied twice. Otherwise the denied run's result is returned with a
+/// note about the sandbox.
+#[cfg(unix)]
+async fn run_pty_sandboxed(
+    ctx: &ToolContext,
+    profile: &SeatbeltProfile,
+    command: &str,
+    shell_state: &parking_lot::Mutex<ShellState>,
+    timeout_dur: Duration,
+    timeout_ms: u64,
+    spill_dir: &Path,
+) -> ToolResult {
+    let run = match run_pty_once(
+        command,
+        shell_state,
+        &ctx.working_dir,
+        timeout_dur,
+        timeout_ms,
+        spill_dir,
+        Some(profile),
+    )
+    .await
+    {
+        Ok(run) => run,
+        Err(result) => return result,
+    };
+    if !crate::sandbox::is_likely_sandbox_denied(run.exit_code, &run.output) {
+        return finish_pty_run(run, command, shell_state);
+    }
+    let decision = crate::sandbox::request_unsandboxed_retry(ctx, command).await;
+    if decision == crate::sandbox::RetryDecision::Approved {
+        debug!(command, "Rerunning a sandbox-denied command outside the sandbox");
+        return run_pty_foreground(
+            command,
+            shell_state,
+            &ctx.working_dir,
+            timeout_dur,
+            timeout_ms,
+            spill_dir,
+            None,
+        )
+        .await;
+    }
+    let mut result = finish_pty_run(run, command, shell_state);
+    result
+        .content
+        .push_str(&crate::sandbox::denial_note(&ctx.config.sandbox, decision));
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -1685,6 +1813,8 @@ mod tests {
         assert!(!leaked, "the sandbox let a write outside the workspace through");
         assert!(denied.is_error, "{}", denied.content);
         assert!(denied.content.contains("Operation not permitted"), "{}", denied.content);
+        // Detected as a denial; headless, so nobody is asked and the note explains.
+        assert!(denied.content.contains("[sandbox] This command ran in the macOS Seatbelt sandbox (workspace-write)"), "{}", denied.content);
 
         let init = std::process::Command::new("git")
             .args(["init", "-q"])
@@ -1702,7 +1832,13 @@ mod tests {
             .execute(json!({ "command": "touch .git/probe" }), &ctx)
             .await;
         assert!(git_write.is_error, "{}", git_write.content);
+        assert!(git_write.content.contains("[sandbox]"), "{}", git_write.content);
         assert!(!workspace.path().join(".git/probe").exists());
+
+        // An ordinary failure is not reported as a sandbox denial.
+        let failed = tool.execute(json!({ "command": "false" }), &ctx).await;
+        assert!(failed.is_error);
+        assert!(!failed.content.contains("[sandbox]"), "{}", failed.content);
     }
 }
 
