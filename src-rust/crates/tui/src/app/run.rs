@@ -390,6 +390,9 @@ impl App {
                     self.rate_limit_7day_pct = secondary_used_percent;
                 }
             }
+            // The TUI renders from the stream and syncs the history when the
+            // query task finishes; committed messages are for headless output.
+            QueryEvent::MessageCommitted(_) => {}
         }
 
         // Update token count from tracker.

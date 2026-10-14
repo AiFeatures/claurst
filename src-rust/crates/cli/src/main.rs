@@ -14,6 +14,7 @@
 
 mod oauth_flow;
 mod codex_oauth_flow;
+mod headless;
 mod upgrade;
 
 // ---------------------------------------------------------------------------
@@ -858,7 +859,7 @@ async fn main() -> anyhow::Result<()> {
 
     // --print mode (headless)
     let result = if is_headless {
-        run_headless(
+        let code = run_headless(
             &cli,
             client,
             tools,
@@ -866,7 +867,13 @@ async fn main() -> anyhow::Result<()> {
             query_config,
             cost_tracker,
         )
-        .await
+        .await;
+        cron_cancel.cancel();
+        match code {
+            Ok(0) => Ok(()),
+            Ok(code) => std::process::exit(code),
+            Err(e) => Err(e),
+        }
     } else {
         let auth_store = claurst_core::AuthStore::load();
         let has_saved_credentials = !auth_store.credentials.is_empty()
@@ -1456,9 +1463,7 @@ async fn run_headless(
     tool_ctx: ToolContext,
     query_config: claurst_query::QueryConfig,
     cost_tracker: Arc<CostTracker>,
-) -> anyhow::Result<()> {
-    use claurst_query::{QueryEvent, QueryOutcome};
-    use tokio::sync::mpsc;
+) -> anyhow::Result<i32> {
     use tokio_util::sync::CancellationToken;
 
     // Build initial messages list from input.
@@ -1521,7 +1526,7 @@ async fn run_headless(
 
         if prompt.is_empty() {
             eprintln!("Error: No prompt provided. Use --print <prompt> or pipe text to stdin.");
-            std::process::exit(1);
+            return Ok(1);
         }
 
         vec![claurst_core::types::Message::user(prompt)]
@@ -1535,188 +1540,53 @@ async fn run_headless(
 
     if messages.is_empty() {
         eprintln!("Error: No messages provided.");
-        std::process::exit(1);
+        return Ok(1);
     }
 
-    let is_json_output = matches!(cli.output_format, CliOutputFormat::Json | CliOutputFormat::StreamJson);
-    let is_stream_json = matches!(cli.output_format, CliOutputFormat::StreamJson);
+    let started = std::time::Instant::now();
+    let cwd = tool_ctx.working_dir.display().to_string();
+    let mut sink = headless::HeadlessSink::new(
+        cli.output_format,
+        tool_ctx.session_id.clone(),
+        std::io::stdout(),
+        std::io::stderr(),
+    );
+    sink.init(headless::InitInfo {
+        model: &query_config.model,
+        cwd: &cwd,
+        tools: tools.iter().map(|t| t.name()).collect(),
+        permission_mode: &tool_ctx.permission_mode,
+    })?;
 
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<QueryEvent>();
     let cancel = CancellationToken::new();
-    let client_clone = client.clone();
-    let tool_ctx_clone = tool_ctx.clone();
-    let qcfg = query_config.clone();
-    let tracker_clone = cost_tracker.clone();
-    let event_tx_clone = event_tx.clone();
-    let cancel_clone = cancel.clone();
+    let (outcome, _messages) = headless::drive(
+        client,
+        tools,
+        tool_ctx,
+        query_config,
+        cost_tracker.clone(),
+        messages,
+        cancel,
+        &mut sink,
+    )
+    .await?;
 
-    let query_handle = tokio::spawn(async move {
-        claurst_query::run_query_loop(
-            client_clone.as_ref(),
-            &mut messages,
-            tools.as_slice(),
-            &tool_ctx_clone,
-            &qcfg,
-            tracker_clone,
-            Some(event_tx_clone),
-            cancel_clone,
-            None,
-        )
-        .await
-    });
-
-    // Drop the original tx so the channel closes when the task drops its clone
-    drop(event_tx);
-
-    // Drain events and print streaming text
-    let mut full_text = String::new();
-
-    while let Some(event) = event_rx.recv().await {
-        match &event {
-            QueryEvent::Stream(claurst_api::AnthropicStreamEvent::ContentBlockDelta {
-                delta: claurst_api::streaming::ContentDelta::TextDelta { text },
-                ..
-            }) => {
-                full_text.push_str(text);
-                if !is_json_output {
-                    print!("{}", text);
-                    use std::io::Write;
-                    std::io::stdout().flush().ok();
-                } else if is_stream_json {
-                    let chunk = serde_json::json!({ "type": "text_delta", "text": text });
-                    println!("{}", chunk);
-                }
-            }
-            QueryEvent::ToolStart { tool_name, .. } => {
-                if !is_json_output {
-                    eprintln!("\n[{}...]", tool_name);
-                } else {
-                    let ev = serde_json::json!({ "type": "tool_start", "tool": tool_name });
-                    println!("{}", ev);
-                }
-            }
-            QueryEvent::Error(msg) => {
-                if is_json_output {
-                    let ev = serde_json::json!({ "type": "error", "error": msg });
-                    eprintln!("{}", ev);
-                } else {
-                    eprintln!("\nError: {}", msg);
-                }
-            }
-            QueryEvent::Retry { attempt, max_attempts, delay_ms, reason } => {
-                let ev = serde_json::json!({
-                    "type": "retry",
-                    "attempt": attempt,
-                    "max_attempts": max_attempts,
-                    "delay_ms": delay_ms,
-                    "reason": reason,
-                });
-                if is_stream_json {
-                    println!("{}", ev);
-                } else if is_json_output {
-                    // `json` keeps stdout for the final result object.
-                    eprintln!("{}", ev);
-                } else {
-                    eprintln!(
-                        "\n[Reconnecting {}/{} in {:.1}s: {}]",
-                        attempt,
-                        max_attempts,
-                        *delay_ms as f64 / 1000.0,
-                        reason
-                    );
-                }
-            }
-            _ => {}
-        }
+    let result = sink.result(&outcome, &cost_tracker, started.elapsed());
+    sink.finish(&result)?;
+    if cli.verbose {
+        eprintln!(
+            "Tokens: {} in / {} out | Cost: ${:.4}",
+            cost_tracker.input_tokens(),
+            cost_tracker.output_tokens(),
+            cost_tracker.total_cost_usd(),
+        );
     }
 
-    // Wait for the query task to finish and get the final outcome
-    let outcome = query_handle.await.unwrap_or(QueryOutcome::Error(
-        claurst_core::error::ClaudeError::Other("Query task panicked".to_string()),
-    ));
-
-    // Final output
-    match cli.output_format {
-        CliOutputFormat::Json => {
-            match outcome {
-                QueryOutcome::EndTurn { message, usage } => {
-                    let result_text = if full_text.is_empty() {
-                        message.get_all_text()
-                    } else {
-                        full_text
-                    };
-                    let out = serde_json::json!({
-                        "type": "result",
-                        "result": result_text,
-                        "usage": {
-                            "input_tokens": usage.input_tokens,
-                            "output_tokens": usage.output_tokens,
-                            "cache_creation_input_tokens": usage.cache_creation_input_tokens,
-                            "cache_read_input_tokens": usage.cache_read_input_tokens,
-                        },
-                        "cost_usd": cost_tracker.total_cost_usd(),
-                    });
-                    println!("{}", out);
-                }
-                QueryOutcome::Error(e) => {
-                    let out = serde_json::json!({ "type": "error", "error": e.to_string() });
-                    eprintln!("{}", out);
-                    std::process::exit(1);
-                }
-                _ => {}
-            }
-        }
-        CliOutputFormat::StreamJson => {
-            // Already streamed above; emit final result event
-            match outcome {
-                QueryOutcome::EndTurn { usage, .. } => {
-                    let out = serde_json::json!({
-                        "type": "result",
-                        "usage": {
-                            "input_tokens": usage.input_tokens,
-                            "output_tokens": usage.output_tokens,
-                        },
-                        "cost_usd": cost_tracker.total_cost_usd(),
-                    });
-                    println!("{}", out);
-                }
-                QueryOutcome::Error(e) => {
-                    let out = serde_json::json!({ "type": "error", "error": e.to_string() });
-                    eprintln!("{}", out);
-                    std::process::exit(1);
-                }
-                _ => {}
-            }
-        }
-        CliOutputFormat::Text => {
-            // Streaming text was already printed; add newline
-            println!();
-            if cli.verbose {
-                eprintln!(
-                    "\nTokens: {} in / {} out | Cost: ${:.4}",
-                    cost_tracker.input_tokens(),
-                    cost_tracker.output_tokens(),
-                    cost_tracker.total_cost_usd(),
-                );
-            }
-            match outcome {
-                QueryOutcome::Error(e) => {
-                    eprintln!("Error: {}", e);
-                    std::process::exit(1);
-                }
-                QueryOutcome::BudgetExceeded { cost_usd, limit_usd } => {
-                    eprintln!(
-                        "Budget limit ${:.4} reached (spent ${:.4}). Stopping.",
-                        limit_usd, cost_usd
-                    );
-                    std::process::exit(2);
-                }
-                _ => {}
-            }
-        }
-    }
-
-    Ok(())
+    Ok(match result.subtype {
+        headless::ResultSubtype::ErrorDuringExecution => 1,
+        headless::ResultSubtype::ErrorBudget => 2,
+        _ => 0,
+    })
 }
 
 // ---------------------------------------------------------------------------
