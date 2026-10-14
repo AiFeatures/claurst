@@ -25,6 +25,7 @@
 use claurst_api::provider_types::StopReason;
 use claurst_api::{LlmProvider, ProviderRequest, StreamEvent, SystemPrompt};
 use claurst_core::error::ClaudeError;
+pub use claurst_core::history::{CompactionRecord, CompactionTrigger};
 use claurst_core::types::{ContentBlock, Message, MessageContent, Role};
 use futures::StreamExt;
 use serde_json::Value;
@@ -997,29 +998,47 @@ async fn request_summary(
     Ok((text, stop_reason))
 }
 
-/// Summarise `messages[..split_at]` through the active provider using the
-/// carefully crafted compaction prompt from TypeScript prompt.ts.
-/// Returns a new conversation: [summary user msg] + messages[split_at..].
-async fn summarise_head(
-    provider: &dyn LlmProvider,
-    model: &str,
-    messages: &[Message],
-    split_at: usize,
-    max_summary_tokens: u32,
-) -> Result<Vec<Message>, ClaudeError> {
-    if split_at == 0 {
-        return Ok(messages.to_vec());
-    }
+/// Upper bound on summary output tokens (mirrors TypeScript
+/// MAX_OUTPUT_TOKENS_FOR_SUMMARY).
+pub const MAX_SUMMARY_TOKENS: u32 = 20_000;
 
-    let head = &messages[..split_at];
+/// Summarisation attempts before a compaction fails (one retry).
+const SUMMARY_ATTEMPTS: u32 = 2;
 
-    // Iterative UPDATE mode: if a prior <compact-summary> already lives in the
-    // head, fold it forward instead of re-summarising from scratch. Keep the
-    // full previous summary (used later for the files-touched manifest) and a
-    // manifest-stripped copy for the prompt so the model doesn't echo it.
-    let previous_summary = extract_previous_summary(head);
+/// Tool results are cut to this many bytes (head and tail kept) in the
+/// summariser transcript, so the summarisation request itself stays well
+/// inside the window even when compacting after an overflow (pi: 2,000).
+const TRANSCRIPT_TOOL_RESULT_CHARS: usize = 2_000;
 
-    // Build a transcript string for the summarisation prompt.
+/// How many of the most recent user turns in the summarised head are carried
+/// verbatim into the summary message.
+const RECENT_USER_TURNS: usize = 3;
+
+/// Byte budget for those verbatim user turns; a turn that would exceed it is
+/// left to the summary.
+const RECENT_USER_TURNS_MAX_CHARS: usize = 16_000;
+
+/// Summary output budget for a model whose output cap is `max_output_tokens`:
+/// the cap itself, bounded by [`MAX_SUMMARY_TOKENS`], so small local models
+/// are never asked for more than they can emit.
+pub fn summary_token_budget(max_output_tokens: u32) -> u32 {
+    max_output_tokens.clamp(1, MAX_SUMMARY_TOKENS)
+}
+
+/// A compaction applied to a conversation: the new history plus the entry
+/// recorded in the session.
+#[derive(Debug, Clone)]
+pub struct Compaction {
+    pub messages: Vec<Message>,
+    pub record: CompactionRecord,
+}
+
+/// Render the summarisation prompt for `head`.
+fn summary_prompt(
+    head: &[Message],
+    previous_summary: Option<&str>,
+    custom_instructions: Option<&str>,
+) -> String {
     let mut transcript = String::new();
     let original_count = head.len();
     let original_token_estimate = estimate_tokens_for_messages(head);
@@ -1047,7 +1066,12 @@ async fn summarise_head(
                     }
                     ContentBlock::ToolResult { tool_use_id, content, is_error } => {
                         let result_text = match content {
-                            claurst_core::types::ToolResultContent::Text(t) => t.as_str().to_string(),
+                            claurst_core::types::ToolResultContent::Text(t) => {
+                                claurst_core::truncate::truncate_tool_output(
+                                    t.clone(),
+                                    TRANSCRIPT_TOOL_RESULT_CHARS,
+                                )
+                            }
                             claurst_core::types::ToolResultContent::Blocks(_) => "[complex content]".to_string(),
                         };
                         let error_flag = if is_error.unwrap_or(false) { " [ERROR]" } else { "" };
@@ -1063,16 +1087,15 @@ async fn summarise_head(
     }
 
     // Feed the prior summary WITHOUT its files-touched manifest: the manifest is
-    // re-appended deterministically below (parsed + unioned), so echoing it in
-    // the prompt would only risk the model drifting the file list.
-    let previous_summary_for_prompt = previous_summary
-        .as_deref()
-        .map(strip_files_touched_section);
+    // re-appended deterministically (parsed + unioned), so echoing it in the
+    // prompt would only risk the model drifting the file list.
+    let previous_summary_for_prompt = previous_summary.map(strip_files_touched_section);
 
     // Select the UPDATE prompt variant when a prior summary is present.
-    let compact_prompt = get_compact_prompt(None, previous_summary_for_prompt.as_deref());
+    let compact_prompt =
+        get_compact_prompt(custom_instructions, previous_summary_for_prompt.as_deref());
 
-    let user_content = if let Some(prev) = previous_summary_for_prompt.as_deref() {
+    if let Some(prev) = previous_summary_for_prompt.as_deref() {
         format!(
             "{}\n\n<previous-summary>\n{}\n</previous-summary>\n\n<conversation_to_summarize original_messages=\"{}\" estimated_tokens=\"{}\">\n{}\n</conversation_to_summarize>",
             compact_prompt,
@@ -1089,20 +1112,68 @@ async fn summarise_head(
             original_token_estimate,
             transcript
         )
-    };
+    }
+}
 
-    let (raw_summary, _stop) = request_summary(
-        provider,
-        model,
-        SUMMARISER_SYSTEM_PROMPT,
-        user_content,
-        max_summary_tokens,
-    )
-    .await?;
-
-    if raw_summary.is_empty() {
+/// Reject a summary that is empty, was cut off by the output limit, or is not
+/// shorter than the messages it replaces.
+fn validate_summary(
+    raw: String,
+    stop_reason: Option<StopReason>,
+    head_tokens: usize,
+) -> Result<String, ClaudeError> {
+    if raw.trim().is_empty() {
         return Err(ClaudeError::Other("Compact summary was empty".to_string()));
     }
+    if matches!(stop_reason, Some(StopReason::MaxTokens)) {
+        return Err(ClaudeError::Other(
+            "Compact summary was cut off at the output limit".to_string(),
+        ));
+    }
+    if (raw.len() / 4) * 4 / 3 >= head_tokens {
+        return Err(ClaudeError::Other(
+            "Compact summary is not shorter than the messages it replaces".to_string(),
+        ));
+    }
+    Ok(raw)
+}
+
+/// Summarise `head` through `provider`, retrying once when the call fails or
+/// the response is rejected by [`validate_summary`]. Returns the formatted
+/// summary with its files-touched manifest.
+async fn generate_summary(
+    provider: &dyn LlmProvider,
+    model: &str,
+    head: &[Message],
+    max_summary_tokens: u32,
+    custom_instructions: Option<&str>,
+) -> Result<String, ClaudeError> {
+    // Iterative UPDATE mode: if a prior <compact-summary> already lives in the
+    // head, fold it forward instead of re-summarising from scratch.
+    let previous_summary = extract_previous_summary(head);
+    let prompt = summary_prompt(head, previous_summary.as_deref(), custom_instructions);
+    let head_tokens = estimate_tokens_for_messages(head);
+
+    let mut attempt = 1;
+    let raw_summary = loop {
+        let outcome = request_summary(
+            provider,
+            model,
+            SUMMARISER_SYSTEM_PROMPT,
+            prompt.clone(),
+            max_summary_tokens,
+        )
+        .await
+        .and_then(|(raw, stop_reason)| validate_summary(raw, stop_reason, head_tokens));
+        match outcome {
+            Ok(raw) => break raw,
+            Err(e) if attempt < SUMMARY_ATTEMPTS => {
+                warn!(attempt, error = %e, "Compaction summary failed; retrying");
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    };
 
     let formatted_summary = format_compact_summary(&raw_summary);
 
@@ -1114,27 +1185,95 @@ async fn summarise_head(
     if let Some(prev) = &previous_summary {
         file_ops.union(&parse_files_touched(prev));
     }
-    let formatted_summary = if file_ops.is_empty() {
+    Ok(if file_ops.is_empty() {
         formatted_summary
     } else {
         format!("{}{}", formatted_summary, format_files_touched(&file_ops))
-    };
+    })
+}
 
-    // Build the new conversation:
-    //   [user: compact summary preamble] [recent tail messages]
-    //
-    // The summary is wrapped in <compact-summary> tags so the NEXT compaction can
-    // detect it (via extract_previous_summary) and fold it forward in UPDATE mode.
-    let compact_notice = Message::user(format!(
+/// The most recent user-authored turns in `head` (oldest first), at most
+/// [`RECENT_USER_TURNS`] within [`RECENT_USER_TURNS_MAX_CHARS`]. Tool results
+/// and earlier compaction summaries are skipped.
+fn recent_user_turns(head: &[Message]) -> Vec<String> {
+    let mut turns = Vec::new();
+    let mut used = 0;
+    for msg in head.iter().rev() {
+        if turns.len() == RECENT_USER_TURNS {
+            break;
+        }
+        if msg.role != Role::User || message_has_tool_result(msg) {
+            continue;
+        }
+        let text = msg.get_all_text();
+        if text.trim().is_empty()
+            || text.contains("<compact-summary>")
+            || text.contains("<recent-user-messages>")
+        {
+            continue;
+        }
+        if used + text.len() > RECENT_USER_TURNS_MAX_CHARS {
+            break;
+        }
+        used += text.len();
+        turns.push(text);
+    }
+    turns.reverse();
+    turns
+}
+
+/// Build the synthetic user message that replaces `head`: `body` (the summary
+/// notice) followed by the most recent user turns verbatim. It gets a fresh
+/// uuid so the session's [`CompactionRecord`] can point at it.
+///
+/// The summary is wrapped in <compact-summary> tags by the callers so the NEXT
+/// compaction can detect it (via extract_previous_summary) and fold it forward
+/// in UPDATE mode.
+fn summary_message(mut body: String, head: &[Message]) -> Message {
+    let recent = recent_user_turns(head);
+    if !recent.is_empty() {
+        body.push_str(
+            "\n\n<recent-user-messages>\nThe user's most recent messages from that portion, verbatim:",
+        );
+        for turn in recent {
+            body.push_str("\n\n---\n");
+            body.push_str(&turn);
+        }
+        body.push_str("\n</recent-user-messages>");
+    }
+    let mut message = Message::user(body);
+    message.uuid = Some(uuid::Uuid::new_v4().to_string());
+    message
+}
+
+/// Notice for a head that was summarised into `summary`.
+fn summarised_notice(summary: &str, head: &[Message]) -> String {
+    format!(
         "This session is being continued from a previous conversation that ran out of context. \
          The summary below covers the earlier portion of the conversation (originally {} messages, \
          ~{} tokens).\n\n<compact-summary>\n{}\n</compact-summary>",
-        original_count, original_token_estimate, formatted_summary
-    ));
+        head.len(),
+        estimate_tokens_for_messages(head),
+        summary
+    )
+}
 
-    let mut new_messages = vec![compact_notice];
+/// Summarise `messages[..split_at]` through the active provider.
+/// Returns a new conversation: [summary user msg] + messages[split_at..].
+async fn summarise_head(
+    provider: &dyn LlmProvider,
+    model: &str,
+    messages: &[Message],
+    split_at: usize,
+    max_summary_tokens: u32,
+) -> Result<Vec<Message>, ClaudeError> {
+    if split_at == 0 {
+        return Ok(messages.to_vec());
+    }
+    let head = &messages[..split_at];
+    let summary = generate_summary(provider, model, head, max_summary_tokens, None).await?;
+    let mut new_messages = vec![summary_message(summarised_notice(&summary, head), head)];
     new_messages.extend_from_slice(&messages[split_at..]);
-
     Ok(new_messages)
 }
 
@@ -1187,18 +1326,26 @@ fn compute_keep_split_index(messages: &[Message], keep_recent_tokens: u64) -> us
     snap_to_pairing_boundary(messages, raw)
 }
 
-/// Compact `messages`, replacing the head with a summary.
-/// Returns the new messages vector on success, or `None` when the whole
-/// conversation already fits the keep-recent budget (nothing to summarise).
+/// Compact `messages`: summarise everything older than the most recent
+/// ~[`KEEP_RECENT_TOKENS`] (cut on a pairing-safe boundary) into one summary
+/// message that also carries the last few user turns verbatim, and return the
+/// new history with the compaction entry for the session.
+///
+/// Returns `Ok(None)` when the whole conversation already fits the keep-recent
+/// budget (nothing to summarise). When the summariser fails twice the error is
+/// returned and the caller keeps its history, except for
+/// [`CompactionTrigger::Overflow`]: the request cannot be sent as is, so the
+/// head is dropped and only the untouched tail is kept (with any previous
+/// summary carried over).
 pub async fn compact_conversation(
     provider: &dyn LlmProvider,
     model: &str,
     messages: &[Message],
-) -> Result<Option<Vec<Message>>, ClaudeError> {
+    trigger: CompactionTrigger,
+    max_summary_tokens: u32,
+    custom_instructions: Option<&str>,
+) -> Result<Option<Compaction>, ClaudeError> {
     let total = messages.len();
-
-    // Token-budget keep: summarise everything older than the most recent
-    // ~KEEP_RECENT_TOKENS worth of messages, cut on a pairing-safe boundary.
     let split_at = compute_keep_split_index(messages, KEEP_RECENT_TOKENS);
 
     if split_at == 0 {
@@ -1214,15 +1361,57 @@ pub async fn compact_conversation(
         total,
         split_at,
         keep_recent_tokens = KEEP_RECENT_TOKENS,
+        ?trigger,
         "Compacting conversation (token-budget keep)"
     );
 
-    // Use a generous token budget for the summary (20k mirrors TypeScript MAX_OUTPUT_TOKENS_FOR_SUMMARY)
-    summarise_head(provider, model, messages, split_at, 20_000).await.map(Some)
+    let head = &messages[..split_at];
+    let (notice, summarised) =
+        match generate_summary(provider, model, head, max_summary_tokens, custom_instructions)
+            .await
+        {
+            Ok(summary) => (summarised_notice(&summary, head), true),
+            Err(e) if trigger == CompactionTrigger::Overflow => {
+                warn!(error = %e, "Summariser failed after a context-window error; keeping only the recent tail");
+                let mut notice = format!(
+                    "This session is being continued from a previous conversation that ran out of context. \
+                     The earlier portion of the conversation (originally {} messages, ~{} tokens) could not \
+                     be summarised and was dropped.",
+                    head.len(),
+                    estimate_tokens_for_messages(head)
+                );
+                if let Some(previous) = extract_previous_summary(head) {
+                    notice.push_str(&format!(
+                        "\n\nSummary carried over from an earlier compaction:\n\n<compact-summary>\n{}\n</compact-summary>",
+                        previous
+                    ));
+                }
+                (notice, false)
+            }
+            Err(e) => return Err(e),
+        };
+
+    let summary = summary_message(notice, head);
+    let summary_uuid = summary.uuid.clone().unwrap_or_default();
+    let mut new_messages = Vec::with_capacity(1 + total - split_at);
+    new_messages.push(summary);
+    new_messages.extend_from_slice(&messages[split_at..]);
+
+    let record = CompactionRecord {
+        at: chrono::Utc::now(),
+        trigger,
+        summary_uuid,
+        messages_before: total,
+        messages_after: new_messages.len(),
+        tokens_before: estimate_tokens_for_messages(messages) as u64,
+        tokens_after: estimate_tokens_for_messages(&new_messages) as u64,
+        summarised,
+    };
+    Ok(Some(Compaction { messages: new_messages, record }))
 }
 
 /// Auto-compact `messages` if needed.  Updates `state` in place.
-/// Returns `Some(new_messages)` if compaction ran, `None` otherwise.
+/// Returns the compaction if one ran, `None` otherwise.
 ///
 /// `context_window` is the effective window for the active provider+model
 /// (resolve it via [`resolve_context_window`]); `provider` and `model` serve
@@ -1233,10 +1422,15 @@ pub async fn auto_compact_if_needed(
     messages: &[Message],
     input_tokens: u64,
     context_window: u64,
-    output_reserve: u64,
+    max_output_tokens: u32,
     state: &mut AutoCompactState,
-) -> Option<Vec<Message>> {
-    if !should_auto_compact_for_window(input_tokens, context_window, output_reserve, state) {
+) -> Option<Compaction> {
+    if !should_auto_compact_for_window(
+        input_tokens,
+        context_window,
+        u64::from(max_output_tokens),
+        state,
+    ) {
         return None;
     }
 
@@ -1247,16 +1441,25 @@ pub async fn auto_compact_if_needed(
         "Auto-compact triggered"
     );
 
-    match compact_conversation(provider, model, messages).await {
+    match compact_conversation(
+        provider,
+        model,
+        messages,
+        CompactionTrigger::Threshold,
+        summary_token_budget(max_output_tokens),
+        None,
+    )
+    .await
+    {
         Ok(None) => None,
-        Ok(Some(new_msgs)) => {
+        Ok(Some(compaction)) => {
             state.on_success();
             info!(
                 original_count = messages.len(),
-                new_count = new_msgs.len(),
+                new_count = compaction.messages.len(),
                 "Auto-compact complete"
             );
-            Some(new_msgs)
+            Some(compaction)
         }
         Err(e) => {
             warn!(error = %e, "Auto-compact failed");
@@ -1463,7 +1666,7 @@ pub async fn reactive_compact(
         estimate_tokens_for_messages(&stripped[..split_at]) as u64;
 
     let mut new_messages =
-        summarise_head(provider, model, &stripped, split_at, 20_000).await?;
+        summarise_head(provider, model, &stripped, split_at, MAX_SUMMARY_TOKENS).await?;
 
     // The summary lives as the first message in new_messages.
     let summary_text = new_messages
@@ -2305,5 +2508,218 @@ mod tests {
             .count()
             + 1;
         assert_eq!(listed, MAX_MANIFEST_FILES);
+    }
+
+    // ---- Issue #441: provider-agnostic, robust summariser --------------------
+
+    /// One scripted summariser reply: `Some((text, stop))`, or `None` for a
+    /// provider error.
+    type Reply = Option<(&'static str, StopReason)>;
+
+    /// A non-Anthropic provider that answers summarisation requests from a
+    /// script and counts them.
+    struct ScriptedSummariser {
+        id: claurst_core::provider_id::ProviderId,
+        replies: std::sync::Mutex<std::collections::VecDeque<Reply>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ScriptedSummariser {
+        fn new(replies: Vec<Reply>) -> Self {
+            Self {
+                id: claurst_core::provider_id::ProviderId::new("openai"),
+                replies: std::sync::Mutex::new(replies.into()),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for ScriptedSummariser {
+        fn id(&self) -> &claurst_core::provider_id::ProviderId {
+            &self.id
+        }
+        fn name(&self) -> &str {
+            "scripted-summariser"
+        }
+
+        async fn create_message(
+            &self,
+            _request: ProviderRequest,
+        ) -> Result<claurst_api::ProviderResponse, claurst_api::ProviderError> {
+            unimplemented!("the summariser streams")
+        }
+
+        async fn create_message_stream(
+            &self,
+            request: ProviderRequest,
+        ) -> Result<
+            std::pin::Pin<
+                Box<dyn futures::Stream<Item = Result<StreamEvent, claurst_api::ProviderError>> + Send>,
+            >,
+            claurst_api::ProviderError,
+        > {
+            assert!(request.tools.is_empty(), "the summariser must not offer tools");
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let reply = self.replies.lock().unwrap().pop_front().flatten();
+            let Some((text, stop)) = reply else {
+                return Err(claurst_api::ProviderError::ServerError {
+                    provider: self.id.clone(),
+                    status: Some(500),
+                    message: "boom".to_string(),
+                    is_retryable: true,
+                });
+            };
+            let events = vec![
+                Ok(StreamEvent::TextDelta { index: 0, text: text.to_string() }),
+                Ok(StreamEvent::MessageDelta { stop_reason: Some(stop), usage: None }),
+                Ok(StreamEvent::MessageStop),
+            ];
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+
+        async fn health_check(
+            &self,
+        ) -> Result<claurst_api::ProviderStatus, claurst_api::ProviderError> {
+            Ok(claurst_api::ProviderStatus::Healthy)
+        }
+
+        fn capabilities(&self) -> claurst_api::ProviderCapabilities {
+            claurst_api::ProviderCapabilities {
+                streaming: true,
+                tool_calling: false,
+                thinking: false,
+                image_input: false,
+                pdf_input: false,
+                audio_input: false,
+                video_input: false,
+                caching: false,
+                structured_output: false,
+                system_prompt_style: claurst_api::SystemPromptStyle::TopLevel,
+            }
+        }
+    }
+
+    const GOOD: Reply = Some(("<summary>Condensed history.</summary>", StopReason::EndTurn));
+
+    /// Short user turns between large assistant replies: the keep-recent cut
+    /// lands at index 8, leaving four user turns in the summarised head.
+    fn turns_history() -> Vec<Message> {
+        let users = ["alpha request", "beta request", "gamma request", "delta request", "epsilon request", "final request"];
+        let mut out = Vec::new();
+        for (i, user) in users.iter().enumerate() {
+            out.push(make_user(user));
+            if i + 1 < users.len() {
+                out.push(make_assistant(&filler(30_000)));
+            }
+        }
+        out
+    }
+
+    async fn compact(
+        provider: &ScriptedSummariser,
+        trigger: CompactionTrigger,
+    ) -> Result<Option<Compaction>, ClaudeError> {
+        compact_conversation(provider, "gpt-test", &turns_history(), trigger, 4_000, None).await
+    }
+
+    #[tokio::test]
+    async fn non_anthropic_provider_compacts_and_records_the_entry() {
+        let provider = ScriptedSummariser::new(vec![GOOD]);
+        let history = turns_history();
+        let compaction = compact(&provider, CompactionTrigger::Threshold)
+            .await
+            .unwrap()
+            .expect("history over the keep budget compacts");
+
+        assert_eq!(provider.calls(), 1);
+        let msgs = &compaction.messages;
+        let record = &compaction.record;
+        assert!(msgs[0].get_all_text().contains("Condensed history."));
+        assert_eq!(record.trigger, CompactionTrigger::Threshold);
+        assert_eq!(msgs[0].uuid.as_deref(), Some(record.summary_uuid.as_str()));
+        assert_eq!(record.messages_before, history.len());
+        assert_eq!(record.messages_after, msgs.len());
+        assert!(record.tokens_after < record.tokens_before);
+        assert!(record.summarised);
+        // The untouched tail follows the summary.
+        assert_eq!(msgs.last().unwrap().get_all_text(), "final request");
+    }
+
+    #[tokio::test]
+    async fn last_user_turns_are_kept_verbatim() {
+        let provider = ScriptedSummariser::new(vec![GOOD]);
+        let compaction = compact(&provider, CompactionTrigger::Threshold).await.unwrap().unwrap();
+        let summary = compaction.messages[0].get_all_text();
+        let recent = &summary[summary.find("<recent-user-messages>").expect("recent block")..];
+        for kept in ["beta request", "gamma request", "delta request"] {
+            assert!(recent.contains(kept), "missing {kept}: {recent}");
+        }
+        assert!(!recent.contains("alpha request"), "only the last {RECENT_USER_TURNS} turns");
+    }
+
+    #[tokio::test]
+    async fn summariser_retries_once_after_a_rejected_summary() {
+        // Empty, then good.
+        let provider = ScriptedSummariser::new(vec![Some(("  ", StopReason::EndTurn)), GOOD]);
+        assert!(compact(&provider, CompactionTrigger::Threshold).await.unwrap().is_some());
+        assert_eq!(provider.calls(), 2);
+
+        // Provider error, then good.
+        let provider = ScriptedSummariser::new(vec![None, GOOD]);
+        assert!(compact(&provider, CompactionTrigger::Manual).await.unwrap().is_some());
+        assert_eq!(provider.calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn truncated_or_failing_summaries_fail_the_compaction() {
+        let truncated = Some(("<summary>cut off", StopReason::MaxTokens));
+        let provider = ScriptedSummariser::new(vec![truncated.clone(), truncated]);
+        assert!(compact(&provider, CompactionTrigger::Threshold).await.is_err());
+        assert_eq!(provider.calls(), 2, "one retry, then give up");
+    }
+
+    #[test]
+    fn over_long_summary_is_rejected() {
+        let head = vec![make_user(&filler(400))];
+        let head_tokens = estimate_tokens_for_messages(&head);
+        assert!(validate_summary(filler(4_000), Some(StopReason::EndTurn), head_tokens).is_err());
+        assert!(validate_summary("short".to_string(), Some(StopReason::EndTurn), head_tokens).is_ok());
+    }
+
+    #[tokio::test]
+    async fn overflow_falls_back_to_the_untouched_tail_when_summaries_fail() {
+        let provider = ScriptedSummariser::new(vec![None, None]);
+        let history = turns_history();
+        let compaction = compact(&provider, CompactionTrigger::Overflow)
+            .await
+            .unwrap()
+            .expect("overflow recovery always yields a history");
+
+        assert!(!compaction.record.summarised);
+        assert_eq!(compaction.record.trigger, CompactionTrigger::Overflow);
+        let notice = compaction.messages[0].get_all_text();
+        assert!(notice.contains("could not be summarised"));
+        assert!(notice.contains("delta request"), "recent user turns survive the fallback");
+        // Everything after the notice is the original tail, untouched.
+        let tail = &history[history.len() - (compaction.messages.len() - 1)..];
+        let kept: Vec<String> = compaction.messages[1..].iter().map(|m| m.get_all_text()).collect();
+        let expected: Vec<String> = tail.iter().map(|m| m.get_all_text()).collect();
+        assert_eq!(kept, expected);
+    }
+
+    #[tokio::test]
+    async fn nothing_to_compact_returns_none() {
+        let provider = ScriptedSummariser::new(vec![GOOD]);
+        let small = vec![make_user("hi"), make_assistant("hello")];
+        let out = compact_conversation(&provider, "gpt-test", &small, CompactionTrigger::Manual, 4_000, None)
+            .await
+            .unwrap();
+        assert!(out.is_none());
+        assert_eq!(provider.calls(), 0);
     }
 }

@@ -3382,6 +3382,10 @@ async fn run_interactive(
 
         // Drain query events — also forward relevant ones to the bridge as outbound.
         while let Ok(evt) = event_rx.try_recv() {
+            // Record loop compactions in the session (issue #441).
+            if let QueryEvent::Compacted(record) = &evt {
+                session.compactions.push(record.clone());
+            }
             // Forward to bridge before consuming (clone only what we need).
             if let Some(ref runtime) = bridge_runtime {
                 let outbound: Option<BridgeOutbound> = match &evt {

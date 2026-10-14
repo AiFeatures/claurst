@@ -50,7 +50,8 @@ pub use compact::{
     context_window_for_model, estimate_context_tokens, format_compact_summary, get_compact_prompt,
     group_messages_for_compact, micro_compact_if_needed, reactive_compact,
     resolve_context_window, should_auto_compact, should_auto_compact_for_window, should_compact,
-    should_context_collapse, snip_compact, auto_compact_threshold, UsageMark,
+    should_context_collapse, snip_compact, auto_compact_threshold, summary_token_budget, Compaction,
+    CompactionRecord, CompactionTrigger, UsageMark,
 };
 pub use session_memory::{
     ExtractedMemory, MemoryCategory, SessionMemoryExtractor, SessionMemoryState,
@@ -278,6 +279,9 @@ pub enum QueryEvent {
     /// `state` is Warning (≥ 80 %) or Critical (≥ 95 %).
     /// `pct_used` is the fraction of the context window consumed (0.0–1.0).
     TokenWarning { state: TokenWarningState, pct_used: f64 },
+    /// The loop compacted the history (issue #441). The caller records the
+    /// entry in the session; `tokens_after` is the new context estimate.
+    Compacted(CompactionRecord),
 }
 
 // ---------------------------------------------------------------------------
@@ -675,7 +679,7 @@ pub async fn run_query_loop(
                 &effective_model,
                 context_tokens,
                 context_window,
-                u64::from(config.max_tokens),
+                config.max_tokens,
                 &mut compact_state,
                 event_tx.as_ref(),
                 &cancel_token,
@@ -964,6 +968,7 @@ pub async fn run_query_loop(
                                     messages,
                                     provider.as_ref(),
                                     &model_id_str,
+                                    config.max_tokens,
                                     event_tx.as_ref(),
                                 )
                                 .await
@@ -1113,6 +1118,7 @@ pub async fn run_query_loop(
                                 messages,
                                 provider.as_ref(),
                                 &model_id_str,
+                                config.max_tokens,
                                 event_tx.as_ref(),
                             )
                             .await
@@ -1383,6 +1389,7 @@ pub async fn run_query_loop(
                         messages,
                         &summariser,
                         &effective_model,
+                        config.max_tokens,
                         event_tx.as_ref(),
                     )
                     .await
@@ -1488,6 +1495,7 @@ pub async fn run_query_loop(
                     messages,
                     &summariser,
                     &effective_model,
+                    config.max_tokens,
                     event_tx.as_ref(),
                 )
                 .await

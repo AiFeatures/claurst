@@ -62,7 +62,7 @@ pub(crate) async fn compact_before_request(
     effective_model: &str,
     context_tokens: u64,
     context_window: u64,
-    output_reserve: u64,
+    max_output_tokens: u32,
     state: &mut compact::AutoCompactState,
     event_tx: Option<&mpsc::UnboundedSender<QueryEvent>>,
     cancel_token: &tokio_util::sync::CancellationToken,
@@ -109,8 +109,12 @@ pub(crate) async fn compact_before_request(
         };
     }
 
-    if !compact::should_auto_compact_for_window(context_tokens, context_window, output_reserve, state)
-    {
+    if !compact::should_auto_compact_for_window(
+        context_tokens,
+        context_window,
+        u64::from(max_output_tokens),
+        state,
+    ) {
         return false;
     }
     let Some((provider, model)) = compaction_endpoint(route, client, effective_model) else {
@@ -123,14 +127,13 @@ pub(crate) async fn compact_before_request(
         messages,
         context_tokens,
         context_window,
-        output_reserve,
+        max_output_tokens,
         state,
     )
     .await
     {
-        Some(new_messages) => {
-            *messages = new_messages;
-            send_status("Context compacted to stay within limits.");
+        Some(compaction) => {
+            apply_compaction(messages, compaction, event_tx);
             true
         }
         None => false,
@@ -144,6 +147,7 @@ pub(crate) async fn compact_after_overflow(
     messages: &mut Vec<Message>,
     provider: &dyn claurst_api::LlmProvider,
     model: &str,
+    max_output_tokens: u32,
     event_tx: Option<&mpsc::UnboundedSender<QueryEvent>>,
 ) -> bool {
     if let Some(tx) = event_tx {
@@ -151,14 +155,23 @@ pub(crate) async fn compact_after_overflow(
             "Context window exceeded — compacting and retrying…".to_string(),
         ));
     }
-    match compact::compact_conversation(provider, model, messages).await {
-        Ok(Some(new_messages)) => {
+    match compact::compact_conversation(
+        provider,
+        model,
+        messages,
+        compact::CompactionTrigger::Overflow,
+        compact::summary_token_budget(max_output_tokens),
+        None,
+    )
+    .await
+    {
+        Ok(Some(compaction)) => {
             info!(
                 before = messages.len(),
-                after = new_messages.len(),
+                after = compaction.messages.len(),
                 "Compacted after a context-window error; retrying the request"
             );
-            *messages = new_messages;
+            apply_compaction(messages, compaction, event_tx);
             true
         }
         Ok(None) => {
@@ -169,5 +182,24 @@ pub(crate) async fn compact_after_overflow(
             warn!(error = %e, "Compaction after a context-window error failed");
             false
         }
+    }
+}
+
+/// Replace the history with a compaction's result and report it: a status
+/// line with the token counts and a [`QueryEvent::Compacted`] entry for the
+/// caller to record in the session.
+fn apply_compaction(
+    messages: &mut Vec<Message>,
+    compaction: compact::Compaction,
+    event_tx: Option<&mpsc::UnboundedSender<QueryEvent>>,
+) {
+    *messages = compaction.messages;
+    if let Some(tx) = event_tx {
+        let record = compaction.record;
+        let _ = tx.send(QueryEvent::Status(format!(
+            "Context compacted: ~{} → ~{} tokens.",
+            record.tokens_before, record.tokens_after
+        )));
+        let _ = tx.send(QueryEvent::Compacted(record));
     }
 }
