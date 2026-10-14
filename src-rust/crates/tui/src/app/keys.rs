@@ -2406,7 +2406,7 @@ impl App {
                 self.remove_last_pending();
                 false
             }
-            "indent" if self.is_streaming && self.prompt_input.suggestions.is_empty() => {
+            "indent" if self.turn_running() && self.prompt_input.suggestions.is_empty() => {
                 // Tab during a turn: queue the prompt as a new turn for after
                 // this one ends (#444). Enter would steer it into this turn.
                 let input = self.take_input();

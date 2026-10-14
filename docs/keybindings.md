@@ -302,7 +302,7 @@ In vim insert mode, `Enter` also submits. Use `Shift+Enter` for newlines in vim 
 
 ### ESC During Streaming
 
-Pressing `Escape` while a turn runs cancels it exactly like `Ctrl+C`: the turn's cancellation token stops the model request and any running tools (and background sub-agents started by the turn). The output streamed so far stays in the transcript, the Reconnecting pill clears, and steers that were not yet delivered return to the prompt. A turn counts as running until its task ends, so `Escape` also works while tools run between model requests.
+Pressing `Escape` while a turn runs cancels it exactly like `Ctrl+C`: the turn's cancellation token stops the model request and any running tools (and background sub-agents started by the turn). The output streamed so far stays in the transcript, the Reconnecting pill clears, and steers that were not yet delivered and Tab-queued messages return to the prompt; background completion notices are still delivered afterwards. A turn counts as running until its task ends, so `Escape` also works while tools run between model requests.
 
 On an idle prompt `Escape` keeps its other meanings (vim normal mode, leaving transcript focus); pressing it twice does nothing.
 

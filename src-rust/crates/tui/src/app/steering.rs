@@ -22,9 +22,9 @@ pub enum PendingKind {
 }
 
 /// The opening tag line of a background-task completion notice
-/// (`<subagent …>` / `<shell …>`), or `None` for ordinary input.
+/// (`<subagent …>` / `<background-shell …>`), or `None` for ordinary input.
 fn completion_notice_header(text: &str) -> Option<&str> {
-    if text.starts_with("<subagent ") || text.starts_with("<shell ") {
+    if text.starts_with("<subagent ") || text.starts_with("<background-shell ") {
         text.lines().next()
     } else {
         None
@@ -94,10 +94,11 @@ impl App {
         }
     }
 
-    /// On cancel: take undelivered steers out of the queue and put them back
-    /// in the prompt, so nothing typed is lost and nothing is sent after the
-    /// user stopped the turn. Completion notices still queued are dropped;
-    /// their task output stays available through the monitor tool.
+    /// On cancel: take undelivered steers out of the queue and Tab-queued
+    /// prompts out of the dock and put them back in the prompt, so nothing
+    /// typed is lost and nothing is sent after the user stopped the turn.
+    /// Completion notices stay queued: the model was told not to poll for
+    /// them, so the idle wake-up delivers them after the cancel.
     pub fn restore_pending_steers(&mut self) {
         let mut restored: Vec<String> = Vec::new();
         if let Some(ref queue) = self.command_queue {
@@ -106,9 +107,9 @@ impl App {
                     restored.push(text);
                 }
             }
-            queue.drain();
         }
         self.pending_steers.clear();
+        restored.extend(self.queued_messages.drain(..));
         if restored.is_empty() {
             return;
         }
@@ -200,11 +201,12 @@ mod tests {
         let (mut app, _queue) = app_with_queue();
         let before = app.messages.len();
         app.handle_query_event(QueryEvent::InputInjected(vec![
-            "<shell id=\"t1\" state=\"completed\" command=\"make\">\nok\n</shell>".to_string(),
+            "<background-shell id=\"t1\" state=\"completed\" command=\"make\">\nok\n</background-shell>"
+                .to_string(),
         ]));
         assert_eq!(app.messages.len(), before);
         let note = app.system_annotations.last().expect("annotation");
-        assert!(note.text.contains("<shell id=\"t1\""), "{}", note.text);
+        assert!(note.text.contains("<background-shell id=\"t1\""), "{}", note.text);
     }
 
     #[test]
@@ -283,6 +285,22 @@ mod tests {
     }
 
     #[test]
+    fn tab_between_model_requests_still_queues() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let (mut app, _queue) = app_with_queue();
+        // Tools running: the query task is alive but nothing is streaming.
+        app.query_in_flight = true;
+        let mode = app.agent_mode.clone();
+        app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.agent_mode, mode, "an empty-prompt Tab must not switch agent mode mid-turn");
+        assert!(!app.agent_mode_changed);
+        app.set_prompt_text("next".to_string());
+        app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.queued_messages, ["next"]);
+        assert!(app.prompt_input.is_empty());
+    }
+
+    #[test]
     fn esc_esc_on_an_idle_prompt_does_nothing() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let (mut app, _queue) = app_with_queue();
@@ -297,18 +315,34 @@ mod tests {
     }
 
     #[test]
-    fn cancel_returns_undelivered_steers_to_the_prompt() {
+    fn cancel_returns_steers_and_queued_prompts_and_keeps_notices() {
         let (mut app, queue) = app_with_queue();
         app.steer("one".to_string());
         app.steer("two".to_string());
+        app.queued_messages.push_back("later".to_string());
         queue.push(
-            QueuedCommand::InjectUserMessage("<shell id=\"t\">x</shell>".to_string()),
+            QueuedCommand::InjectUserMessage(
+                "<background-shell id=\"t\">x</background-shell>".to_string(),
+            ),
             CommandPriority::Normal,
         );
         app.set_prompt_text("draft".to_string());
         app.restore_pending_steers();
-        assert_eq!(app.prompt_input.text, "one\ntwo\ndraft");
+        assert_eq!(app.prompt_input.text, "one\ntwo\nlater\ndraft");
         assert!(app.pending_steers.is_empty());
-        assert!(queue.is_empty());
+        assert!(app.queued_messages.is_empty(), "nothing auto-submits after a cancel");
+        let left: Vec<String> = queue
+            .drain()
+            .into_iter()
+            .map(|command| match command {
+                QueuedCommand::InjectUserMessage(text) => text,
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            left,
+            ["<background-shell id=\"t\">x</background-shell>"],
+            "the completion notice waits for the idle wake-up"
+        );
     }
 }
