@@ -29,10 +29,10 @@ pub fn truncate_lines(lines: &[String], max_lines: usize) -> (Vec<String>, bool)
 /// Cap tool output at about `max_bytes`, keeping the head and the tail (where
 /// commands print what they are doing and how they ended) and replacing the
 /// middle with a note giving the omitted size. Cuts land on char boundaries.
-/// Output within the cap is returned unchanged.
-pub fn truncate_tool_output(text: String, max_bytes: usize) -> String {
+/// Output within the cap is returned unchanged (borrowed).
+pub fn truncate_tool_output(text: &str, max_bytes: usize) -> std::borrow::Cow<'_, str> {
     if text.len() <= max_bytes {
-        return text;
+        return std::borrow::Cow::Borrowed(text);
     }
     let half = max_bytes / 2;
     let mut head_end = half;
@@ -43,12 +43,12 @@ pub fn truncate_tool_output(text: String, max_bytes: usize) -> String {
     while !text.is_char_boundary(tail_start) {
         tail_start += 1;
     }
-    format!(
+    std::borrow::Cow::Owned(format!(
         "{}\n\n[... {} bytes omitted from the middle of this output ...]\n\n{}",
         &text[..head_end],
         tail_start - head_end,
         &text[tail_start..]
-    )
+    ))
 }
 
 /// Truncate a file path for display, keeping the filename and shortening the directory.
@@ -92,13 +92,13 @@ mod tests {
 
     #[test]
     fn truncate_tool_output_short_is_unchanged() {
-        assert_eq!(truncate_tool_output("ok".to_string(), 10), "ok");
+        assert!(matches!(truncate_tool_output("ok", 10), std::borrow::Cow::Borrowed("ok")));
     }
 
     #[test]
     fn truncate_tool_output_keeps_head_and_tail() {
         let text = format!("HEAD{}TAIL", "x".repeat(10_000));
-        let out = truncate_tool_output(text, 1_000);
+        let out = truncate_tool_output(&text, 1_000);
         assert!(out.starts_with("HEAD"));
         assert!(out.ends_with("TAIL"));
         assert!(out.contains("9008 bytes omitted"), "{}", out);
@@ -109,7 +109,7 @@ mod tests {
     fn truncate_tool_output_cuts_on_char_boundaries() {
         // 3-byte chars: neither cut point may split one.
         let text = "€".repeat(1_000);
-        let out = truncate_tool_output(text, 101);
+        let out = truncate_tool_output(&text, 101);
         assert!(out.starts_with('€') && out.ends_with('€'));
     }
 

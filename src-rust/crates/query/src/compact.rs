@@ -881,7 +881,7 @@ async fn request_summary(
     provider: &dyn LlmProvider,
     model: &str,
     system: &str,
-    prompt: String,
+    prompt: &str,
     max_tokens: u32,
 ) -> Result<(String, Option<StopReason>), ClaudeError> {
     let request = ProviderRequest {
@@ -984,9 +984,10 @@ fn summary_prompt(
                         let result_text = match content {
                             claurst_core::types::ToolResultContent::Text(t) => {
                                 claurst_core::truncate::truncate_tool_output(
-                                    t.clone(),
+                                    t,
                                     TRANSCRIPT_TOOL_RESULT_CHARS,
                                 )
+                                .into_owned()
                             }
                             claurst_core::types::ToolResultContent::Blocks(_) => "[complex content]".to_string(),
                         };
@@ -1031,27 +1032,29 @@ fn summary_prompt(
     }
 }
 
-/// Reject a summary that is empty, was cut off by the output limit, or is not
+/// Format a raw summariser reply (dropping the discarded `<analysis>` block)
+/// and reject it when it is empty, was cut off by the output limit, or is not
 /// shorter than the messages it replaces.
 fn validate_summary(
-    raw: String,
+    raw: &str,
     stop_reason: Option<StopReason>,
     head_tokens: usize,
 ) -> Result<String, ClaudeError> {
-    if raw.trim().is_empty() {
-        return Err(ClaudeError::Other("Compact summary was empty".to_string()));
-    }
     if matches!(stop_reason, Some(StopReason::MaxTokens)) {
         return Err(ClaudeError::Other(
             "Compact summary was cut off at the output limit".to_string(),
         ));
     }
-    if (raw.len() / 4) * 4 / 3 >= head_tokens {
+    let summary = format_compact_summary(raw);
+    if summary.trim().is_empty() {
+        return Err(ClaudeError::Other("Compact summary was empty".to_string()));
+    }
+    if (summary.len() / 4) * 4 / 3 >= head_tokens {
         return Err(ClaudeError::Other(
             "Compact summary is not shorter than the messages it replaces".to_string(),
         ));
     }
-    Ok(raw)
+    Ok(summary)
 }
 
 /// Summarise `head` through `provider`, retrying once when the call fails or
@@ -1071,18 +1074,18 @@ async fn generate_summary(
     let head_tokens = estimate_tokens_for_messages(head);
 
     let mut attempt = 1;
-    let raw_summary = loop {
+    let formatted_summary = loop {
         let outcome = request_summary(
             provider,
             model,
             SUMMARISER_SYSTEM_PROMPT,
-            prompt.clone(),
+            &prompt,
             max_summary_tokens,
         )
         .await
-        .and_then(|(raw, stop_reason)| validate_summary(raw, stop_reason, head_tokens));
+        .and_then(|(raw, stop_reason)| validate_summary(&raw, stop_reason, head_tokens));
         match outcome {
-            Ok(raw) => break raw,
+            Ok(summary) => break summary,
             Err(e) if attempt < SUMMARY_ATTEMPTS => {
                 warn!(attempt, error = %e, "Compaction summary failed; retrying");
                 attempt += 1;
@@ -1090,8 +1093,6 @@ async fn generate_summary(
             Err(e) => return Err(e),
         }
     };
-
-    let formatted_summary = format_compact_summary(&raw_summary);
 
     // Files-touched manifest: files this batch read/wrote/edited, unioned with
     // any manifest carried in the prior summary so the agent doesn't forget what
@@ -1234,11 +1235,22 @@ fn snap_to_pairing_boundary(messages: &[Message], idx: usize) -> usize {
 /// after it is kept verbatim. Larger `keep_recent_tokens` keeps more messages;
 /// smaller keeps fewer. The index is snapped to a tool_use↔tool_result-safe
 /// boundary so pairing is never broken.
+///
+/// When even the newest message alone exceeds the budget (typically the user
+/// message carrying a large tool batch, at the pre-request check), the whole
+/// last round — from the last assistant message on — is kept instead of
+/// summarising everything, so the results the model just asked for survive.
 fn compute_keep_split_index(messages: &[Message], keep_recent_tokens: u64) -> usize {
     if messages.is_empty() {
         return 0;
     }
-    let raw = calculate_messages_to_keep_index(messages, keep_recent_tokens);
+    let mut raw = calculate_messages_to_keep_index(messages, keep_recent_tokens);
+    if raw == messages.len() {
+        raw = messages
+            .iter()
+            .rposition(|m| m.role == Role::Assistant)
+            .unwrap_or(0);
+    }
     snap_to_pairing_boundary(messages, raw)
 }
 
@@ -1678,7 +1690,7 @@ pub async fn context_collapse(
         model,
         "You are a conversation summariser. Produce an emergency ultra-short \
          summary as instructed. Plain text only.",
-        collapse_prompt,
+        &collapse_prompt,
         1_000,
     )
     .await?;
@@ -2616,8 +2628,34 @@ mod tests {
     fn over_long_summary_is_rejected() {
         let head = vec![make_user(&filler(400))];
         let head_tokens = estimate_tokens_for_messages(&head);
-        assert!(validate_summary(filler(4_000), Some(StopReason::EndTurn), head_tokens).is_err());
-        assert!(validate_summary("short".to_string(), Some(StopReason::EndTurn), head_tokens).is_ok());
+        assert!(validate_summary(&filler(4_000), Some(StopReason::EndTurn), head_tokens).is_err());
+        assert!(validate_summary("short", Some(StopReason::EndTurn), head_tokens).is_ok());
+        // The discarded <analysis> block does not count against the summary.
+        let reply = format!("<analysis>{}</analysis><summary>short</summary>", filler(4_000));
+        assert_eq!(
+            validate_summary(&reply, Some(StopReason::EndTurn), head_tokens).unwrap().trim(),
+            format_compact_summary("<summary>short</summary>").trim()
+        );
+    }
+
+    /// At the pre-request check the newest message can be a tool batch larger
+    /// than the whole keep budget: the last round must survive compaction.
+    #[test]
+    fn keep_split_keeps_an_oversized_last_round() {
+        let mut msgs = plain_convo(5, 30_000);
+        msgs.push(assistant_tool_use("t1", "Read", serde_json::json!({"file_path": "a"})));
+        msgs.push(Message::user_blocks(
+            ["t1", "t2", "t3"]
+                .iter()
+                .map(|id| ContentBlock::ToolResult {
+                    tool_use_id: id.to_string(),
+                    content: ToolResultContent::Text(filler(40_000)),
+                    is_error: None,
+                })
+                .collect(),
+        ));
+        let split = compute_keep_split_index(&msgs, KEEP_RECENT_TOKENS);
+        assert_eq!(split, msgs.len() - 2, "tail keeps the tool_use and its results");
     }
 
     #[tokio::test]

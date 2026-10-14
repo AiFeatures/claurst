@@ -3,15 +3,17 @@
 
 use crate::*;
 
-/// Wrap a tool's output for the history, capped at `max_chars` bytes with
-/// the head and tail kept and the omitted size noted (issue #441). Applied once
-/// when the result is appended, so later requests never rewrite history.
-/// `max_chars == 0` disables the cap.
-pub(crate) fn tool_result_for_history(content: String, max_chars: usize) -> ToolResultContent {
-    if max_chars == 0 {
+/// Wrap a tool's output for the history, capped at `max_bytes` with the head
+/// and tail kept and the omitted size noted (issue #441). Applied once when the
+/// result is appended, so later requests never rewrite history.
+/// `max_bytes == 0` disables the cap.
+pub(crate) fn tool_result_for_history(content: String, max_bytes: usize) -> ToolResultContent {
+    if max_bytes == 0 || content.len() <= max_bytes {
         return ToolResultContent::Text(content);
     }
-    ToolResultContent::Text(claurst_core::truncate::truncate_tool_output(content, max_chars))
+    ToolResultContent::Text(
+        claurst_core::truncate::truncate_tool_output(&content, max_bytes).into_owned(),
+    )
 }
 
 /// Apply the outcome of a reactive-compact / context-collapse call to the live

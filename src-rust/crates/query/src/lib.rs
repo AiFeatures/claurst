@@ -119,8 +119,8 @@ pub struct QueryConfig {
     /// appended to the history: longer output keeps its head and tail with a
     /// note giving the omitted size (issue #441). History is never rewritten
     /// afterwards, so the prompt prefix stays stable. `0` disables the cap.
-    /// Default: [`DEFAULT_TOOL_RESULT_MAX_CHARS`] (~10k tokens).
-    pub tool_result_max_chars: usize,
+    /// Default: [`DEFAULT_TOOL_RESULT_MAX_BYTES`] (~16k tokens).
+    pub tool_result_max_bytes: usize,
     /// Optional effort level.  When set and `thinking_budget` is `None`,
     /// the effort level's `thinking_budget_tokens()` is used as the
     /// thinking budget.  Also provides a temperature override when the
@@ -204,7 +204,7 @@ impl Default for QueryConfig {
             working_directory: None,
             thinking_budget: None,
             temperature: None,
-            tool_result_max_chars: DEFAULT_TOOL_RESULT_MAX_CHARS,
+            tool_result_max_bytes: DEFAULT_TOOL_RESULT_MAX_BYTES,
             effort_level: None,
             command_queue: None,
             skill_index: None,
@@ -299,9 +299,13 @@ pub enum QueryEvent {
 // Query loop
 // ---------------------------------------------------------------------------
 
-/// Default per-item cap for tool results appended to the history: 40k bytes,
-/// roughly 10k tokens (codex truncates tool output at 10k tokens on insert).
-pub const DEFAULT_TOOL_RESULT_MAX_CHARS: usize = 40_000;
+/// Default per-item cap for tool results appended to the history: 64k bytes,
+/// roughly 16k tokens. It sits above the largest tool-native output window
+/// (Read's 50 KiB page and Bash's 50 KiB window, each plus a continuation
+/// trailer) so the loop never re-cuts output a tool already bounded; cutting
+/// the middle of a Read page would hide the gap behind an intact offset
+/// trailer. It only catches tools without their own bound.
+pub const DEFAULT_TOOL_RESULT_MAX_BYTES: usize = 64_000;
 
 /// Maximum number of max_tokens continuation attempts before surfacing the
 /// partial response.  Mirrors `MAX_OUTPUT_TOKENS_RECOVERY_LIMIT` in query.ts.
@@ -1346,7 +1350,7 @@ pub async fn run_query_loop(
                                 tool_use_id: tool_id,
                                 content: tool_result_for_history(
                                     result.content,
-                                    config.tool_result_max_chars,
+                                    config.tool_result_max_bytes,
                                 ),
                                 is_error: Some(result.is_error),
                             });
@@ -2012,7 +2016,7 @@ pub async fn run_query_loop(
                         tool_use_id: p.id.clone(),
                         content: tool_result_for_history(
                             result.content,
-                            config.tool_result_max_chars,
+                            config.tool_result_max_bytes,
                         ),
                         is_error: if result.is_error { Some(true) } else { None },
                     });
@@ -2164,7 +2168,7 @@ mod tests {
             working_directory: None,
             thinking_budget: None,
             temperature: None,
-            tool_result_max_chars: DEFAULT_TOOL_RESULT_MAX_CHARS,
+            tool_result_max_bytes: DEFAULT_TOOL_RESULT_MAX_BYTES,
             effort_level: None,
             command_queue: None,
             skill_index: None,
@@ -3772,6 +3776,6 @@ mod tests {
         assert!(result.starts_with("FIRST LINE"));
         assert!(result.ends_with("LAST LINE"));
         assert!(result.contains("bytes omitted from the middle"));
-        assert!(result.len() <= DEFAULT_TOOL_RESULT_MAX_CHARS + 100, "{}", result.len());
+        assert!(result.len() <= DEFAULT_TOOL_RESULT_MAX_BYTES + 100, "{}", result.len());
     }
 }

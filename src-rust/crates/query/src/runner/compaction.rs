@@ -196,9 +196,14 @@ fn apply_compaction(
     *messages = compaction.messages;
     if let Some(tx) = event_tx {
         let record = compaction.record;
+        let verb = if record.summarised {
+            "Context compacted"
+        } else {
+            "Context trimmed without summary"
+        };
         let _ = tx.send(QueryEvent::Status(format!(
-            "Context compacted: ~{} → ~{} tokens.",
-            record.tokens_before, record.tokens_after
+            "{}: ~{} → ~{} tokens.",
+            verb, record.tokens_before, record.tokens_after
         )));
         let _ = tx.send(QueryEvent::Compacted(record));
     }

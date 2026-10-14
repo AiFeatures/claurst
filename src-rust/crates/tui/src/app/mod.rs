@@ -441,10 +441,6 @@ pub struct App {
     /// External status line output (`statusLine` / CLAUDE_STATUS_COMMAND),
     /// already stripped and line-capped by `set_status_line_output`.
     pub status_line_override: Option<String>,
-    /// Whether auto-compact is enabled (from settings).
-    pub auto_compact_enabled: bool,
-    /// Context threshold (0-100) at which to auto-compact.
-    pub auto_compact_threshold: u8,
 
     // ---- Voice hold-to-talk ------------------------------------------------
 
@@ -762,8 +758,6 @@ impl App {
             background_task_count: 0,
             background_task_status: None,
             status_line_override: None,
-            auto_compact_enabled: false,
-            auto_compact_threshold: 95,
             voice_recorder: {
                 // Check whether voice input has been enabled via the /voice command
                 // (stored in ~/.claurst/ui-settings.json).  We also accept
