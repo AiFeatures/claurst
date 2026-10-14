@@ -183,11 +183,13 @@ struct Cli {
     #[arg(long = "system-prompt-file")]
     system_prompt_file: Option<PathBuf>,
 
-    /// Tools to allow (comma-separated, default: all)
+    /// Allow without prompting, for this session (comma- or space-separated
+    /// rules: Tool, Tool(pattern) or *; e.g. "Read,Bash(git status *)")
     #[arg(long = "allowed-tools", value_name = "TOOLS")]
     allowed_tools: Option<String>,
 
-    /// Tools to disallow (comma-separated)
+    /// Deny in every mode, for this session (same syntax as --allowed-tools;
+    /// a tool-wide entry also hides the tool from the model)
     #[arg(long = "disallowed-tools", value_name = "TOOLS")]
     disallowed_tools: Option<String>,
 
@@ -379,6 +381,7 @@ async fn main() -> anyhow::Result<()> {
                     remote_session_url: None,
                     mcp_manager: None,
                     mcp_auth_runner: None,
+                    permission_manager: None,
                 };
                 // Collect remaining args after the command name
                 let rest: Vec<&str> = raw_args[2..].iter().map(|s| s.as_str()).collect();
@@ -521,6 +524,28 @@ async fn main() -> anyhow::Result<()> {
         config.permission_mode = cli.permission_mode.into();
     }
     config.additional_dirs = cli.add_dir.clone();
+    // --allowed-tools / --disallowed-tools extend the configured lists for
+    // this session only; the permission manager turns them into rules.
+    for (flag, list, target) in [
+        ("--allowed-tools", cli.allowed_tools.as_deref(), &mut config.allowed_tools),
+        ("--disallowed-tools", cli.disallowed_tools.as_deref(), &mut config.disallowed_tools),
+    ] {
+        for spec in list.map(claurst_core::permissions::split_rule_specs).unwrap_or_default() {
+            if claurst_core::permissions::parse_rule_spec(
+                &spec,
+                claurst_core::permissions::PermissionAction::Allow,
+            )
+            .is_none()
+            {
+                anyhow::bail!(
+                    "Invalid {} entry {:?}: expected Tool, Tool(pattern) or *",
+                    flag,
+                    spec
+                );
+            }
+            target.push(spec);
+        }
+    }
     if cli.no_auto_compact {
         config.auto_compact = false;
     }
@@ -666,10 +691,17 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    let permission_manager = Arc::new(std::sync::Mutex::new(PermissionManager::new(
-        config.permission_mode.clone(),
-        &settings,
-    )));
+    // Approvals saved "for this project" live under the claurst home, keyed
+    // by the repository root (or the working directory outside a repo).
+    let mut permission_manager =
+        PermissionManager::new(config.permission_mode.clone(), &settings).with_project_store(
+            claurst_core::permissions::project_approvals_path(
+                &claurst_core::config::Settings::config_dir(),
+                &claurst_core::permissions::approvals_project_root(&cwd),
+            ),
+        );
+    permission_manager.sync_config(&config);
+    let permission_manager = Arc::new(std::sync::Mutex::new(permission_manager));
 
     let permission_handler: Arc<dyn claurst_core::PermissionHandler> = if is_headless {
         Arc::new(AutoPermissionHandler::with_manager(permission_manager.clone()))
@@ -763,6 +795,7 @@ async fn main() -> anyhow::Result<()> {
         // Placeholder token; `run_query_loop` rebinds it to the loop's actual
         // cancel token so the parallel tool executor honours Ctrl-C (issue #218).
         cancel_token: tokio_util::sync::CancellationToken::new(),
+        batch_rejection: Default::default(),
     };
 
     // Hourly shadow-snapshot GC loop: only runs when snapshot is explicitly enabled.
@@ -1749,17 +1782,13 @@ fn permission_request_from_core(
             )
         }
         ("Bash", Some(command)) => {
-            let suggested_prefix = command
-                .split_whitespace()
-                .next()
-                .filter(|prefix| !prefix.is_empty())
-                .map(|prefix| format!("{} ", prefix));
+            let suggested_rules = claurst_core::shell_scan::approval_rules(&command);
             claurst_tui::dialogs::PermissionRequest::bash(
                 tool_use_id,
                 tool_name,
                 reason,
                 command,
-                suggested_prefix,
+                suggested_rules,
             )
         },
         ("PowerShell", Some(command)) => claurst_tui::dialogs::PermissionRequest::powershell(
@@ -2076,11 +2105,6 @@ async fn run_interactive(
     // setup dialog instead of failing silently on the first message.
     app.has_credentials = has_credentials;
 
-    // Restore "always allow" bash prefixes persisted from earlier sessions so
-    // previously-approved command prefixes don't prompt again.
-    app.bash_prefix_allowlist
-        .extend(settings.allowed_bash_prefixes.iter().cloned());
-
     // If a non-Anthropic provider is active, prefix model_name with "provider/model"
     // so the status bar can show the provider name.
     if let Some(ref provider) = live_config.provider {
@@ -2248,6 +2272,7 @@ async fn run_interactive(
         remote_session_url: session.remote_session_url.clone(),
         mcp_manager: tool_ctx.mcp_manager.clone(),
         mcp_auth_runner: None,
+        permission_manager: tool_ctx.permission_manager.clone(),
     };
 
     // tools is already Arc<Vec<...>> — share it across spawned tasks without copying.
@@ -2852,6 +2877,13 @@ async fn run_interactive(
                                     normalize_provider_from_model(&mut applied_cfg);
                                     cmd_ctx.config = applied_cfg.clone();
                                     tool_ctx.config = applied_cfg.clone();
+                                    // Mode and tool allow/deny lists may have changed
+                                    // (e.g. /permissions); re-derive their rules.
+                                    if let Some(manager) = tool_ctx.permission_manager.as_ref() {
+                                        if let Ok(mut manager) = manager.lock() {
+                                            manager.sync_config(&applied_cfg);
+                                        }
+                                    }
                                     app.config = applied_cfg.clone();
                                     // Sync model/provider shown in the TUI header.
                                     if let Some(ref model) = applied_cfg.model {
@@ -2879,6 +2911,13 @@ async fn run_interactive(
                                     normalize_provider_from_model(&mut applied_cfg);
                                     cmd_ctx.config = applied_cfg.clone();
                                     tool_ctx.config = applied_cfg.clone();
+                                    // Mode and tool allow/deny lists may have changed
+                                    // (e.g. /permissions); re-derive their rules.
+                                    if let Some(manager) = tool_ctx.permission_manager.as_ref() {
+                                        if let Ok(mut manager) = manager.lock() {
+                                            manager.sync_config(&applied_cfg);
+                                        }
+                                    }
                                     // Sync model/provider + fast_mode visual indicator.
                                     if let Some(ref model) = applied_cfg.model {
                                         app.set_model(model.clone());
@@ -3269,63 +3308,62 @@ async fn run_interactive(
                                 continue;
                             }
                             let tool_use_id = pr.tool_use_id.clone();
-                            let selected_option = pr.selected_option;
-                            let selected_key = pr.options.get(selected_option).map(|o| o.key);
-                            let should_record_bash_prefix = selected_key == Some('P');
-                            let selected_path = pending_permissions
-                                .lock()
-                                .waiting
-                                .get(&tool_use_id)
-                                .and_then(|p| p.request.path.clone());
-                            let bash_prefix = if should_record_bash_prefix {
-                                match &pr.kind {
-                                    claurst_tui::dialogs::PermissionDialogKind::Bash { command, .. } => {
-                                        let first_word = command.split_whitespace().next().unwrap_or("").to_string();
-                                        if first_word.is_empty() { None } else { Some(first_word) }
-                                    }
-                                    _ => None,
+                            let selected_key = pr.options.get(pr.selected_option).map(|o| o.key);
+                            // The reason typed after choosing deny, if any,
+                            // goes back to the model with the denial.
+                            let feedback = pr
+                                .feedback
+                                .take()
+                                .map(|reason| reason.trim().to_string())
+                                .filter(|reason| !reason.is_empty());
+                            let suggested_rules = match &mut pr.kind {
+                                claurst_tui::dialogs::PermissionDialogKind::Bash { suggested_rules, .. } => {
+                                    std::mem::take(suggested_rules)
                                 }
-                            } else {
-                                None
+                                _ => Vec::new(),
                             };
                             app.permission_request = None;
 
-                            if let Some(prefix) = bash_prefix {
-                                app.bash_prefix_allowlist.insert(prefix.clone());
-                                // "Always allow" must survive restarts: persist
-                                // the prefix to settings.json so it is reloaded
-                                // into the allowlist on the next launch.
-                                if let Ok(mut settings) = claurst_core::config::Settings::load_sync() {
-                                    if !settings.allowed_bash_prefixes.contains(&prefix) {
-                                        settings.allowed_bash_prefixes.push(prefix);
-                                        let _ = settings.save_sync();
-                                    }
-                                }
-                            }
-
                             if let Some(mut pending) = pending_permissions.lock().waiting.remove(&tool_use_id) {
-                                let decision = match selected_key {
-                                    Some('n') => claurst_core::permissions::PermissionDecision::Deny,
+                                let decision = match (selected_key, feedback) {
+                                    (Some('n'), Some(reason)) => {
+                                        claurst_core::permissions::PermissionDecision::DenyWithFeedback(reason)
+                                    }
+                                    (Some('n'), None) => claurst_core::permissions::PermissionDecision::Deny,
                                     _ => claurst_core::permissions::PermissionDecision::Allow,
                                 };
 
                                 if let Some(manager) = tool_ctx.permission_manager.as_ref() {
                                     if let Ok(mut manager) = manager.lock() {
+                                        let tool_name = pending.request.tool_name.as_str();
+                                        let target = pending.request.path.as_deref();
+                                        let is_shell = claurst_core::permissions::is_shell_tool(tool_name);
                                         match selected_key {
-                                            Some('Y') => {
-                                                if let Some(path) = selected_path.as_deref() {
-                                                    manager.add_session_allow_path(&pending.request.tool_name, path);
-                                                } else {
-                                                    manager.add_session_allow(&pending.request.tool_name);
+                                            Some('Y') => match target {
+                                                Some(command) if is_shell => {
+                                                    manager.add_session_allow_command(tool_name, command);
                                                 }
-                                            }
-                                            Some('p') => {
-                                                let mut settings = claurst_core::config::Settings::load_sync().unwrap_or_default();
-                                                if let Some(path) = selected_path.as_deref() {
-                                                    let pattern = format!("{}*", path);
-                                                    let _ = manager.add_persistent_allow_path(&pending.request.tool_name, &pattern, &mut settings);
+                                                Some(path) => manager.add_session_allow_path(tool_name, path),
+                                                None => manager.add_session_allow(tool_name),
+                                            },
+                                            Some(key @ ('p' | 'a')) => {
+                                                let scope = if key == 'p' {
+                                                    claurst_core::permissions::ApprovalScope::Project
                                                 } else {
-                                                    let _ = manager.add_persistent_allow(&pending.request.tool_name, &mut settings);
+                                                    claurst_core::permissions::ApprovalScope::Global
+                                                };
+                                                // Shell approvals save the arity prefixes shown in
+                                                // the dialog; path approvals cover the path as a
+                                                // prefix glob; anything else allows the tool.
+                                                let patterns: Vec<Option<String>> = match target {
+                                                    Some(_) if is_shell => suggested_rules.into_iter().map(Some).collect(),
+                                                    Some(path) => vec![Some(format!("{}*", path))],
+                                                    None => vec![None],
+                                                };
+                                                for pattern in patterns {
+                                                    if let Err(e) = manager.save_allow(scope, tool_name, pattern.as_deref()) {
+                                                        app.status_message = Some(format!("Could not save approval: {}", e));
+                                                    }
                                                 }
                                             }
                                             _ => {}
@@ -3437,8 +3475,8 @@ async fn run_interactive(
                     break;
                 };
 
-                // A sandbox escalation is always shown: no permission rule or
-                // Bash prefix may answer "run outside the sandbox" (#470).
+                // A sandbox escalation is always shown: no permission rule may
+                // answer "run outside the sandbox" (#470).
                 if pending.request.tool_name == claurst_tools::sandbox::SANDBOX_ESCALATION_TOOL {
                     let tool_use_id = pending.tool_use_id.clone();
                     app.permission_request = Some(permission_request_from_core(&pending));
@@ -3446,31 +3484,21 @@ async fn run_interactive(
                     break;
                 }
 
-                let prefix_allowed = pending.request.tool_name == "Bash"
-                    && pending
-                        .request
-                        .path
-                        .as_deref()
-                        .map(|command| app.bash_command_allowed_by_prefix(command))
-                        .unwrap_or(false);
-
-                let reevaluated = if prefix_allowed {
-                    Some(claurst_core::permissions::PermissionDecision::Allow)
-                } else {
-                    tool_ctx
-                        .permission_manager
-                        .as_ref()
-                        .and_then(|manager| manager.lock().ok())
-                        .map(|manager| {
-                            manager.evaluate(
-                                &pending.request.tool_name,
-                                &pending.request.description,
-                                pending.request.path.as_deref(),
-                                pending.request.working_dir.as_deref(),
-                                &pending.request.allowed_roots,
-                            )
-                        })
-                };
+                // Re-evaluate: an approval saved while this request waited
+                // in the queue may cover it now.
+                let reevaluated = tool_ctx
+                    .permission_manager
+                    .as_ref()
+                    .and_then(|manager| manager.lock().ok())
+                    .map(|manager| {
+                        manager.evaluate(
+                            &pending.request.tool_name,
+                            &pending.request.description,
+                            pending.request.path.as_deref(),
+                            pending.request.working_dir.as_deref(),
+                            &pending.request.allowed_roots,
+                        )
+                    });
 
                 match reevaluated {
                     Some(claurst_core::permissions::PermissionDecision::Ask { .. }) | None => {

@@ -836,6 +836,7 @@ pub async fn run_query_loop(
         } else {
             tools
                 .iter()
+                .filter(|t| !tool_ctx.tool_is_disallowed(t.name()))
                 .map(|t| ApiToolDefinition::from(&t.to_definition()))
                 .collect()
         };
@@ -1075,7 +1076,11 @@ pub async fn run_query_loop(
                     // summary turn with no tools so the provider can only emit
                     // text (opencode's `toolChoice:"none"` equivalent).
                     let provider_tools: Vec<claurst_core::types::ToolDefinition> = if caps.tool_calling && !degradation_turn {
-                        tools.iter().map(|t| t.to_definition()).collect()
+                        tools
+                            .iter()
+                            .filter(|t| !tool_ctx.tool_is_disallowed(t.name()))
+                            .map(|t| t.to_definition())
+                            .collect()
                     } else {
                         Vec::new()
                     };
@@ -1502,6 +1507,12 @@ pub async fn run_query_loop(
                             let _ = tx.send(QueryEvent::MessageCommitted(assistant_msg.clone()));
                         }
                         let mut tool_results = Vec::new();
+                        // Reject cascade (#445): once the user denies a call,
+                        // the rest of this turn's calls are not run.
+                        let batch_ctx = ToolContext {
+                            batch_rejection: claurst_tools::BatchRejection::default(),
+                            ..tool_ctx.clone()
+                        };
                         for (tool_id, tool_name, tool_input) in tool_use_blocks {
                             // Notify TUI that a tool is starting (matches Anthropic path).
                             if let Some(ref tx) = event_tx {
@@ -1516,8 +1527,10 @@ pub async fn run_query_loop(
                                 // be parsed — return an error the model can see
                                 // and recover from (issues #215, #439).
                                 invalid_tool_input_result(&tool_name, err)
+                            } else if batch_ctx.batch_rejection.is_rejected() {
+                                ToolResult::error(claurst_tools::BATCH_REJECTED_MSG)
                             } else {
-                                run_tool_with_hooks(&tool_name, tool_input, tools, tool_ctx).await
+                                run_tool_with_hooks(&tool_name, tool_input, tools, &batch_ctx).await
                             };
                             if let Some(ref tx) = event_tx {
                                 let _ = tx.send(QueryEvent::ToolEnd {
@@ -2065,6 +2078,18 @@ pub async fn run_query_loop(
                     call: PreToolUse,
                 }
 
+                // Reject cascade (#445): the batch gets a fresh `BatchRejection`.
+                // When the user denies one call, the calls that have not
+                // started yet return an error instead of running, and calls
+                // that would prompt are rejected without asking. join_all
+                // polls in order and a prompt blocks the task until answered,
+                // so the calls after a prompted one have not started by then.
+                let batch_ctx = ToolContext {
+                    batch_rejection: claurst_tools::BatchRejection::default(),
+                    ..tool_ctx.clone()
+                };
+                let batch_ctx = &batch_ctx;
+
                 // Phase 1: sequential pre-hook pass.
                 let mut prepared: Vec<PreparedTool> = Vec::with_capacity(tool_blocks.len());
                 for block in tool_blocks {
@@ -2082,7 +2107,7 @@ pub async fn run_query_loop(
                         let call = if let Some(err) = invalid_tool_inputs.get(id) {
                             PreToolUse::Blocked(invalid_tool_input_result(name, err))
                         } else {
-                            pre_tool_use(name, input.clone(), tool_ctx).await
+                            pre_tool_use(name, input.clone(), batch_ctx).await
                         };
                         prepared.push(PreparedTool { id: id.clone(), name: name.clone(), call });
                     }
@@ -2091,17 +2116,20 @@ pub async fn run_query_loop(
                 // Phase 2: build execution futures for non-blocked tools and join them.
                 // Blocked tools yield a ready future with their error result.
                 // A call a hook allowed runs with that call's permission context.
+                // Every context of the batch shares `batch_ctx.batch_rejection`
+                // (hook contexts are clones of it), so a denial anywhere in the
+                // batch rejects the calls that have not started yet.
                 let exec_futures: Vec<_> = prepared
                     .iter()
                     .map(|p| match &p.call {
                         PreToolUse::Blocked(result) => {
                             futures::future::Either::Left(std::future::ready(result.clone()))
                         }
-                        PreToolUse::Run { input, ctx } => futures::future::Either::Right(execute_tool(
+                        PreToolUse::Run { input, ctx } => futures::future::Either::Right(execute_batch_call(
                             &p.name,
                             input,
                             tools,
-                            ctx.as_deref().unwrap_or(tool_ctx),
+                            ctx.as_deref().unwrap_or(batch_ctx),
                         )),
                     })
                     .collect();
@@ -2734,6 +2762,7 @@ mod tests {
             permission_manager: None,
             user_question_tx: None,
             cancel_token: tokio_util::sync::CancellationToken::new(),
+            batch_rejection: Default::default(),
         }
     }
 
@@ -2814,6 +2843,114 @@ mod tests {
                 level
             );
         }
+    }
+
+    /// #445: a tool covered by `disallowed_tools` is refused before it runs,
+    /// even a read-only one the central backstop would not gate.
+    #[tokio::test]
+    async fn disallowed_tool_is_refused_before_running() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockTool {
+            name: "MockSafe",
+            level: PermissionLevel::ReadOnly,
+            self_gates: false,
+            ran: ran.clone(),
+        })];
+        let mut manager = claurst_core::permissions::PermissionManager::new(
+            claurst_core::config::PermissionMode::BypassPermissions,
+            &claurst_core::config::Settings::default(),
+        );
+        manager.sync_config(&claurst_core::config::Config {
+            permission_mode: claurst_core::config::PermissionMode::BypassPermissions,
+            disallowed_tools: vec!["MockSafe".to_string()],
+            ..Default::default()
+        });
+        let ctx = ToolContext {
+            permission_manager: Some(Arc::new(std::sync::Mutex::new(manager))),
+            ..deny_all_context()
+        };
+
+        assert!(ctx.tool_is_disallowed("MockSafe"));
+        let result = execute_tool("MockSafe", &serde_json::json!({}), &tools, &ctx).await;
+        assert!(result.is_error);
+        assert!(result.content.contains("disallowed"), "{}", result.content);
+        assert!(!ran.load(AtomicOrdering::SeqCst), "a disallowed tool must not run");
+    }
+
+    /// #445: when the user denies a call in a parallel batch with a reason,
+    /// the reason reaches the model and the batch's remaining calls are
+    /// rejected instead of run.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn user_denial_rejects_the_rest_of_the_batch() {
+        let queue = Arc::new(parking_lot::Mutex::new(
+            claurst_tools::PendingPermissionStore::default(),
+        ));
+        // Answer the first prompt as the TUI does when the user types a
+        // reason and denies.
+        let responder_queue = queue.clone();
+        let responder = std::thread::spawn(move || loop {
+            let next = responder_queue.lock().queue.pop_front();
+            if let Some(mut pending) = next {
+                if let Some(tx) = pending.decision_tx.take() {
+                    let _ = tx.send(claurst_core::permissions::PermissionDecision::DenyWithFeedback(
+                        "use cargo check instead".to_string(),
+                    ));
+                }
+                return pending.request.tool_name;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        });
+
+        let asked_ran = Arc::new(AtomicBool::new(false));
+        let later_ran = Arc::new(AtomicBool::new(false));
+        let tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(MockTool {
+                name: "MockExec",
+                level: PermissionLevel::Execute,
+                self_gates: false,
+                ran: asked_ran.clone(),
+            }),
+            Box::new(MockTool {
+                name: "MockSafe",
+                level: PermissionLevel::ReadOnly,
+                self_gates: false,
+                ran: later_ran.clone(),
+            }),
+        ];
+        let ctx = ToolContext {
+            non_interactive: false,
+            pending_permissions: Some(queue),
+            ..deny_all_context()
+        };
+        let input = serde_json::json!({});
+        let batch = vec![
+            execute_batch_call("MockExec", &input, &tools, &ctx),
+            execute_batch_call("MockSafe", &input, &tools, &ctx),
+        ];
+        let (results, cancelled) = run_tool_batch(batch, &ctx.cancel_token).await;
+
+        assert_eq!(responder.join().unwrap(), "MockExec");
+        assert!(!cancelled);
+        assert!(results[0].is_error);
+        assert!(
+            results[0].content.contains("The user said: use cargo check instead"),
+            "{}",
+            results[0].content
+        );
+        assert!(!asked_ran.load(AtomicOrdering::SeqCst));
+        assert!(results[1].is_error);
+        assert_eq!(results[1].content, claurst_tools::BATCH_REJECTED_MSG);
+        assert!(!later_ran.load(AtomicOrdering::SeqCst), "a call after the denial must not run");
+        assert!(ctx.batch_rejection.is_rejected());
+
+        // A fresh batch runs normally again.
+        let fresh = ToolContext {
+            batch_rejection: claurst_tools::BatchRejection::default(),
+            ..ctx.clone()
+        };
+        let result = execute_batch_call("MockSafe", &input, &tools, &fresh).await;
+        assert!(!result.is_error);
+        assert!(later_ran.load(AtomicOrdering::SeqCst));
     }
 
     #[test]
@@ -4751,6 +4888,7 @@ mod hook_loop_tests {
             permission_manager: None,
             user_question_tx: None,
             cancel_token: tokio_util::sync::CancellationToken::new(),
+            batch_rejection: Default::default(),
         };
 
         let query_config = QueryConfig {

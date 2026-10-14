@@ -576,13 +576,6 @@ pub struct App {
     /// Timestamp of the last scroll event (for burst detection).
     scroll_last_time: Option<std::time::Instant>,
 
-    // ---- Bash prefix allowlist -------------------------------------------
-    /// Command prefixes that have been permanently allowed this session via
-    /// the "Allow commands starting with X" option in the bash permission dialog.
-    /// Before showing the dialog for a bash command, the first whitespace-delimited
-    /// word is checked against this set; a match silently auto-approves the request.
-    pub bash_prefix_allowlist: std::collections::HashSet<String>,
-
     // ---- Auto-update notification ----------------------------------------
     /// If a newer version was found during background update check, this holds
     /// the latest version string (e.g. "0.1.0"). Shown in the footer status bar.
@@ -862,7 +855,6 @@ impl App {
             context_menu_state: None,
             scroll_accel: 3.0,
             scroll_last_time: None,
-            bash_prefix_allowlist: std::collections::HashSet::new(),
             update_available: None,
             managed_agent_cost_breakdown: None,
             managed_agents_active: false,

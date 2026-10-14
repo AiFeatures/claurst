@@ -764,7 +764,7 @@ const PERMISSIONS_SECTION: &str = r#"
 Tool calls that change files, run commands or reach the network may need the user's approval, depending on the current permission mode (stated after these instructions). Reading files inside the workspace never needs approval.
 - Every Bash call's `description` is shown to the user as the approval question. Write it as a short question the user can answer, e.g. "Install the project's npm dependencies?", not a restatement of the command.
 - If a tool call is denied, do not retry it with a different wrapper, shell, or path. Either continue with a safer alternative that does not need the denied capability, or explain what was blocked and ask the user.
-- A saved approval covers a tool and, for Bash, a pattern over the command text; it can cover more than the one command in front of you, so ask only for narrow ones.
+- A saved approval covers a tool and, for Bash, a per-command pattern (`git status *`), matched against every command of a compound line; it can cover more than the one command in front of you, so ask only for narrow ones.
 - Never request or rely on broad standing approvals (e.g. "always allow Bash"). Prefer narrow, categorical ones ("cargo test", "npm run dev"). Never ask for a standing approval for destructive commands.
 - Potentially destructive actions the user did not explicitly ask for (`rm`, `git reset`, `git checkout --`, dropping data) need a fresh, explicit confirmation from the user, even in a mode that does not prompt.
 - Bash commands rated critical risk (e.g. `rm -rf /`, `mkfs`, a download piped into a shell) are refused in every mode.
@@ -811,9 +811,10 @@ fn permission_mode_sentence(mode: &crate::config::PermissionMode) -> &'static st
              they are denied)."
         }
         PermissionMode::AcceptEdits => {
-            "Current permission mode: `acceptEdits`. Edit calls are approved automatically; \
-             writes, shell commands and network access still ask the user first unless a \
-             saved approval covers them."
+            "Current permission mode: `acceptEdits`. Edits and writes (Edit, Write, \
+             NotebookEdit, BatchEdit, ApplyPatch) to files inside the workspace are approved \
+             automatically; targets outside the workspace, shell commands and network access \
+             still ask unless a saved approval covers them."
         }
         PermissionMode::Plan => {
             "Current permission mode: `plan`. Read-only: investigate and propose a plan; \
@@ -821,7 +822,8 @@ fn permission_mode_sentence(mode: &crate::config::PermissionMode) -> &'static st
         }
         PermissionMode::BypassPermissions => {
             "Current permission mode: `bypassPermissions`. Tool calls run without approval \
-             prompts, so exercise the caution the user has delegated to you."
+             prompts, so exercise the caution the user has delegated to you, except calls \
+             covered by a deny rule (`disallowed_tools`), which are refused in every mode."
         }
     }
 }
