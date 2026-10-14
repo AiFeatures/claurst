@@ -3959,6 +3959,37 @@ pub mod history {
         pub snapshot: Vec<Message>,
     }
 
+    /// What started a compaction of the session history.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum CompactionTrigger {
+        /// The projected context crossed the auto-compact threshold.
+        Threshold,
+        /// The provider rejected a request for exceeding the context window.
+        Overflow,
+        /// The user ran `/compact`.
+        Manual,
+    }
+
+    /// One compaction of the session history (issue #441). The head of the
+    /// history was replaced by the summary message whose uuid is
+    /// `summary_uuid`; this entry records when, why and how much it saved.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct CompactionRecord {
+        pub at: chrono::DateTime<chrono::Utc>,
+        pub trigger: CompactionTrigger,
+        /// uuid of the summary message now at the head of the history.
+        pub summary_uuid: String,
+        pub messages_before: usize,
+        pub messages_after: usize,
+        /// Estimated context tokens before and after (chars / 4 heuristic).
+        pub tokens_before: u64,
+        pub tokens_after: u64,
+        /// `false` when the summariser failed and the head was dropped to
+        /// recover from a context-window error, keeping only the untouched tail.
+        pub summarised: bool,
+    }
+
     /// A single persisted conversation session.
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct ConversationSession {
@@ -3996,6 +4027,9 @@ pub mod history {
         /// Message index in the parent session at which this fork was created.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub fork_point_message_index: Option<usize>,
+        /// Compactions applied to `messages`, oldest first.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub compactions: Vec<CompactionRecord>,
     }
 
     impl ConversationSession {
@@ -4018,6 +4052,7 @@ pub mod history {
                 checkpoints: vec![],
                 parent_session_id: None,
                 fork_point_message_index: None,
+                compactions: vec![],
             }
         }
 
@@ -4199,6 +4234,7 @@ pub mod history {
             checkpoints: vec![],
             parent_session_id: None,
             fork_point_message_index: None,
+            compactions: vec![],
         };
         save_session(&branched).await?;
         Ok(branched)

@@ -359,7 +359,7 @@ impl Tool for AgentTool {
             working_directory: Some(working_dir_str),
             thinking_budget: None,
             temperature: None,
-            tool_result_budget: 50_000,
+            tool_result_max_bytes: crate::DEFAULT_TOOL_RESULT_MAX_BYTES,
             effort_level: None,
             command_queue: None,
             skill_index: None,
@@ -377,6 +377,7 @@ impl Tool for AgentTool {
             // continuation — stop after one turn like every non-goal run.
             continuation: crate::continuation::ContinuationMode::Default,
             degradation_enabled: ctx.config.degradation_summary_enabled_or_default(),
+            auto_compact: true,
         };
         // -----------------------------------------------------------------------
         // Background mode: spawn and return agent_id immediately.

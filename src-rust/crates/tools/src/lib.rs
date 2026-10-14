@@ -163,19 +163,6 @@ impl ToolResult {
         self.images = images;
         self
     }
-
-    /// The tool-result payload for the model: plain text, or the text
-    /// followed by the image blocks.
-    pub fn into_model_content(self) -> claurst_core::types::ToolResultContent {
-        use claurst_core::types::{ContentBlock, ToolResultContent};
-        if self.images.is_empty() {
-            return ToolResultContent::Text(self.content);
-        }
-        let mut blocks = Vec::with_capacity(self.images.len() + 1);
-        blocks.push(ContentBlock::Text { text: self.content });
-        blocks.extend(self.images);
-        ToolResultContent::Blocks(blocks)
-    }
 }
 
 /// Permission level required by a tool.

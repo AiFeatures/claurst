@@ -561,7 +561,9 @@ pub mod client {
         }
     }
 
-    /// The main Anthropic API client.
+    /// The main Anthropic API client. Cloning is cheap: the HTTP client is
+    /// reference-counted and the clone keeps the same session id.
+    #[derive(Clone)]
     pub struct AnthropicClient {
         http: wreq::Client,
         config: ClientConfig,
