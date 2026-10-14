@@ -180,6 +180,14 @@ impl App {
         ) {
             self.retry_status = None;
         }
+        // A finished, failed or retried request closes its tok/s window.
+        if matches!(
+            event,
+            QueryEvent::TurnComplete { .. } | QueryEvent::Error(_) | QueryEvent::Retry { .. }
+        ) {
+            self.request_output_started = None;
+            self.request_output_bytes = 0;
+        }
 
         match event {
             QueryEvent::Stream(stream_evt) => {
@@ -202,11 +210,13 @@ impl App {
                         self.stall_start = None;
                         match delta {
                             claurst_api::streaming::ContentDelta::TextDelta { text } => {
+                                self.note_request_output(text.len());
                                 self.streaming_text.push_str(&text);
                                 self.invalidate_transcript();
                             }
                             claurst_api::streaming::ContentDelta::ThinkingDelta { thinking } => {
                                 debug!(len = thinking.len(), "Thinking delta received");
+                                self.note_request_output(thinking.len());
                                 self.streaming_thinking.push_str(&thinking);
                                 self.invalidate_transcript();
                             }

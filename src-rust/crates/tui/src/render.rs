@@ -2521,6 +2521,17 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             ));
         }
 
+        // Output rate of the streaming request (#444).
+        if let Some(rate) = app.stream_tokens_per_sec() {
+            if !spans.is_empty() {
+                spans.push(Span::raw("  "));
+            }
+            spans.push(Span::styled(
+                format!("~{rate:.0} tok/s"),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+
         // Agent type badge (shown when running as subagent / coordinator)
         if let Some(ref badge) = app.agent_type_badge {
             if !spans.is_empty() {
@@ -4226,6 +4237,37 @@ mod status_line_tests {
             "footer: {:?}",
             rows(&terminal)[0]
         );
+    }
+
+    #[test]
+    fn footer_shows_tokens_per_second_while_streaming() {
+        let mut app = App::new(Config::default(), CostTracker::new());
+        let mut terminal = Terminal::new(TestBackend::new(120, 1)).unwrap();
+        app.is_streaming = true;
+        app.request_output_bytes = 800;
+        // Under half a second the rate is noise and stays hidden.
+        app.request_output_started = Some(std::time::Instant::now());
+        terminal.draw(|f| render_footer(f, &app, f.area())).unwrap();
+        assert!(!rows(&terminal)[0].contains("tok/s"));
+
+        // 800 bytes ~ 200 tokens over ~2 s.
+        app.request_output_started =
+            std::time::Instant::now().checked_sub(std::time::Duration::from_secs(2));
+        let rate = app.stream_tokens_per_sec().expect("rate while streaming");
+        assert!((95.0..=100.0).contains(&rate), "{rate}");
+        terminal.draw(|f| render_footer(f, &app, f.area())).unwrap();
+        assert!(rows(&terminal)[0].contains(" tok/s"), "{:?}", rows(&terminal)[0]);
+
+        // The request ends: the window closes and the rate disappears.
+        app.handle_query_event(claurst_query::QueryEvent::TurnComplete {
+            turn: 1,
+            stop_reason: "end_turn".to_string(),
+            usage: None,
+        });
+        assert_eq!(app.request_output_bytes, 0);
+        assert!(app.stream_tokens_per_sec().is_none());
+        terminal.draw(|f| render_footer(f, &app, f.area())).unwrap();
+        assert!(!rows(&terminal)[0].contains("tok/s"));
     }
 
     #[test]

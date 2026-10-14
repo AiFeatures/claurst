@@ -94,6 +94,24 @@ impl App {
         }
     }
 
+    /// Count streamed output toward the current request's tok/s.
+    pub(super) fn note_request_output(&mut self, bytes: usize) {
+        self.request_output_started.get_or_insert_with(std::time::Instant::now);
+        self.request_output_bytes += bytes;
+    }
+
+    /// Output rate of the request streaming now, in approximate tokens per
+    /// second (about four bytes per token). `None` while idle or during the
+    /// first half second, when the figure is mostly noise.
+    pub fn stream_tokens_per_sec(&self) -> Option<f64> {
+        if !self.is_streaming {
+            return None;
+        }
+        let elapsed = self.request_output_started?.elapsed().as_secs_f64();
+        (elapsed >= 0.5 && self.request_output_bytes > 0)
+            .then(|| self.request_output_bytes as f64 / 4.0 / elapsed)
+    }
+
     /// Whether a turn is running: the model is streaming, or the query task
     /// is between requests (tools running, retry back-off).
     pub(super) fn turn_running(&self) -> bool {
@@ -109,6 +127,8 @@ impl App {
         self.spinner_verb = None;
         self.stall_start = None;
         self.retry_status = None;
+        self.request_output_started = None;
+        self.request_output_bytes = 0;
         self.flush_streamed_assistant_message();
         self.tool_use_blocks.retain(|b| b.status != super::types::ToolStatus::Running);
         self.status_message = Some("Cancelled.".to_string());

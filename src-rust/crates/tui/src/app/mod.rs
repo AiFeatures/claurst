@@ -451,6 +451,11 @@ pub struct App {
     /// Unlike `is_streaming` it stays true between model requests while
     /// tools run and during retry back-off.
     pub query_in_flight: bool,
+    /// When the current model request produced its first output delta;
+    /// `None` between requests. Drives the footer's tok/s (#444).
+    pub request_output_started: Option<std::time::Instant>,
+    /// Bytes of text and thinking streamed by the current request.
+    pub request_output_bytes: usize,
     /// Set when the user interrupts the turn (Esc / Ctrl+C); the interactive
     /// loop takes it and cancels the turn's token (#444).
     pub cancel_requested: bool,
@@ -783,6 +788,8 @@ impl App {
             background_task_count: 0,
             retry_status: None,
             query_in_flight: false,
+            request_output_started: None,
+            request_output_bytes: 0,
             cancel_requested: false,
             background_task_status: None,
             status_line_override: None,
