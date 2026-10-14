@@ -621,11 +621,13 @@ pub async fn run_query_loop(
                     }
                     if degradation_turn {
                         // The retried turn re-injects the summary request.
+                        // Messages drained after the injection (pending /
+                        // command queue) may follow it, so search backwards.
                         degradation_done = false;
-                        if messages.last().is_some_and(|m| {
+                        if let Some(idx) = messages.iter().rposition(|m| {
                             m.role == Role::User && m.get_all_text() == MAX_STEPS_DEGRADATION_MSG
                         }) {
-                            messages.pop();
+                            messages.remove(idx);
                         }
                     }
                     turn -= 1;
@@ -3651,6 +3653,18 @@ mod tests {
         max_retries: u32,
         tools: Vec<Box<dyn Tool>>,
     ) -> ScriptedRun {
+        drive_scripted_with(steps, max_retries, tools, None, Vec::new()).await
+    }
+
+    /// [`drive_scripted`] with an explicit turn cap and queued user messages
+    /// (drained by the loop at the top of each turn).
+    async fn drive_scripted_with(
+        steps: Vec<ScriptStep>,
+        max_retries: u32,
+        tools: Vec<Box<dyn Tool>>,
+        max_turns: Option<u32>,
+        mut pending: Vec<String>,
+    ) -> ScriptedRun {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let provider = Arc::new(ScriptedProvider {
             id: claurst_core::provider_id::ProviderId::new("scriptprov"),
@@ -3678,6 +3692,9 @@ mod tests {
             initial_delay: std::time::Duration::from_millis(1),
             ..claurst_api::RetryConfig::default()
         };
+        if let Some(max_turns) = max_turns {
+            config.max_turns = max_turns;
+        }
 
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut messages = vec![Message::user("start")];
@@ -3692,7 +3709,7 @@ mod tests {
                 claurst_core::cost::CostTracker::new(),
                 Some(tx),
                 tokio_util::sync::CancellationToken::new(),
-                None,
+                Some(&mut pending),
             ),
         )
         .await
@@ -3917,5 +3934,28 @@ mod tests {
             text.contains("invalid JSON input for tool noop_tool"),
             "the model must see why: {text}"
         );
+    }
+
+    #[tokio::test]
+    async fn retried_degradation_turn_injects_the_summary_prompt_once() {
+        // max_turns = 0 makes the first turn the tool-less summary turn. A
+        // queued message drained after the injection sits after the prompt;
+        // the retry must still remove it before re-injecting.
+        let run = drive_scripted_with(
+            vec![ScriptStep::Fail(server_error(503))],
+            5,
+            noop_tools(),
+            Some(0),
+            vec!["typed during the attempt".to_string()],
+        )
+        .await;
+        assert!(matches!(run.outcome, QueryOutcome::EndTurn { .. }));
+        assert_eq!(run.calls, 2);
+        let prompts = run
+            .messages
+            .iter()
+            .filter(|m| m.get_all_text() == MAX_STEPS_DEGRADATION_MSG)
+            .count();
+        assert_eq!(prompts, 1, "summary prompt must appear exactly once");
     }
 }

@@ -662,6 +662,7 @@ async fn main() -> anyhow::Result<()> {
         api_key: api_key.clone(),
         api_base: config.resolve_anthropic_api_base(),
         use_bearer_auth,
+        retry: claurst_api::RetryConfig::with_max_retries(config.max_retries),
         ..Default::default()
     };
     let client = Arc::new(
@@ -1378,6 +1379,7 @@ async fn refresh_provider_runtime_state(
         api_key,
         api_base: config.resolve_anthropic_api_base(),
         use_bearer_auth,
+        retry: claurst_api::RetryConfig::with_max_retries(config.max_retries),
         ..Default::default()
     };
     let client = Arc::new(
@@ -1423,6 +1425,7 @@ async fn reload_provider_runtime_state(
         api_key,
         api_base: config.resolve_anthropic_api_base(),
         use_bearer_auth,
+        retry: claurst_api::RetryConfig::with_max_retries(config.max_retries),
         ..Default::default()
     };
     let client = Arc::new(

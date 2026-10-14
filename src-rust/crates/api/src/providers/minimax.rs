@@ -386,22 +386,20 @@ impl LlmProvider for MinimaxProvider {
                                     }
                                 }
                                 Err(e) => {
-                                    yield Err(ProviderError::Other {
+                                    yield Err(ProviderError::StreamError {
                                         provider: provider_id_inner.clone(),
                                         message: format!("Failed to parse event: {}", e),
-                                        status: None,
-                                        body: None,
+                                        partial_response: None,
                                     });
                                 }
                             }
                         }
                     }
                     Err(e) => {
-                        yield Err(ProviderError::Other {
+                        yield Err(ProviderError::StreamError {
                             provider: provider_id_inner.clone(),
                             message: format!("Stream error: {}", e),
-                            status: None,
-                            body: None,
+                            partial_response: None,
                         });
                     }
                 }

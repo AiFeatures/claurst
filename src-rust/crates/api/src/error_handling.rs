@@ -276,10 +276,21 @@ mod tests {
         let pid = ProviderId::new("openai");
         let err = parse_error_response(
             429,
-            r#"{"error":{"message":"You exceeded your current quota, check your billing details"}}"#,
+            r#"{"error":{"code":"insufficient_quota","message":"You exceeded your current quota"}}"#,
             &pid,
         );
         assert!(matches!(err, ProviderError::QuotaExceeded { .. }));
+    }
+
+    #[test]
+    fn test_parse_error_response_throttle_mentioning_billing_is_rate_limit() {
+        let pid = ProviderId::new("google");
+        let err = parse_error_response(
+            429,
+            r#"{"error":{"message":"Resource has been exhausted. Please check your plan and billing details."}}"#,
+            &pid,
+        );
+        assert!(matches!(err, ProviderError::RateLimited { .. }), "{err:?}");
     }
 
     #[test]

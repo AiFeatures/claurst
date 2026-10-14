@@ -163,7 +163,8 @@ const FATAL_PATTERNS: &[&str] = &[
     "quota exceeded",
     "quota_exceeded",
     "out of budget",
-    "billing",
+    "billing_not_active",
+    "billing hard limit",
     "credit balance",
     "usage limit",
     "usagelimiterror",
@@ -441,6 +442,16 @@ mod tests {
         };
         assert_eq!(classify_claude_error(&billing_429), RetryDecision::Fail);
         assert!(classify_claude_error(&ClaudeError::Api("connection error: reset".into())).is_retry());
+        // Transient per-minute 429s often link to a billing page; they must
+        // still be retried (Groq / OpenAI free tier / Gemini wording).
+        for msg in [
+            "Rate limit reached for model in organization on tokens per minute (TPM). Upgrade to Dev Tier at https://console.groq.com/settings/billing",
+            "Rate limit reached for requests. Visit https://platform.openai.com/account/billing to add a payment method",
+            "Resource has been exhausted. Please check your plan and billing details.",
+        ] {
+            let throttled = ClaudeError::ApiStatus { status: 429, message: msg.into(), retry_after: None };
+            assert!(classify_claude_error(&throttled).is_retry(), "{msg}");
+        }
     }
 
     #[test]

@@ -948,12 +948,25 @@ fn parse_bedrock_event(
         return events;
     }
 
-    // internalServerException / throttlingException
+    // validationException: the request itself is invalid; never retried.
+    if let Some(err) = val.get("validationException") {
+        let message = err
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Unknown Bedrock validation error")
+            .to_string();
+        events.push(Err(ProviderError::InvalidRequest {
+            provider: provider_id.clone(),
+            message,
+        }));
+        return events;
+    }
+
+    // internalServerException / throttlingException / modelStreamErrorException
     if let Some(err) = val
         .get("internalServerException")
         .or_else(|| val.get("throttlingException"))
         .or_else(|| val.get("modelStreamErrorException"))
-        .or_else(|| val.get("validationException"))
     {
         let message = err
             .get("message")
