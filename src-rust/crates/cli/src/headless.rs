@@ -22,6 +22,7 @@ use claurst_core::types::{ContentBlock, Message, MessageContent, Role};
 use claurst_query::{QueryEvent, QueryOutcome};
 use serde::Serialize;
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
 
@@ -84,6 +85,9 @@ pub(crate) struct RunResult {
     pub duration_ms: u64,
     pub total_cost_usd: f64,
     pub usage: ResultUsage,
+    /// Input of the accepted StructuredOutput call (`--json-schema` runs).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub structured_output: Option<serde_json::Value>,
 }
 
 /// A message as carried by `assistant` / `user` events.
@@ -160,6 +164,10 @@ pub(crate) struct HeadlessSink<W: Write, E: Write> {
     printed_text: bool,
     max_turns: Option<u32>,
     compactions: Vec<CompactionRecord>,
+    /// Inputs of StructuredOutput calls awaiting their tool result, by id.
+    pending_structured: HashMap<String, serde_json::Value>,
+    /// Input of the last StructuredOutput call the tool accepted.
+    structured_output: Option<serde_json::Value>,
 }
 
 impl<W: Write, E: Write> HeadlessSink<W, E> {
@@ -174,6 +182,8 @@ impl<W: Write, E: Write> HeadlessSink<W, E> {
             printed_text: false,
             max_turns: None,
             compactions: Vec::new(),
+            pending_structured: HashMap::new(),
+            structured_output: None,
         }
     }
 
@@ -244,6 +254,7 @@ impl<W: Write, E: Write> HeadlessSink<W, E> {
     }
 
     fn on_message(&mut self, message: &Message) -> std::io::Result<()> {
+        self.track_structured_output(message);
         if message.role == Role::Assistant {
             self.num_turns += 1;
             self.last_assistant_text = message.get_all_text();
@@ -266,6 +277,31 @@ impl<W: Write, E: Write> HeadlessSink<W, E> {
             Role::User => HeadlessEvent::User { message: event_message, session_id },
         };
         write_event(&mut self.out, &event)
+    }
+
+    /// Capture a StructuredOutput call's input once its tool result shows the
+    /// tool accepted it (a schema mismatch comes back as an error result).
+    fn track_structured_output(&mut self, message: &Message) {
+        let MessageContent::Blocks(blocks) = &message.content else {
+            return;
+        };
+        for block in blocks {
+            match block {
+                ContentBlock::ToolUse { id, name, input, .. }
+                    if name == claurst_tools::SyntheticOutputTool::NAME =>
+                {
+                    self.pending_structured.insert(id.clone(), input.clone());
+                }
+                ContentBlock::ToolResult { tool_use_id, is_error, .. } => {
+                    if let Some(input) = self.pending_structured.remove(tool_use_id) {
+                        if *is_error != Some(true) {
+                            self.structured_output = Some(input);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Build the result for `outcome`. Usage and cost are the run totals.
@@ -292,6 +328,7 @@ impl<W: Write, E: Write> HeadlessSink<W, E> {
                 cache_creation_input_tokens: cost_tracker.cache_creation_tokens(),
                 cache_read_input_tokens: cost_tracker.cache_read_tokens(),
             },
+            structured_output: self.structured_output.clone(),
         }
     }
 
@@ -354,6 +391,21 @@ fn classify(outcome: &QueryOutcome, max_turns: Option<u32>) -> (ResultSubtype, &
         QueryOutcome::Cancelled => (ResultSubtype::Cancelled, "cancelled", None),
         QueryOutcome::Error(e) => (ResultSubtype::ErrorDuringExecution, "error", Some(e.to_string())),
     }
+}
+
+/// Build the StructuredOutput tool from `--json-schema`: inline JSON when the
+/// value starts with `{`, otherwise the path of a JSON file.
+pub(crate) fn structured_output_tool(raw: &str) -> anyhow::Result<claurst_tools::SyntheticOutputTool> {
+    use anyhow::Context;
+
+    let text = if raw.trim_start().starts_with('{') {
+        Cow::Borrowed(raw)
+    } else {
+        Cow::Owned(std::fs::read_to_string(raw).with_context(|| format!("could not read {}", raw))?)
+    };
+    let schema: serde_json::Value =
+        serde_json::from_str(&text).context("the schema is not valid JSON")?;
+    claurst_tools::SyntheticOutputTool::new(schema).map_err(anyhow::Error::msg)
 }
 
 /// Which saved session a headless run continues.
@@ -1079,5 +1131,51 @@ mod tests {
         assert_eq!(events.last().unwrap()["subtype"], "success", "the run continues to its end");
         assert_eq!(run.result.result, "final answer");
         let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[tokio::test]
+    async fn json_schema_output_is_captured_in_the_result() {
+        let schema = r#"{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"]}"#;
+        let tool = structured_output_tool(schema).unwrap();
+        let run = run(
+            CliOutputFormat::StreamJson,
+            vec![
+                // Rejected by the schema: not captured, the model retries.
+                Step::Stream(tool_turn("call-bad", "StructuredOutput", r#"{"answer":42}"#)),
+                Step::Stream(tool_turn("call-ok", "StructuredOutput", r#"{"answer":"42"}"#)),
+            ],
+            vec![Box::new(tool)],
+        )
+        .await;
+        let events = lines(&run.stdout);
+        assert_eq!(events[2]["message"]["content"][0]["is_error"], true, "{}", run.stdout);
+        let result = events.last().unwrap();
+        assert_eq!(result["subtype"], "success");
+        assert_eq!(result["structured_output"], serde_json::json!({"answer": "42"}));
+    }
+
+    #[tokio::test]
+    async fn without_json_schema_the_result_has_no_structured_output() {
+        let run = run(CliOutputFormat::Json, Vec::new(), Vec::new()).await;
+        assert!(lines(&run.stdout)[0].get("structured_output").is_none());
+    }
+
+    #[test]
+    fn json_schema_accepts_inline_json_or_a_file_and_needs_an_object_schema() {
+        assert!(structured_output_tool(r#"{"type":"object"}"#).is_ok());
+        assert!(structured_output_tool(r#"{"type":"array"}"#).is_err());
+        assert!(structured_output_tool("{not json").is_err());
+
+        let path = std::env::temp_dir().join(format!("claurst-schema-{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(&path, r#"{"type":"object","properties":{}}"#).unwrap();
+        let tool = structured_output_tool(&path.display().to_string()).unwrap();
+        assert_eq!(claurst_tools::Tool::name(&tool), "StructuredOutput");
+        let _ = std::fs::remove_file(&path);
+        assert!(structured_output_tool("/no/such/schema.json").is_err());
+    }
+
+    #[test]
+    fn structured_output_is_not_a_default_tool() {
+        assert!(claurst_tools::all_tools().iter().all(|t| t.name() != "StructuredOutput"));
     }
 }

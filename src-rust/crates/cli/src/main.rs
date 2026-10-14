@@ -102,6 +102,11 @@ struct Cli {
     #[arg(long = "output-format", value_enum, default_value_t = CliOutputFormat::Text)]
     output_format: CliOutputFormat,
 
+    /// JSON Schema (inline JSON or a file path) for a structured final answer:
+    /// adds the StructuredOutput tool and reports its input as `structured_output`
+    #[arg(long = "json-schema", value_name = "FILE|JSON")]
+    json_schema: Option<String>,
+
     /// Enable verbose logging
     #[arg(long = "verbose", short = 'v', action = ArgAction::SetTrue)]
     verbose: bool,
@@ -544,6 +549,13 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // --json-schema: validated up front so a bad schema fails before any work.
+    let structured_output_tool = match cli.json_schema.as_deref() {
+        None => None,
+        Some(_) if !is_headless => anyhow::bail!("--json-schema requires --print"),
+        Some(raw) => Some(headless::structured_output_tool(raw).context("invalid --json-schema")?),
+    };
+
     // Build context
     let ctx_builder = ContextBuilder::new(cwd.clone())
         .disable_claude_mds(config.disable_claude_mds);
@@ -844,6 +856,17 @@ async fn main() -> anyhow::Result<()> {
         }
     } else {
         tools
+    };
+    // StructuredOutput is offered only with --json-schema. The list was built
+    // above and has no other owner yet.
+    let tools = match structured_output_tool {
+        Some(tool) => {
+            let mut list = Arc::try_unwrap(tools)
+                .map_err(|_| anyhow::anyhow!("the tool list is already shared"))?;
+            list.push(Box::new(tool));
+            Arc::new(list)
+        }
+        None => tools,
     };
 
     // Spawn the background cron scheduler (fires cron tasks at scheduled times).

@@ -967,7 +967,7 @@ pub fn all_tools() -> Vec<Box<dyn Tool>> {
         Box::new(ReplTool),
         Box::new(TeamCreateTool),
         Box::new(TeamDeleteTool),
-        Box::new(SyntheticOutputTool),
+        // SyntheticOutputTool (StructuredOutput) is added only with --json-schema.
         Box::new(McpAuthTool),
         Box::new(RemoteTriggerTool),
         Box::new(MonitorTool),
