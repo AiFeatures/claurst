@@ -4738,6 +4738,7 @@ mod hook_loop_tests {
             permission_manager: None,
             user_question_tx: None,
             cancel_token: tokio_util::sync::CancellationToken::new(),
+            batch_rejection: Default::default(),
         };
 
         let query_config = QueryConfig {
