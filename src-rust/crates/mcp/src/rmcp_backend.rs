@@ -1,5 +1,6 @@
 use crate::backend::{McpBackendKind, McpClientBackend, McpClientSnapshot};
 use crate::transport;
+use crate::{McpTimeoutError, McpTimeouts};
 use crate::types::{
     CallToolResult, GetPromptResult, McpContent, McpPrompt, McpPromptArgument,
     McpResource, McpTool, PromptMessage, PromptMessageContent, PromptsCapability,
@@ -20,6 +21,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
+use tokio::time::Instant as TokioInstant;
 use tokio_stream::wrappers::ReceiverStream;
 
 /// Lock a `std::sync::Mutex`, recovering from poisoning instead of panicking.
@@ -113,6 +115,8 @@ pub struct RmcpClientBackend {
 impl RmcpClientBackend {
     pub async fn connect_stdio(
         config: &claurst_core::config::McpServerConfig,
+        deadline: TokioInstant,
+        timeouts: McpTimeouts,
     ) -> anyhow::Result<Self> {
         let command = config
             .command
@@ -126,13 +130,15 @@ impl RmcpClientBackend {
         .map_err(|e| anyhow::anyhow!("failed to spawn rmcp stdio child for '{}': {}", config.name, e))?;
 
         let client_info = build_client_info(rmcp_model::ProtocolVersion::default());
-        Self::connect_with_transport(config, transport, client_info, "stdio").await
+        Self::connect_with_transport(config, transport, client_info, "stdio", deadline, timeouts).await
     }
 
     pub async fn connect_http(
         config: &claurst_core::config::McpServerConfig,
         auth_token: Option<String>,
         protocol_version: rmcp_model::ProtocolVersion,
+        deadline: TokioInstant,
+        timeouts: McpTimeouts,
     ) -> anyhow::Result<Self> {
         let endpoint = config
             .url
@@ -146,19 +152,26 @@ impl RmcpClientBackend {
 
         let transport = StreamableHttpClientTransport::from_config(transport_config);
         let client_info = build_client_info(protocol_version);
-        Self::connect_with_transport(config, transport, client_info, "http").await
+        Self::connect_with_transport(config, transport, client_info, "http", deadline, timeouts).await
     }
 
     pub async fn connect_legacy_sse(
         config: &claurst_core::config::McpServerConfig,
         auth_token: Option<String>,
+        deadline: TokioInstant,
+        timeouts: McpTimeouts,
     ) -> anyhow::Result<Self> {
         // Legacy SSE servers still expose the real POST endpoint via
         // `event: endpoint`; keep a thin compatibility shim here and hand the
         // session and capability flow back to rmcp once connected.
-        let transport = LegacySseRmcpTransport::connect(config, auth_token).await?;
+        let transport = tokio::time::timeout_at(
+            deadline,
+            LegacySseRmcpTransport::connect(config, auth_token),
+        )
+        .await
+        .map_err(|_| connect_timeout(config, "opening the SSE stream", timeouts))??;
         let client_info = build_client_info(rmcp_model::ProtocolVersion::V_2024_11_05);
-        Self::connect_with_transport(config, transport, client_info, "sse").await
+        Self::connect_with_transport(config, transport, client_info, "sse", deadline, timeouts).await
     }
 
     async fn connect_with_transport<T, E, A>(
@@ -166,6 +179,8 @@ impl RmcpClientBackend {
         transport: T,
         client_info: rmcp_model::ClientInfo,
         transport_label: &str,
+        deadline: TokioInstant,
+        timeouts: McpTimeouts,
     ) -> anyhow::Result<Self>
     where
         T: rmcp::transport::IntoTransport<RoleClient, E, A>,
@@ -173,17 +188,22 @@ impl RmcpClientBackend {
     {
         let (notifications_tx, notifications_rx) = mpsc::unbounded_channel();
         let handler = RmcpNotificationClient::new(notifications_tx, client_info);
-        let running = handler.serve(transport).await.map_err(|e| {
-            anyhow::anyhow!(
-                "rmcp {} client '{}' failed to initialize: {}",
-                transport_label,
-                config.name,
-                e
-            )
-        })?;
+        // Dropping the pending handshake on timeout drops the transport,
+        // which kills a stdio child process.
+        let running = tokio::time::timeout_at(deadline, handler.serve(transport))
+            .await
+            .map_err(|_| connect_timeout(config, "initialize", timeouts))?
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "rmcp {} client '{}' failed to initialize: {}",
+                    transport_label,
+                    config.name,
+                    e
+                )
+            })?;
 
         let peer = running.peer().clone();
-        let snapshot = build_snapshot(config, &peer).await?;
+        let snapshot = build_snapshot(config, &peer, timeouts.catalog).await?;
 
         Ok(Self {
             snapshot,
@@ -616,9 +636,44 @@ impl McpClientBackend for RmcpClientBackend {
     }
 }
 
+fn connect_timeout(
+    config: &claurst_core::config::McpServerConfig,
+    phase: &'static str,
+    timeouts: McpTimeouts,
+) -> anyhow::Error {
+    McpTimeoutError {
+        server: config.name.clone(),
+        phase,
+        after: timeouts.connect,
+    }
+    .into()
+}
+
+/// Run one catalog request under the catalog timeout.
+async fn catalog_request<T, F>(
+    server: &str,
+    phase: &'static str,
+    catalog_timeout: std::time::Duration,
+    request: F,
+) -> anyhow::Result<T>
+where
+    F: std::future::Future<Output = Result<T, rmcp::ServiceError>>,
+{
+    match tokio::time::timeout(catalog_timeout, request).await {
+        Ok(result) => result.map_err(|e| anyhow::anyhow!("rmcp {} failed: {}", phase, e)),
+        Err(_) => Err(McpTimeoutError {
+            server: server.to_string(),
+            phase,
+            after: catalog_timeout,
+        }
+        .into()),
+    }
+}
+
 async fn build_snapshot(
     config: &claurst_core::config::McpServerConfig,
     peer: &rmcp::Peer<RoleClient>,
+    catalog_timeout: std::time::Duration,
 ) -> anyhow::Result<McpClientSnapshot> {
     let server_info = peer.peer_info().map(|info| (*info).clone());
 
@@ -634,10 +689,12 @@ async fn build_snapshot(
         None => (None, ServerCapabilities::default(), None),
     };
 
+    // Tools are what the server is for, so a failed `tools/list` fails the
+    // connect. Resources and prompts are optional extras: a failure there is
+    // logged and the server stays usable.
     let tools = if capabilities.tools.is_some() {
-        peer.list_all_tools()
-            .await
-            .map_err(|e| anyhow::anyhow!("rmcp list_all_tools failed: {}", e))?
+        catalog_request(&config.name, "tools/list", catalog_timeout, peer.list_all_tools())
+            .await?
             .into_iter()
             .map(convert_tool)
             .collect()
@@ -646,23 +703,25 @@ async fn build_snapshot(
     };
 
     let resources = if capabilities.resources.is_some() {
-        peer.list_all_resources()
-            .await
-            .map_err(|e| anyhow::anyhow!("rmcp list_all_resources failed: {}", e))?
-            .into_iter()
-            .map(convert_resource)
-            .collect()
+        match catalog_request(&config.name, "resources/list", catalog_timeout, peer.list_all_resources()).await {
+            Ok(resources) => resources.into_iter().map(convert_resource).collect(),
+            Err(e) => {
+                tracing::warn!(server = %config.name, error = %e, "MCP resources unavailable");
+                vec![]
+            }
+        }
     } else {
         vec![]
     };
 
     let prompts = if capabilities.prompts.is_some() {
-        peer.list_all_prompts()
-            .await
-            .map_err(|e| anyhow::anyhow!("rmcp list_all_prompts failed: {}", e))?
-            .into_iter()
-            .map(convert_prompt)
-            .collect()
+        match catalog_request(&config.name, "prompts/list", catalog_timeout, peer.list_all_prompts()).await {
+            Ok(prompts) => prompts.into_iter().map(convert_prompt).collect(),
+            Err(e) => {
+                tracing::warn!(server = %config.name, error = %e, "MCP prompts unavailable");
+                vec![]
+            }
+        }
     } else {
         vec![]
     };
@@ -854,6 +913,8 @@ mod tests {
             env: HashMap::new(),
             url: Some(url),
             server_type: "sse".to_string(),
+            connect_timeout_ms: None,
+            catalog_timeout_ms: None,
             origin: Default::default(),
         }
     }

@@ -1,0 +1,225 @@
+// End-to-end tests for `McpManager` against a fake stdio MCP server.
+//
+// This target has `harness = false`: the same binary is both the test runner
+// and the fake server. When `FAKE_MCP_MODE` is set it speaks newline-delimited
+// JSON-RPC on stdin/stdout instead of running tests, and the tests spawn
+// `current_exe()` with that variable as a real stdio MCP server. No libtest
+// output can corrupt the protocol stream, and no extra binary is shipped.
+
+use claurst_core::config::McpServerConfig;
+use claurst_mcp::{McpManager, McpServerStatus};
+use std::collections::HashMap;
+use std::future::Future;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+fn main() {
+    if let Ok(mode) = std::env::var("FAKE_MCP_MODE") {
+        fake_server::run(&mode);
+        return;
+    }
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    let mut failed = 0usize;
+    let mut run = |name: &str, test: std::pin::Pin<Box<dyn Future<Output = Result<(), String>>>>| {
+        let outcome = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(60), test)
+                .await
+                .unwrap_or_else(|_| Err("test timed out after 60s".to_string()))
+        });
+        match outcome {
+            Ok(()) => println!("test {name} ... ok"),
+            Err(e) => {
+                failed += 1;
+                println!("test {name} ... FAILED\n    {e}");
+            }
+        }
+    };
+
+    run("hung_server_times_out", Box::pin(hung_server_times_out()));
+    run(
+        "servers_connect_concurrently_without_blocking_start",
+        Box::pin(servers_connect_concurrently_without_blocking_start()),
+    );
+
+    if failed > 0 {
+        println!("\n{failed} stdio fixture test(s) failed");
+        std::process::exit(1);
+    }
+    println!("\nall stdio fixture tests passed");
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// A config that launches this binary as a fake server in `mode`.
+fn fake_server(name: &str, mode: &str, extra_env: &[(&str, &str)]) -> McpServerConfig {
+    let exe = std::env::current_exe().expect("current_exe");
+    let mut env = HashMap::new();
+    env.insert("FAKE_MCP_MODE".to_string(), mode.to_string());
+    env.insert("FAKE_MCP_NAME".to_string(), name.to_string());
+    for (key, value) in extra_env {
+        env.insert((*key).to_string(), (*value).to_string());
+    }
+    McpServerConfig {
+        name: name.to_string(),
+        command: Some(exe.to_string_lossy().into_owned()),
+        args: vec![],
+        env,
+        url: None,
+        server_type: "stdio".to_string(),
+        connect_timeout_ms: None,
+        catalog_timeout_ms: None,
+        origin: Default::default(),
+    }
+}
+
+/// Poll `condition` until it holds or `within` elapses.
+async fn wait_for(within: Duration, mut condition: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + within;
+    while Instant::now() < deadline {
+        if condition() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    condition()
+}
+
+fn ensure(condition: bool, message: impl FnOnce() -> String) -> Result<(), String> {
+    if condition {
+        Ok(())
+    } else {
+        Err(message())
+    }
+}
+
+fn is_connected(manager: &Arc<McpManager>, name: &str) -> bool {
+    matches!(manager.server_status(name), McpServerStatus::Connected { .. })
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+async fn hung_server_times_out() -> Result<(), String> {
+    let mut config = fake_server("hung", "hang", &[]);
+    config.connect_timeout_ms = Some(500);
+    let started = Instant::now();
+    let manager = McpManager::start(&[config]);
+    manager.wait_until_settled().await;
+    let elapsed = started.elapsed();
+
+    ensure(elapsed < Duration::from_secs(5), || {
+        format!("settling took {elapsed:?}, expected the 500 ms connect timeout to apply")
+    })?;
+    match manager.server_status("hung") {
+        McpServerStatus::Disconnected { last_error: Some(error) } => ensure(
+            error.contains("timed out"),
+            || format!("expected a timeout error, got: {error}"),
+        ),
+        other => Err(format!("expected a failed server, got {other:?}")),
+    }
+}
+
+async fn servers_connect_concurrently_without_blocking_start() -> Result<(), String> {
+    let mut hung = fake_server("slow", "hang", &[]);
+    hung.connect_timeout_ms = Some(3_000);
+    let healthy = fake_server("quick", "serve", &[]);
+
+    let started = Instant::now();
+    let manager = McpManager::start(&[hung, healthy]);
+    let start_cost = started.elapsed();
+    ensure(start_cost < Duration::from_millis(500), || {
+        format!("start() blocked for {start_cost:?}")
+    })?;
+    ensure(
+        matches!(manager.server_status("slow"), McpServerStatus::Connecting),
+        || format!("expected 'slow' to be connecting, got {:?}", manager.server_status("slow")),
+    )?;
+
+    // The healthy server must not wait behind the hung one.
+    let quick_up = wait_for(Duration::from_millis(2_500), || is_connected(&manager, "quick")).await;
+    ensure(quick_up, || {
+        format!("'quick' did not connect while 'slow' hung: {:?}", manager.server_status("quick"))
+    })?;
+    ensure(
+        matches!(manager.server_status("slow"), McpServerStatus::Connecting),
+        || format!("'slow' should still be connecting, got {:?}", manager.server_status("slow")),
+    )?;
+
+    manager.wait_until_settled().await;
+    ensure(manager.failed_servers().len() == 1, || {
+        format!("expected exactly one failed server, got {:?}", manager.failed_servers())
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Fake stdio MCP server
+// ---------------------------------------------------------------------------
+
+mod fake_server {
+    use serde_json::{json, Value};
+    use std::io::{BufRead, Write};
+
+    fn send(out: &mut impl Write, message: &Value) {
+        // A closed stdout means the client went away; nothing left to do.
+        if writeln!(out, "{message}").and_then(|_| out.flush()).is_err() {
+            std::process::exit(0);
+        }
+    }
+
+    /// `hang`: read requests and never answer, like a server stuck at startup.
+    /// `serve`: a minimal, well-behaved server.
+    pub fn run(mode: &str) {
+        let name = std::env::var("FAKE_MCP_NAME").unwrap_or_else(|_| "fake".to_string());
+        let stdin = std::io::stdin();
+        let mut stdout = std::io::stdout().lock();
+        for line in stdin.lock().lines() {
+            let Ok(line) = line else { break };
+            if mode == "hang" {
+                continue;
+            }
+            let Ok(request) = serde_json::from_str::<Value>(&line) else { continue };
+            let Some(id) = request.get("id").cloned() else { continue };
+            let method = request["method"].as_str().unwrap_or_default();
+            let result = match method {
+                "initialize" => json!({
+                    "protocolVersion": request["params"]["protocolVersion"],
+                    "capabilities": { "tools": { "listChanged": true } },
+                    "serverInfo": { "name": name, "version": "0.0.0" },
+                }),
+                "tools/list" => json!({
+                    "tools": [{
+                        "name": "echo",
+                        "description": "Echo which server and tool handled the call",
+                        "inputSchema": { "type": "object" },
+                    }],
+                }),
+                "tools/call" => {
+                    let tool = request["params"]["name"].as_str().unwrap_or_default();
+                    json!({
+                        "content": [{ "type": "text", "text": format!("server={name} tool={tool}") }],
+                    })
+                }
+                "ping" => json!({}),
+                _ => {
+                    send(
+                        &mut stdout,
+                        &json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "error": { "code": -32601, "message": "method not found" },
+                        }),
+                    );
+                    continue;
+                }
+            };
+            send(&mut stdout, &json!({ "jsonrpc": "2.0", "id": id, "result": result }));
+        }
+    }
+}

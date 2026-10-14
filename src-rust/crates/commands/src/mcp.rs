@@ -406,8 +406,8 @@ impl McpCommand {
                             "MCP server '{}' is currently disconnected.\n\
                              Status: {}\n\
                              \n\
-                             The runtime MCP manager reconnects servers automatically.\n\
-                             If the server stays disconnected:\n\
+                             Remote servers get up to 3 startup attempts, stdio servers one.\n\
+                             To recover:\n\
                              1. Check authentication: /mcp auth {}\n\
                              2. Verify the command/URL in ~/.claurst/settings.json\n\
                              3. Restart Claurst to force a full reconnect",
@@ -475,14 +475,6 @@ impl McpCommand {
                 }
                 McpServerStatus::Connecting => {
                     lines.push("\nConnection in progress…".to_string());
-                }
-            }
-
-            // Show failed server errors from the initial connect_all pass.
-            for (name, err) in manager.failed_servers() {
-                if name == server_name {
-                    lines.push(format!("\nStartup connection error:\n  {}", err));
-                    break;
                 }
             }
         } else {

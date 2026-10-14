@@ -138,7 +138,5 @@ async fn build_mcp_manager(
     if decision.allowed.is_empty() {
         return None;
     }
-    let mgr = Arc::new(claurst_mcp::McpManager::connect_all(&decision.allowed).await);
-    mgr.clone().spawn_notification_poll_loop();
-    Some(mgr)
+    Some(claurst_mcp::McpManager::connect_all(&decision.allowed).await)
 }

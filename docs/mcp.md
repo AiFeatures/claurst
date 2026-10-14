@@ -61,6 +61,8 @@ Each entry in the `mcpServers` / `mcp_servers` array (or the `config.mcp_servers
 | `env` | object | No | Extra environment variables set for the child process |
 | `url` | string | HTTP only | Full URL of the SSE endpoint |
 | `type` | string | No | Transport type: `"stdio"` (default) or `"http"` |
+| `connect_timeout_ms` | integer | No | Bound on starting the transport and the `initialize` handshake. Default `10000` |
+| `catalog_timeout_ms` | integer | No | Bound on each `tools/list`, `resources/list` and `prompts/list` request. Default `30000` |
 
 ---
 
@@ -186,24 +188,25 @@ In addition to these, every tool that an MCP server exposes is automatically ava
 
 ---
 
-## Reconnection with Exponential Backoff
+## Startup, Timeouts and Retries
 
-When an MCP server disconnects or fails to connect, Claurst starts a background reconnection loop automatically:
+Claurst connects to all configured servers concurrently in the background. The TUI starts immediately; the footer shows `MCP connecting (N)` while servers start and `MCP N failed` if any could not start, and the `/mcp` panel shows each server's state and error. A server's tools become available to the model on the first turn after it connects. Headless runs (`--print`) wait for every server to connect or fail before sending the prompt.
 
-- Initial retry delay: **1 second**
-- Backoff factor: **2x** after each failed attempt
-- Maximum delay: **60 seconds**
+Each server's startup is bounded:
 
-The loop exits as soon as the server connects successfully. A new loop can be started again if the server disconnects again later. The `/mcp restart <name>` command cancels any running loop and starts a fresh connection attempt immediately.
+- **Connect timeout** (`connect_timeout_ms`, default 10 s): spawning the process or opening the HTTP/SSE stream plus the `initialize` handshake. A hung stdio server is killed when it expires.
+- **Catalog timeout** (`catalog_timeout_ms`, default 30 s): each `tools/list`, `resources/list` and `prompts/list` request. A failing `tools/list` fails the server; a failing `resources/list` or `prompts/list` is logged and the server stays usable.
 
-Server statuses during reconnection:
+Remote (`http`/`sse`) servers get up to three connect attempts, 0.5 s and 1 s apart, unless an attempt timed out. Stdio servers get one attempt. After that the server stays failed until the MCP runtime is rebuilt (for example after approving a project server or completing `/mcp auth`) or Claurst restarts.
+
+Server statuses:
 
 | Status | Meaning |
 |---|---|
 | `Connected` | Active connection; reports tool count |
 | `Connecting` | Connection attempt in progress |
-| `Disconnected` | Cleanly disconnected or not yet attempted |
-| `Failed` | Last attempt failed; retry scheduled |
+| `Failed` | A remote attempt failed; another attempt is scheduled |
+| `Disconnected` | Startup failed for good (the error is shown), or not connected |
 
 ---
 

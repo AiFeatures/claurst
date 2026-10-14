@@ -1299,6 +1299,14 @@ pub mod config {
         pub url: Option<String>,
         #[serde(rename = "type", default = "default_mcp_type")]
         pub server_type: String,
+        /// Bound on spawning/opening the transport and the `initialize`
+        /// handshake, in milliseconds. `None` uses the 10 s default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub connect_timeout_ms: Option<u64>,
+        /// Bound on each catalog request (`tools/list`, `resources/list`,
+        /// `prompts/list`), in milliseconds. `None` uses the 30 s default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub catalog_timeout_ms: Option<u64>,
         /// Origin of this definition. Never read from JSON (always `User` on
         /// deserialize); set to `Project` in `find_project_settings` for
         /// servers loaded from a repo. See [`McpServerOrigin`].
@@ -5130,6 +5138,8 @@ mod tests {
             env: std::collections::HashMap::new(),
             url: None,
             server_type: "stdio".to_string(),
+            connect_timeout_ms: None,
+            catalog_timeout_ms: None,
             origin: McpServerOrigin::User,
         });
         let json = serde_json::to_string_pretty(&project).unwrap();

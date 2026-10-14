@@ -2810,6 +2810,26 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
                 "MCP reconnecting",
                 Style::default().fg(Color::Yellow),
             ));
+        } else if let Some(manager) = app.mcp_manager.as_ref() {
+            // Servers connect in the background: show progress, then failures.
+            let summary = manager.status_summary();
+            if summary.connecting > 0 {
+                if !parts.is_empty() {
+                    parts.push(Span::raw("  "));
+                }
+                parts.push(Span::styled(
+                    format!("MCP connecting ({})", summary.connecting),
+                    Style::default().fg(Color::Yellow),
+                ));
+            } else if summary.failed > 0 {
+                if !parts.is_empty() {
+                    parts.push(Span::raw("  "));
+                }
+                parts.push(Span::styled(
+                    format!("MCP {} failed", summary.failed),
+                    Style::default().fg(Color::Red),
+                ));
+            }
         }
 
         parts

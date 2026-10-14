@@ -742,7 +742,16 @@ async fn main() -> anyhow::Result<()> {
             );
         }
     }
-    let mcp_manager_arc = connect_mcp_manager_arc(&mcp_decision.allowed).await;
+    // Servers connect concurrently in the background; the TUI draws
+    // immediately and picks up tools as servers finish. Headless runs have no
+    // later turn to pick them up, so they wait (bounded by the per-server
+    // connect/catalog timeouts) before the tool list is built.
+    let mcp_manager_arc = start_mcp_manager(&mcp_decision.allowed);
+    if is_headless {
+        if let Some(manager) = mcp_manager_arc.as_ref() {
+            manager.wait_until_settled().await;
+        }
+    }
 
     let pending_permissions = Arc::new(ParkingMutex::new(claurst_tools::PendingPermissionStore::default()));
 
@@ -948,7 +957,7 @@ async fn main() -> anyhow::Result<()> {
     result
 }
 
-async fn connect_mcp_manager_arc(
+fn start_mcp_manager(
     servers: &[claurst_core::config::McpServerConfig],
 ) -> Option<Arc<claurst_mcp::McpManager>> {
     if servers.is_empty() {
@@ -956,9 +965,20 @@ async fn connect_mcp_manager_arc(
     }
 
     info!(count = servers.len(), "Connecting to MCP servers");
-    let mcp_manager = Arc::new(claurst_mcp::McpManager::connect_all(servers).await);
-    mcp_manager.clone().spawn_notification_poll_loop();
-    Some(mcp_manager)
+    Some(claurst_mcp::McpManager::start(servers))
+}
+
+/// The session tool list: built-ins, Agent and every connected MCP tool,
+/// narrowed by the active agent's access level.
+fn tools_for_session(
+    mcp_manager: Option<Arc<claurst_mcp::McpManager>>,
+    query_config: &claurst_query::QueryConfig,
+) -> Arc<Vec<Box<dyn claurst_tools::Tool>>> {
+    let tools = build_tools_with_mcp(mcp_manager);
+    match query_config.agent_definition.as_ref() {
+        Some(def) => filter_tools_for_agent(tools, &def.access),
+        None => tools,
+    }
 }
 
 fn build_tools_with_mcp(
@@ -2214,10 +2234,14 @@ async fn run_interactive(
     };
 
     // tools is already Arc<Vec<...>> — share it across spawned tasks without copying.
-    // Keep the full unfiltered tool set so agent-mode switching can re-filter.
-    let all_tools_arc: Arc<Vec<Box<dyn claurst_tools::Tool>>> =
-        Arc::new(claurst_tools::all_tools());
+    // Agent-mode switches and MCP catalog changes rebuild it via `tools_for_session`.
     let mut tools_arc = tools;
+    // MCP manager generation the current `tools_arc` was built from; `None`
+    // forces a rebuild on the first idle pass.
+    let mut mcp_seen_generation: Option<u64> = None;
+    // Servers whose startup failure was already reported in the status line.
+    let mut mcp_reported_failures: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
 
     // Current cancel token (replaced each turn)
     let mut cancel: Option<CancellationToken> = None;
@@ -3283,13 +3307,12 @@ async fn run_interactive(
                             if let Some(turns) = def.max_turns {
                                 base_query_config.max_turns = turns;
                             }
-                            tools_arc = filter_tools_for_agent(all_tools_arc.clone(), &def.access);
                         } else {
                             // "build" with no explicit definition = full access, no agent
                             base_query_config.agent_name = None;
                             base_query_config.agent_definition = None;
-                            tools_arc = all_tools_arc.clone();
                         }
+                        tools_arc = tools_for_session(tool_ctx.mcp_manager.clone(), &base_query_config);
                     }
                     if !app.is_streaming && app.messages.len() < messages.len() {
                         messages = app.messages.clone();
@@ -4393,27 +4416,51 @@ async fn run_interactive(
                 &app.mcp_session_trusted,
                 &store,
             );
-            let new_mcp_manager = connect_mcp_manager_arc(&decision.allowed).await;
+            let new_mcp_manager = start_mcp_manager(&decision.allowed);
             tool_ctx.mcp_manager = new_mcp_manager.clone();
             app.mcp_manager = new_mcp_manager.clone();
-            tools_arc = build_tools_with_mcp(new_mcp_manager.clone());
+            tools_arc = tools_for_session(new_mcp_manager.clone(), &base_query_config);
+            mcp_seen_generation = new_mcp_manager.as_ref().map(|manager| manager.generation());
+            mcp_reported_failures.clear();
             if app.mcp_view.visible {
                 app.refresh_mcp_view();
             }
 
-            let connected = new_mcp_manager
-                .as_ref()
-                .map(|manager| manager.server_count())
-                .unwrap_or(0);
             app.status_message = Some(if cmd_ctx.config.mcp_servers.is_empty() {
                 "No MCP servers configured.".to_string()
             } else {
+                let starting = decision.allowed.len();
                 format!(
-                    "Reconnected MCP runtime ({} connected server{}).",
-                    connected,
-                    if connected == 1 { "" } else { "s" }
+                    "Reconnecting MCP runtime ({} server{})...",
+                    starting,
+                    if starting == 1 { "" } else { "s" }
                 )
             });
+        }
+
+        // MCP servers connect in the background and may change their tool
+        // lists at runtime (`tools/list_changed`). Rebuild the tool list
+        // between turns whenever the manager reports a change, and surface
+        // servers that failed to start.
+        if !app.is_streaming && current_query.is_none() {
+            if let Some(manager) = tool_ctx.mcp_manager.clone() {
+                let generation = manager.generation();
+                if mcp_seen_generation != Some(generation) {
+                    mcp_seen_generation = Some(generation);
+                    tools_arc = tools_for_session(Some(manager.clone()), &base_query_config);
+                    if app.mcp_view.visible {
+                        app.refresh_mcp_view();
+                    }
+                    for (server, error) in manager.failed_servers() {
+                        if mcp_reported_failures.insert(server.clone()) {
+                            app.status_message = Some(format!(
+                                "MCP server '{}' failed to start: {} (see /mcp)",
+                                server, error
+                            ));
+                        }
+                    }
+                }
+            }
         }
 
         // Prompt for any project-defined MCP servers awaiting approval (#123).

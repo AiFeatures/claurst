@@ -223,6 +223,8 @@ mod tests {
             env: HashMap::new(),
             url: None,
             server_type: "stdio".to_string(),
+            connect_timeout_ms: None,
+            catalog_timeout_ms: None,
             origin: McpServerOrigin::User,
         }
     }
@@ -235,6 +237,8 @@ mod tests {
             env: HashMap::new(),
             url: None,
             server_type: "stdio".to_string(),
+            connect_timeout_ms: None,
+            catalog_timeout_ms: None,
             origin: McpServerOrigin::Project,
         }
     }
