@@ -1932,6 +1932,17 @@ async fn run_interactive(
     // main loop starts a turn to deliver it.
     let command_queue = claurst_query::CommandQueue::new();
     base_query_config.command_queue = Some(command_queue.clone());
+    // Background sub-agents and Bash commands report completion into the same
+    // queue as `<subagent>` / `<shell>` notices (gated by completionWakeups).
+    tool_ctx.completion_notifier = Some({
+        let queue = command_queue.clone();
+        claurst_tools::CompletionNotifier::new(move |notice| {
+            queue.push(
+                claurst_query::QueuedCommand::InjectUserMessage(notice),
+                claurst_query::CommandPriority::Normal,
+            );
+        })
+    });
     let mut live_config = config.clone();
     if !session.model.is_empty() {
         live_config.model = Some(session.model.clone());
@@ -3129,7 +3140,7 @@ async fn run_interactive(
 
                         // Share the Arc so the spawned task can access all tools (incl. MCP).
                         let tools_arc_clone = tools_arc.clone();
-                        let mut ctx_clone = tool_ctx.clone();
+                        let ctx_clone = tool_ctx.clone();
                         let mut qcfg = base_query_config.clone();
                         qcfg.model = claurst_api::effective_model_for_config(&cmd_ctx.config, &model_registry);
                         qcfg.max_tokens = cmd_ctx.config.effective_max_tokens();
@@ -3145,16 +3156,6 @@ async fn run_interactive(
                         // Apply active effort level (set via /effort command).
                         if let Some(level) = current_effort {
                             qcfg.effort_level = Some(level);
-                        }
-                        // Wire completion_notifier if a command queue is available.
-                        if let Some(ref cq) = qcfg.command_queue {
-                            let cq = cq.clone();
-                            ctx_clone.completion_notifier = Some(claurst_tools::CompletionNotifier::new(move |msg| {
-                                cq.push(
-                                    claurst_query::QueuedCommand::InjectSystemMessage(msg),
-                                    claurst_query::CommandPriority::Normal,
-                                );
-                            }));
                         }
                         let tracker = cost_tracker.clone();
                         let tx = event_tx.clone();

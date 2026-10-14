@@ -515,7 +515,8 @@ fn opened_file_location(
 
 
 /// A cloneable handle for injecting notification messages into the next agent turn.
-/// Used by background tasks with `notify_on_complete` to signal completion without polling.
+/// Background sub-agents and Bash commands call it when they finish (#444), so the
+/// model is told instead of having to poll.
 #[derive(Clone)]
 pub struct CompletionNotifier(Arc<dyn Fn(String) + Send + Sync>);
 
@@ -526,6 +527,26 @@ impl CompletionNotifier {
     pub fn notify(&self, msg: String) {
         (self.0)(msg);
     }
+}
+
+/// The message a finished background task sends through its
+/// [`CompletionNotifier`] (#444): `<tag k="v" …>\nbody\n</tag>`, e.g.
+/// `<shell id="…" state="completed" command="…">`. Attribute values are
+/// escaped and kept on one line.
+pub fn completion_notice(tag: &str, attrs: &[(&str, &str)], body: &str) -> String {
+    let mut out = format!("<{tag}");
+    for (key, value) in attrs {
+        let value: String = value
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect::<String>()
+            .replace('&', "&amp;")
+            .replace('"', "&quot;")
+            .replace('<', "&lt;");
+        out.push_str(&format!(" {key}=\"{value}\""));
+    }
+    out.push_str(&format!(">\n{}\n</{tag}>", body.trim_end()));
+    out
 }
 
 /// Shared context passed to every tool invocation.
@@ -1302,5 +1323,18 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o755, "executable bit preserved");
         assert_eq!(count_atomic_tmp_files(dir.path()), 0);
+    }
+
+    #[test]
+    fn completion_notice_escapes_attributes_and_wraps_the_body() {
+        let notice = completion_notice(
+            "shell",
+            &[("id", "t1"), ("command", "echo \"a\" && cat <x\nmore")],
+            "line 1\nline 2\n",
+        );
+        assert_eq!(
+            notice,
+            "<shell id=\"t1\" command=\"echo &quot;a&quot; &amp;&amp; cat &lt;x more\">\nline 1\nline 2\n</shell>"
+        );
     }
 }
