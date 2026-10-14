@@ -2002,14 +2002,21 @@ impl App {
             },
             RewindStep::Confirming { .. } => match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    if let Some(idx) = self.rewind_flow.accept_confirm() {
-                        // Truncate conversation to the selected message index.
-                        self.messages.truncate(idx);
-                        // Remove system annotations placed after the truncation point.
-                        self.system_annotations.retain(|a| a.after_index <= idx);
+                    if let Some(position) = self.rewind_flow.accept_confirm() {
+                        match position.checked_sub(self.rewind_archive_len) {
+                            Some(idx) => {
+                                // Truncate conversation to the selected message index.
+                                self.messages.truncate(idx);
+                                // Remove system annotations placed after the truncation point.
+                                self.system_annotations.retain(|a| a.after_index <= idx);
+                            }
+                            // Inside a compaction's replaced head: the caller
+                            // restores that history from the session.
+                            None => self.pending_rewind = Some(position),
+                        }
                         self.push_notification(
                             NotificationKind::Success,
-                            format!("Rewound to message #{}", idx),
+                            format!("Rewound to message #{}", position),
                             Some(4),
                         );
                     }

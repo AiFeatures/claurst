@@ -237,6 +237,13 @@ pub struct App {
     pub message_selector: MessageSelectorOverlay,
     /// Multi-step rewind flow overlay.
     pub rewind_flow: RewindFlowOverlay,
+    /// Number of compaction-archived messages listed ahead of the live ones
+    /// in the open rewind flow (issue #449).
+    pub rewind_archive_len: usize,
+    /// A confirmed rewind into the compaction archive: a position in the
+    /// session's rewind timeline for the caller to apply with
+    /// `ConversationSession::rewind_to`.
+    pub pending_rewind: Option<usize>,
     /// Bridge connection state.
     pub bridge_state: BridgeConnectionState,
     /// Active notification queue.
@@ -658,6 +665,8 @@ impl App {
             global_search: GlobalSearchState::default(),
             message_selector: MessageSelectorOverlay::new(),
             rewind_flow: RewindFlowOverlay::new(),
+            rewind_archive_len: 0,
+            pending_rewind: None,
             bridge_state: BridgeConnectionState::Disconnected,
             notifications: NotificationQueue::new(),
             error_modal_scroll_offset: 0,

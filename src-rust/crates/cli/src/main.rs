@@ -1677,6 +1677,26 @@ async fn run_headless(
 // Interactive REPL mode
 // ---------------------------------------------------------------------------
 
+/// Persist the live session (issue #449): a full checkpoint (journal plus an
+/// atomic snapshot) when no query is running, otherwise only a metadata
+/// entry, since the running loop owns the history until it finishes. A
+/// failure (for example the session being open in another process) is
+/// logged; the session stays usable in memory.
+fn persist_live_session(
+    journal: &claurst_core::session_journal::SessionJournal,
+    session: &mut claurst_core::history::ConversationSession,
+    query_running: bool,
+) {
+    let result = if query_running {
+        journal.record_meta(session)
+    } else {
+        journal.checkpoint(session)
+    };
+    if let Err(e) = result {
+        tracing::warn!(session = %session.id, error = %e, "Session not saved");
+    }
+}
+
 fn permission_request_from_core(
     pending: &claurst_tools::PendingPermissionRequest,
 ) -> claurst_tui::dialogs::PermissionRequest {
@@ -1838,9 +1858,20 @@ async fn run_interactive(
     };
 
     let mut session = if let Some(ref id) = resume_id {
-        match claurst_core::history::load_session(id).await {
-            Ok(session) => {
+        match claurst_core::session_journal::load(&claurst_core::history::sessions_dir(), id) {
+            Ok(claurst_core::session_journal::LoadedSession { session, replayed, rebuilt }) => {
                 println!("Resumed session: {}", id);
+                if rebuilt {
+                    println!(
+                        "Session snapshot was missing or unreadable; rebuilt it from {} journal entries.",
+                        replayed
+                    );
+                } else if replayed > 0 {
+                    println!(
+                        "Recovered {} journal entries written after the last snapshot (interrupted turn).",
+                        replayed
+                    );
+                }
                 if let Some(saved_dir) = session.working_dir.as_ref() {
                     let saved_path = std::path::PathBuf::from(saved_dir);
                     if saved_path.exists() {
@@ -1871,7 +1902,16 @@ async fn run_interactive(
         session
     };
     let initial_messages = session.messages.clone();
+    // Crash-safe writer for the live session (issue #449). A resumed session
+    // is locked up front so a second claurst on it is told immediately.
+    let mut session_journal = claurst_core::session_journal::SessionJournal::for_session(&session);
+    if !session.messages.is_empty() {
+        if let Err(e) = session_journal.acquire() {
+            resume_warning = Some(e.to_string());
+        }
+    }
     let mut base_query_config = query_config;
+    base_query_config.session_journal = Some(session_journal.clone());
     // Goal autonomy is now an in-loop continuation policy (issue #230 / MI-3):
     // run_query_loop itself decides whether to continue toward an active goal
     // after each turn, instead of the REPL re-dispatching a fresh turn. Select
@@ -2501,6 +2541,12 @@ async fn run_interactive(
                                     );
                                     messages.clear();
                                     app.replace_messages(Vec::new());
+                                    session_journal =
+                                        claurst_core::session_journal::SessionJournal::for_session(
+                                            &session,
+                                        );
+                                    base_query_config.session_journal =
+                                        Some(session_journal.clone());
                                     tool_ctx.session_id = session.id.clone();
                                     cmd_ctx.session_id = session.id.clone();
                                     cmd_ctx.session_title = None;
@@ -2540,8 +2586,11 @@ async fn run_interactive(
                                     session.working_dir =
                                         Some(destination.display().to_string());
                                     session.updated_at = chrono::Utc::now();
-                                    let _ =
-                                        claurst_core::history::save_session(&mut session).await;
+                                    persist_live_session(
+                                        &session_journal,
+                                        &mut session,
+                                        current_query.is_some(),
+                                    );
                                     // NOTE: opencode appends a synthetic
                                     // <system-reminder> prompt after a move. claurst
                                     // re-derives working_directory into every turn's
@@ -2576,21 +2625,42 @@ async fn run_interactive(
                                 }
                                 Some(CommandResult::Compacted {
                                     messages: new_msgs,
-                                    record,
+                                    mut record,
                                     report,
                                 }) => {
-                                    messages = new_msgs.clone();
-                                    app.replace_messages(new_msgs);
+                                    // Keep the replaced head in the record so
+                                    // /rewind can still reach it (issue #449).
+                                    claurst_core::history::apply_compaction(
+                                        &mut messages,
+                                        new_msgs,
+                                        &mut record,
+                                    );
+                                    if current_query.is_none() {
+                                        if let Err(e) =
+                                            session_journal.record_compaction(&record, &messages)
+                                        {
+                                            tracing::warn!(error = %e, "Session journal: /compact not recorded");
+                                        }
+                                    }
+                                    app.replace_messages(messages.clone());
                                     app.context_used_tokens = record.tokens_after;
                                     session.messages = messages.clone();
                                     session.compactions.push(record);
                                     session.updated_at = chrono::Utc::now();
-                                    let _ = claurst_core::history::save_session(&mut session).await;
+                                    persist_live_session(
+                                        &session_journal,
+                                        &mut session,
+                                        current_query.is_some(),
+                                    );
                                     app.status_message = Some(report);
                                 }
                                 Some(CommandResult::OpenRewindOverlay) => {
                                     app.replace_messages(messages.clone());
-                                    app.open_rewind_flow();
+                                    // Offer the messages earlier compactions
+                                    // replaced too (issue #449).
+                                    app.open_rewind_flow_with_archive(
+                                        session.compactions.iter().flat_map(|c| c.replaced.iter()),
+                                    );
                                     app.status_message =
                                         Some("Select a message to rewind to.".to_string());
                                 }
@@ -2611,6 +2681,19 @@ async fn run_interactive(
                                 }
                                 Some(CommandResult::ResumeSession(resumed_session)) => {
                                     session = resumed_session;
+                                    session_journal =
+                                        claurst_core::session_journal::SessionJournal::for_session(
+                                            &session,
+                                        );
+                                    base_query_config.session_journal =
+                                        Some(session_journal.clone());
+                                    if let Err(e) = session_journal.acquire() {
+                                        app.notifications.push(
+                                            NotificationKind::Warning,
+                                            e.to_string(),
+                                            None,
+                                        );
+                                    }
                                     messages = session.messages.clone();
                                     app.replace_messages(messages.clone());
                                     cmd_ctx.config.model = Some(session.model.clone());
@@ -2652,8 +2735,11 @@ async fn run_interactive(
                                     session.title = Some(title.clone());
                                     session.updated_at = chrono::Utc::now();
                                     cmd_ctx.session_title = session.title.clone();
-                                    let _ =
-                                        claurst_core::history::save_session(&mut session).await;
+                                    persist_live_session(
+                                        &session_journal,
+                                        &mut session,
+                                        current_query.is_some(),
+                                    );
                                     claurst_tui::update_terminal_title(Some(&title));
                                     app.status_message = Some(format!(
                                         "Session renamed to \"{}\".",
@@ -3236,6 +3322,17 @@ async fn run_interactive(
                             tools_arc = all_tools_arc.clone();
                         }
                     }
+                    // A /rewind into a compaction's replaced head restores the
+                    // pre-compaction history (issue #449); the next turn's
+                    // journal sync records it.
+                    if !app.is_streaming {
+                        if let Some(position) = app.pending_rewind.take() {
+                            session.messages = std::mem::take(&mut messages);
+                            session.rewind_to(position);
+                            messages = session.messages.clone();
+                            app.replace_messages(messages.clone());
+                        }
+                    }
                     if !app.is_streaming && app.messages.len() < messages.len() {
                         messages = app.messages.clone();
                         session.messages = messages.clone();
@@ -3327,10 +3424,17 @@ async fn run_interactive(
 
         // Drain query events — also forward relevant ones to the bridge as outbound.
         while let Ok(evt) = event_rx.try_recv() {
-            // Record loop compactions in the session (issue #441).
-            if let QueryEvent::Compacted(record) = &evt {
-                session.compactions.push(record.clone());
-            }
+            // Record loop compactions in the session (issue #441), moving the
+            // replaced head into it rather than copying it (issue #449).
+            let evt = match evt {
+                QueryEvent::Compacted(mut record) => {
+                    let mut kept = record.without_replaced();
+                    kept.replaced = std::mem::take(&mut record.replaced);
+                    session.compactions.push(kept);
+                    QueryEvent::Compacted(record)
+                }
+                other => other,
+            };
             // Forward to bridge before consuming (clone only what we need).
             if let Some(ref runtime) = bridge_runtime {
                 let outbound: Option<BridgeOutbound> = match &evt {
@@ -3433,7 +3537,11 @@ async fn run_interactive(
                         // Persist the session URL into the saved session record.
                         session.remote_session_url = Some(session_url.clone());
                         session.updated_at = chrono::Utc::now();
-                        let _ = claurst_core::history::save_session(&mut session).await;
+                        persist_live_session(
+                            &session_journal,
+                            &mut session,
+                            current_query.is_some(),
+                        );
 
                         // Wire the BridgeSessionInfo relay so live tool/text events reach
                         // the web UI via /api/bridge/sessions. This runs alongside
@@ -3587,7 +3695,11 @@ async fn run_interactive(
                         session.updated_at = chrono::Utc::now();
                         cmd_ctx.session_title = Some(title.clone());
                         app.session_title = Some(title);
-                        let _ = claurst_core::history::save_session(&mut session).await;
+                        persist_live_session(
+                            &session_journal,
+                            &mut session,
+                            current_query.is_some(),
+                        );
                     }
                     Ok(TuiBridgeEvent::Error(msg)) => {
                         app.bridge_state = BridgeConnectionState::Failed {
@@ -4088,11 +4200,14 @@ async fn run_interactive(
                 }
             }
         }
-        // Check if query task is done; sync messages from the task
+        // Check if query task is done; sync messages from the task. Wait until
+        // its events are drained too, so a late Compacted entry reaches the
+        // session before the turn-end checkpoint (issue #449).
         let task_finished = current_query
             .as_ref()
             .map(|(h, _)| h.is_finished())
-            .unwrap_or(false);
+            .unwrap_or(false)
+            && event_rx.is_empty();
 
         if task_finished {
             if let Some((handle, msgs_arc)) = current_query.take() {
@@ -4125,8 +4240,9 @@ async fn run_interactive(
                     app.pending_auto_submit = true;
                 }
 
-                // Save session to JSONL (primary storage)
-                let _ = claurst_core::history::save_session(&mut session).await;
+                // Checkpoint: the journal already holds every step of the turn;
+                // this rewrites the snapshot atomically (issue #449).
+                persist_live_session(&session_journal, &mut session, false);
 
                 // Also index into SQLite for /search support
                 {

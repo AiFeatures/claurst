@@ -1206,3 +1206,31 @@ use super::types::{ContextMenuItem, ContextMenuState};
         assert_eq!(u64::from(pin.context_window), app.context_window_size);
         assert_eq!(pin.max_output_tokens, 131_072);
     }
+
+    // ---- /rewind into the compaction archive (issue #449) ----
+
+    #[test]
+    fn rewind_flow_lists_archived_messages_and_defers_rewinds_into_them() {
+        let mut app = make_app();
+        app.replace_messages(vec![Message::user("summary"), Message::assistant("a2")]);
+        let archived = [Message::user("u1"), Message::assistant("a1")];
+        app.open_rewind_flow_with_archive(archived.iter());
+        assert_eq!(app.rewind_archive_len, 2);
+
+        // The selection starts on the newest message (position 3); move up
+        // to "a1" (position 1, inside the archive) and confirm.
+        app.handle_rewind_flow_key(press_key(KeyCode::Up, KeyModifiers::NONE));
+        app.handle_rewind_flow_key(press_key(KeyCode::Up, KeyModifiers::NONE));
+        app.handle_rewind_flow_key(press_key(KeyCode::Enter, KeyModifiers::NONE));
+        app.handle_rewind_flow_key(press_key(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert_eq!(app.pending_rewind, Some(1));
+        assert_eq!(app.messages.len(), 2, "the caller applies archive rewinds");
+
+        // A live position ("a2", position 3) still truncates in place.
+        app.pending_rewind = None;
+        app.open_rewind_flow_with_archive(archived.iter());
+        app.handle_rewind_flow_key(press_key(KeyCode::Enter, KeyModifiers::NONE));
+        app.handle_rewind_flow_key(press_key(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert_eq!(app.pending_rewind, None);
+        assert_eq!(app.messages.len(), 1);
+    }
