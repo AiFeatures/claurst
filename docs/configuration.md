@@ -349,7 +349,8 @@ Saved approvals never live inside the repository, so a repository cannot grant
 itself permissions. `allowed_tools`, `permissionRules` and `allowedBashPrefixes`
 are read only from the global settings file; a project settings file can add
 `disallowed_tools` entries. Each `allowedBashPrefixes` entry `git` acts as the
-rule `Bash(git *)`.
+rule `Bash(git *)`. Bash rules saved by earlier versions as `<command>*` (a
+prefix of the raw line) are read as the per-command rule `<command> *`.
 
 ### Shell commands
 
@@ -358,9 +359,14 @@ Claurst splits the line at `;`, `&&`, `||`, `|`, `|&`, `&` and newlines,
 removes quotes, and drops redirections. A line is auto-allowed only when
 **every** command in it is allowed, and denied when **any** command matches a
 deny rule (also after stripping leading `NAME=value` assignments and the
-command's directory, so `FOO=1 /bin/rm x` still matches `Bash(rm *)`).
+command's directory, so `FOO=1 /bin/rm x` still matches `Bash(rm *)`). For
+deny rules an argument the shell would expand (it contains `$`, `{`, `}`, `*`,
+`?` or `[`) matches any word of the pattern, so `git $X -f` and
+`git {push,-f}` are denied by `Bash(git push *)`.
 
-A Bash pattern is a command with an optional trailing ` *`:
+A Bash pattern is a command with an optional trailing ` *`, which matches
+whole words: `Bash(npm run test:*)` is read as `npm run test *` and covers
+`npm run test` and `npm run test -- --watch`, but not `npm run test:unit`.
 
 | Pattern | Matches | Does not match |
 |---------|---------|----------------|
@@ -378,11 +384,18 @@ recorded by "Allow this session", does):
 - commands that run other commands: `eval`, `exec`, `source`, `.`, `bash -c`,
   `sh -c` (and other shells with `-c`), `xargs`, `sudo`, `doas`, `su`, `env`,
   `command`, `builtin`, `nohup`, `nice`, `time`, `timeout`, `watch`,
-  `parallel`, `find -exec`, and a command name taken from a variable
+  `parallel`, `export`, `find -exec`, interpreters running inline code
+  (`python -c`, `node -e`, `perl -e`, `ruby -e`, ...), and a command name the
+  shell would expand (`$CMD`, `r{m,}`)
 
 A tool-wide `Bash` allow covers these lines too, unless a Bash deny pattern
-exists. A command that redirects output to a file (`>`, `>>`, `&>`) is never
-covered by a pattern; redirection to `/dev/null` and `2>&1` are fine. Commands
+exists. Deny patterns are best effort for these lines: they are only matched
+against the whole line, so in `bypassPermissions` mode a denied command
+hidden inside one (`eval "rm -rf x"`) is not caught. Use a tool-wide deny, or
+another mode, when that matters. A command that redirects output to a file
+(`>`, `>>`, `&>`) is never covered by a pattern; redirection to `/dev/null`
+and `2>&1` are fine. "Allow this session" on such a line records the whole
+line, and `p`/`a` are not offered for it. Commands
 classified as Critical (`rm -rf /`, fork bombs, `dd if=...`, ...) are blocked
 in every mode, including when they appear later in a compound line.
 
