@@ -25,7 +25,6 @@ pub mod coordinator;
 pub mod cron_scheduler;
 pub mod sanitize;
 pub mod session_memory;
-pub mod skill_prefetch;
 
 mod runner;
 pub use runner::*;
@@ -39,9 +38,6 @@ pub use goal_loop::{
     GoalContinuation, StopReason, check_and_continue_goal, decide_goal_continuation,
     mark_goal_complete,
 };
-pub use skill_prefetch::{
-    SkillDefinition, SkillIndex, SharedSkillIndex, prefetch_skills, format_skill_listing,
-};
 pub use sanitize::sanitize_history;
 pub use compact::{
     AutoCompactState, CompactResult, CompactTrigger, MicroCompactConfig, MessageGroup, TokenWarningState,
@@ -50,7 +46,8 @@ pub use compact::{
     context_window_for_model, estimate_context_tokens, format_compact_summary, get_compact_prompt,
     group_messages_for_compact, micro_compact_if_needed, reactive_compact,
     resolve_context_window, should_auto_compact, should_auto_compact_for_window, should_compact,
-    should_context_collapse, snip_compact,
+    should_context_collapse, snip_compact, auto_compact_threshold, summary_token_budget, Compaction,
+    CompactionRecord, CompactionTrigger, UsageMark,
 };
 pub use session_memory::{
     ExtractedMemory, MemoryCategory, SessionMemoryExtractor, SessionMemoryState,
@@ -58,7 +55,7 @@ pub use session_memory::{
 
 use claurst_api::{
     ApiMessage, ApiToolDefinition, AnthropicStreamEvent, CreateMessageRequest, StreamAccumulator,
-    StreamHandler, SystemPrompt, ThinkingConfig,
+    StreamHandler, SystemBlock, SystemPrompt,
 };
 use claurst_core::config::Config;
 use claurst_core::cost::CostTracker;
@@ -95,35 +92,50 @@ pub struct QueryConfig {
     pub model: String,
     pub max_tokens: u32,
     pub max_turns: u32,
+    /// Session-local turn-cap override (e.g. from `/turns`). When set it
+    /// takes precedence over BOTH the agent definition and `max_turns`.
+    /// Always a finite cap; `/turns off` maps to a high ceiling, not to
+    /// "unlimited".
+    pub max_turns_override: Option<u32>,
+    /// Whether the max-steps graceful degradation summary turn is enabled.
+    /// When `false`, exceeding `max_turns` returns cold (last assistant
+    /// message) instead of running a final tool-less summary turn.
+    pub degradation_enabled: bool,
     pub system_prompt: Option<String>,
     pub append_system_prompt: Option<String>,
+    /// Session context gathered at startup (git status, IDE context).
+    /// Sent in the dynamic system block, after the cached stable block.
+    pub session_context: Option<String>,
     pub output_style: claurst_core::system_prompt::OutputStyle,
     pub output_style_prompt: Option<String>,
     pub working_directory: Option<String>,
+    /// Skills listed to the model in the cached system block (name and
+    /// description), discovered once per session. Empty: no listing.
+    pub available_skills: Vec<claurst_core::system_prompt::SkillListing>,
+    /// AGENTS.md / CLAUDE.md instruction files loaded at session start, sent
+    /// in the cached system block. Empty: none.
+    pub instruction_files: Vec<claurst_core::claudemd::InstructionFile>,
     pub thinking_budget: Option<u32>,
     pub temperature: Option<f32>,
-    /// Maximum cumulative character count of all tool results in the message
-    /// history before older results are replaced with a truncation notice.
-    /// Mirrors the TS `applyToolResultBudget` mechanism.  Default: 50_000.
-    pub tool_result_budget: usize,
+    /// Per-item cap, in bytes, applied to each tool result when it is
+    /// appended to the history: longer output keeps its head and tail with a
+    /// note giving the omitted size (issue #441). History is never rewritten
+    /// afterwards, so the prompt prefix stays stable. `0` disables the cap.
+    /// Default: [`DEFAULT_TOOL_RESULT_MAX_BYTES`] (~16k tokens).
+    pub tool_result_max_bytes: usize,
     /// Optional effort level.  When set and `thinking_budget` is `None`,
     /// the effort level's `thinking_budget_tokens()` is used as the
     /// thinking budget.  Also provides a temperature override when the
     /// level specifies one.
     pub effort_level: Option<claurst_core::effort::EffortLevel>,
-    /// T1-4: Optional shared command queue.
+    /// Optional shared command queue (#444).
     ///
-    /// When set, the query loop drains this queue before each API call and
-    /// injects any resulting messages into the conversation.  The queue is
-    /// shared (Arc-backed) so the TUI input thread can push commands while the
-    /// loop is waiting for a model response.
+    /// When set, the query loop drains this queue before each API call (each
+    /// step boundary) and appends the resulting messages to the conversation,
+    /// emitting [`QueryEvent::InputInjected`]. The queue is shared
+    /// (Arc-backed) so the TUI can push steers, and background tasks their
+    /// completion notices, while the loop is running.
     pub command_queue: Option<CommandQueue>,
-    /// T1-5: Optional shared skill index.
-    ///
-    /// When set, `prefetch_skills` is spawned once before the loop begins and
-    /// the resulting index is used to inject a skill listing attachment into
-    /// the conversation context.
-    pub skill_index: Option<SharedSkillIndex>,
     /// Optional USD spend cap. The query loop checks accumulated cost after
     /// each turn and aborts with `QueryOutcome::BudgetExceeded` when exceeded.
     pub max_budget_usd: Option<f64>,
@@ -159,6 +171,13 @@ pub struct QueryConfig {
     // both the tool vec and the config (e.g. sub-agents) may still set it
     // explicitly; the loop only fills an unset field.
     pub enabled_tools: Option<Vec<String>>,
+    /// Current permission mode, described in the dynamic system block. When
+    /// `None`, `run_query_loop` fills it from the live `ToolContext` config
+    /// each turn, so a mode change (/yolo, Shift+Tab) reaches the next request.
+    pub permission_mode: Option<claurst_core::config::PermissionMode>,
+    /// Extra workspace roots (`/add-dir`) for `<environment_context>`. When
+    /// empty, `run_query_loop` fills it from the live `ToolContext` config.
+    pub additional_dirs: Vec<String>,
     /// End-of-turn continuation policy (issue #230 / MI-3).
     ///
     /// `Default` stops after one turn (normal, non-goal behaviour). Goal-driven
@@ -166,6 +185,25 @@ pub struct QueryConfig {
     /// goal's guards allow, injecting the goal continuation message as the next
     /// user turn — instead of the CLI REPL re-dispatching a fresh turn.
     pub continuation: crate::continuation::ContinuationMode,
+    /// Retry policy for transient model-request failures (#439): HTTP
+    /// 408/409/425/429/5xx, dropped connections, stalled or truncated streams.
+    pub retry: claurst_api::RetryConfig,
+    /// Automatic compaction (issue #441): the pre-request threshold check and
+    /// compact-and-retry on a provider context-window error. `false` (from
+    /// `--no-auto-compact`) leaves the history alone and surfaces overflow
+    /// errors; `/compact` still works.
+    pub auto_compact: bool,
+    /// Writer for the session this loop runs in (issue #449). When set, the
+    /// history is journaled after every assistant message, every tool-result
+    /// batch and every compaction, so a crash loses at most the step in
+    /// flight. `None` (sub-agents, headless runs) persists nothing.
+    pub session_journal: Option<Arc<claurst_core::session_journal::SessionJournal>>,
+    /// Set for a sub-agent's loop: a finished turn fires `SubagentStop`
+    /// hooks instead of `Stop` (#447).
+    pub is_subagent: bool,
+    /// Sandbox line for the dynamic system prompt (#470). Always filled by
+    /// `run_query_loop` from the tool context's sandbox settings.
+    pub sandbox_state: Option<String>,
 }
 
 impl Default for QueryConfig {
@@ -174,17 +212,21 @@ impl Default for QueryConfig {
             model: claurst_core::constants::DEFAULT_MODEL.to_string(),
             max_tokens: claurst_core::constants::DEFAULT_MAX_TOKENS,
             max_turns: claurst_core::constants::MAX_TURNS_DEFAULT,
+            max_turns_override: None,
+            degradation_enabled: true,
             system_prompt: None,
             append_system_prompt: None,
+            session_context: None,
             output_style: claurst_core::system_prompt::OutputStyle::Default,
             output_style_prompt: None,
             working_directory: None,
+            available_skills: Vec::new(),
+            instruction_files: Vec::new(),
             thinking_budget: None,
             temperature: None,
-            tool_result_budget: 50_000,
+            tool_result_max_bytes: DEFAULT_TOOL_RESULT_MAX_BYTES,
             effort_level: None,
             command_queue: None,
-            skill_index: None,
             max_budget_usd: None,
             fallback_model: None,
             provider_registry: None,
@@ -193,7 +235,24 @@ impl Default for QueryConfig {
             model_registry: None,
             managed_agents: None,
             enabled_tools: None,
+            permission_mode: None,
+            additional_dirs: Vec::new(),
             continuation: crate::continuation::ContinuationMode::Default,
+            retry: claurst_api::RetryConfig::default(),
+            auto_compact: true,
+            session_journal: None,
+            is_subagent: false,
+            sandbox_state: None,
+        }
+    }
+}
+
+/// Journal the history (issue #449). A failed write is logged, never fatal:
+/// the turn goes on and the snapshot at its end is the fallback.
+fn persist_step(config: &QueryConfig, messages: &[Message]) {
+    if let Some(journal) = config.session_journal.as_deref() {
+        if let Err(e) = journal.sync_messages(messages) {
+            warn!(error = %e, "Session journal write failed");
         }
     }
 }
@@ -210,6 +269,9 @@ impl QueryConfig {
                 .as_ref()
                 .map(|p| p.display().to_string()),
             managed_agents: cfg.managed_agents.clone(),
+            effort_level: cfg.effective_effort_level(),
+            degradation_enabled: cfg.degradation_summary_enabled_or_default(),
+            retry: claurst_api::RetryConfig::with_max_retries(cfg.max_retries),
             ..Default::default()
         }
     }
@@ -231,6 +293,9 @@ impl QueryConfig {
                 .as_ref()
                 .map(|p| p.display().to_string()),
             managed_agents: cfg.managed_agents.clone(),
+            effort_level: cfg.effective_effort_level(),
+            degradation_enabled: cfg.degradation_summary_enabled_or_default(),
+            retry: claurst_api::RetryConfig::with_max_retries(cfg.max_retries),
             ..Default::default()
         }
     }
@@ -255,6 +320,29 @@ pub enum QueryEvent {
     /// `state` is Warning (≥ 80 %) or Critical (≥ 95 %).
     /// `pct_used` is the fraction of the context window consumed (0.0–1.0).
     TokenWarning { state: TokenWarningState, pct_used: f64 },
+    /// A model request failed transiently and will be retried after
+    /// `delay_ms` (#439). `attempt` is 1-based and at most `max_attempts`.
+    /// Output streamed by the failed attempt is discarded.
+    Retry { attempt: u32, max_attempts: u32, delay_ms: u64, reason: String },
+    /// The loop compacted the history (issue #441). The caller records the
+    /// entry in the session; `tokens_after` is the new context estimate.
+    Compacted(CompactionRecord),
+    /// Provider-reported subscription usage (0-100 per window), e.g. the
+    /// Codex `x-codex-*` rate-limit headers.
+    RateLimits { primary_used_percent: Option<f32>, secondary_used_percent: Option<f32> },
+    /// Queued input drained from [`QueryConfig::command_queue`] at a step
+    /// boundary and appended to the history as user messages, in order
+    /// (#444): steers typed during the turn and background-task completion
+    /// notices.
+    InputInjected(Vec<String>),
+    /// A message was appended to the history for good: an assistant reply
+    /// (after any retry settled, with its final content blocks and tool-use
+    /// ids) or the user message carrying a turn's tool results (#473).
+    MessageCommitted(Message),
+    /// The turn cap was reached: the loop either runs one final tool-less
+    /// summary turn or returns at once (#473). May repeat when that summary
+    /// turn is retried.
+    MaxTurnsReached { max_turns: u32 },
 }
 
 // ---------------------------------------------------------------------------
@@ -264,6 +352,14 @@ pub enum QueryEvent {
 // ---------------------------------------------------------------------------
 // Query loop
 // ---------------------------------------------------------------------------
+
+/// Default per-item cap for tool results appended to the history: 64k bytes,
+/// roughly 16k tokens. It sits above the largest tool-native output window
+/// (Read's 50 KiB page and Bash's 50 KiB window, each plus a continuation
+/// trailer) so the loop never re-cuts output a tool already bounded; cutting
+/// the middle of a Read page would hide the gap behind an intact offset
+/// trailer. It only catches tools without their own bound.
+pub const DEFAULT_TOOL_RESULT_MAX_BYTES: usize = 64_000;
 
 /// Maximum number of max_tokens continuation attempts before surfacing the
 /// partial response.  Mirrors `MAX_OUTPUT_TOKENS_RECOVERY_LIMIT` in query.ts.
@@ -400,6 +496,12 @@ pub async fn run_query_loop(
 
     let mut turn = 0u32;
     let mut compact_state = compact::AutoCompactState::default();
+    // Prompt-token count reported for the last request, anchoring the
+    // pre-request context projection. Cleared whenever history is compacted.
+    let mut last_usage: Option<compact::UsageMark> = None;
+    // One-shot guard: a context-window error compacts and retries the request
+    // once; a second overflow on the same request surfaces the error.
+    let mut overflow_recovery_used = false;
     // Tracks how many consecutive max_tokens recoveries we've attempted so
     // we don't loop forever on a model that can't finish within any budget.
     let mut max_tokens_recovery_count: u32 = 0;
@@ -419,17 +521,24 @@ pub async fn run_query_loop(
     }
 
     let mut used_fallback = false;
-    // How many automatic retries remain when a stream stalls (no data for 45s).
-    let mut retries_left: u32 = 2;
+    // Retries spent on the current model request (#439). Bounded by
+    // `config.retry.max_retries`; reset once a response streams to completion.
+    let mut retry_attempt: u32 = 0;
     // Max-steps graceful degradation (issue #230 / MI-3): set once the final
     // tool-less summary turn has been dispatched so it can never re-trigger
     // (anti-recursion guard).
     let mut degradation_done = false;
+    // Set once a Stop hook has blocked a stop in this run; sent to later Stop
+    // hooks as `stop_hook_active` so they can avoid blocking forever (#447).
+    let mut stop_hook_active = false;
 
-    // If an agent defines a max_turns override, respect it (agent wins over config).
-    let effective_max_turns = config.agent_definition
-        .as_ref()
-        .and_then(|a| a.max_turns)
+    // Turn-cap precedence (PR #398 review): session override (set via
+    // `/turns`) wins over the agent definition, which wins over config.
+    // Without the explicit override field, agent definitions like the
+    // built-in `plan` agent (max_turns: Some(20)) would silently ignore a
+    // user-requested cap change.
+    let effective_max_turns = config.max_turns_override
+        .or_else(|| config.agent_definition.as_ref().and_then(|a| a.max_turns))
         .unwrap_or(config.max_turns);
 
     // In-loop continuation policy (issue #230 / MI-3). Consulted at the end of
@@ -471,10 +580,17 @@ pub async fn run_query_loop(
         // dispatched exactly once, and re-exceeding the cap afterwards returns
         // cold. Applies to both goal and non-goal runs.
         let degradation_turn = if turn > effective_max_turns {
-            if degradation_done {
+            if !degradation_done {
+                if let Some(ref tx) = event_tx {
+                    let _ = tx.send(QueryEvent::MaxTurnsReached { max_turns: effective_max_turns });
+                }
+            }
+            if !config.degradation_enabled || degradation_done {
                 info!(
                     turns = turn,
-                    "Max turns reached after degradation summary — returning"
+                    max = effective_max_turns,
+                    degradation_enabled = config.degradation_enabled,
+                    "Max turns reached — returning without a further summary turn"
                 );
                 let last_msg = messages
                     .last()
@@ -541,7 +657,7 @@ pub async fn run_query_loop(
                         // one-loop-per-goal-turn design.
                         turn = 0;
                         max_tokens_recovery_count = 0;
-                        retries_left = 2;
+                        retry_attempt = 0;
                         goal_turn_start = std::time::Instant::now();
                         continue;
                     }
@@ -556,6 +672,71 @@ pub async fn run_query_loop(
                             usage: $usage,
                         };
                     }
+                }
+            }};
+        }
+
+        // Transient-failure retry (#439). When the retry budget allows: report
+        // the retry, wait per `config.retry` (cancellable), and restart this
+        // turn. Otherwise fall through so the caller surfaces the error.
+        macro_rules! retry_turn {
+            ($reason:expr, $after:expr) => {{
+                if retry_attempt < config.retry.max_retries {
+                    retry_attempt += 1;
+                    let reason: String = $reason;
+                    let delay = config.retry.delay_for(retry_attempt, $after);
+                    warn!(
+                        attempt = retry_attempt,
+                        max_retries = config.retry.max_retries,
+                        delay_ms = delay.as_millis() as u64,
+                        reason = %reason,
+                        "Transient model-request failure; retrying"
+                    );
+                    if let Some(ref tx) = event_tx {
+                        let _ = tx.send(QueryEvent::Retry {
+                            attempt: retry_attempt,
+                            max_attempts: config.retry.max_retries,
+                            delay_ms: delay.as_millis() as u64,
+                            reason,
+                        });
+                    }
+                    tokio::select! {
+                        _ = cancel_token.cancelled() => return QueryOutcome::Cancelled,
+                        _ = tokio::time::sleep(delay) => {}
+                    }
+                    if degradation_turn {
+                        // The retried turn re-injects the summary request.
+                        // Messages drained after the injection (pending /
+                        // command queue) may follow it, so search backwards.
+                        degradation_done = false;
+                        if let Some(idx) = messages.iter().rposition(|m| {
+                            m.role == Role::User && m.get_all_text() == MAX_STEPS_DEGRADATION_MSG
+                        }) {
+                            messages.remove(idx);
+                        }
+                    }
+                    turn -= 1;
+                    continue;
+                }
+            }};
+        }
+
+        // Stop / SubagentStop hooks (#447), fired exactly once for each
+        // finished turn. A hook that blocks the stop has its reason sent to
+        // the model and the loop continues.
+        macro_rules! fire_stop_hooks {
+            ($assistant_msg:expr) => {{
+                if let Some(reason) =
+                    stop_hooks(&$assistant_msg, stop_hook_active, config.is_subagent, tool_ctx).await
+                {
+                    stop_hook_active = true;
+                    let feedback = Message::user(format!("Stop hook feedback: {reason}"));
+                    if let Some(ref tx) = event_tx {
+                        let _ = tx.send(QueryEvent::Status(format!("Stop hook blocked stopping: {reason}")));
+                        let _ = tx.send(QueryEvent::MessageCommitted(feedback.clone()));
+                    }
+                    messages.push(feedback);
+                    continue;
                 }
             }};
         }
@@ -575,44 +756,85 @@ pub async fn run_query_loop(
             }
         }
 
-        // T1-4: Drain the priority command queue (if wired up) and prepend any
-        // resulting messages to the conversation before the API call.
-        // Mirrors the TS `messageQueueManager` priority-queue drain.
+        // Step boundary (#444): deliver queued input — steers typed while the
+        // turn ran and background-task completion notices — before the next
+        // model request. They are appended after the last tool results, in
+        // queue order, and reported so the UI can show them where they landed.
         if let Some(ref cq) = config.command_queue {
             if !cq.is_empty() {
                 let injected = drain_command_queue(cq);
                 if !injected.is_empty() {
                     debug!(count = injected.len(), "Injecting command-queue messages");
-                    // Prepend so that higher-priority commands appear first.
-                    let tail = std::mem::take(messages);
+                    if let Some(ref tx) = event_tx {
+                        let _ = tx.send(QueryEvent::InputInjected(
+                            injected.iter().map(Message::get_all_text).collect(),
+                        ));
+                    }
                     messages.extend(injected);
-                    messages.extend(tail);
                 }
             }
         }
 
-        // Apply tool-result budget: if the cumulative size of all tool results
-        // in the conversation exceeds the configured threshold, replace the
-        // oldest results with a placeholder until we're back under budget.
-        // This mirrors the TS `applyToolResultBudget` call in query.ts.
-        if config.tool_result_budget > 0 {
-            let (budgeted, truncated) =
-                apply_tool_result_budget(std::mem::take(messages), config.tool_result_budget);
-            *messages = budgeted;
-            if truncated > 0 {
-                info!(
-                    truncated,
-                    budget = config.tool_result_budget,
-                    "Tool-result budget exceeded: truncated {} result(s)",
-                    truncated
-                );
-                if let Some(ref tx) = event_tx {
-                    let _ = tx.send(QueryEvent::Status(format!(
-                        "[{} older tool result(s) truncated to save context]",
-                        truncated
-                    )));
-                }
+        // Persist the input queued since the last step before the compaction
+        // check, which journals the compaction against this history.
+        persist_step(config, messages);
+
+        // Resolve where this request goes once, up front, so the compaction
+        // check below summarises through the same provider the request uses.
+        let route = config.provider_registry.as_deref().map(|registry| {
+            resolve_provider_route(registry, config, tool_ctx, &effective_model, client)
+        });
+
+        // Pre-request compaction check point (issue #441). It runs before
+        // every request, including the one that follows each tool batch, so
+        // a large batch of tool results is measured before it is sent.
+        //
+        // The window comes from the models.dev-backed registry (correct for
+        // every provider — 1M Gemini/GPT windows, 32k local models) with the
+        // Claude-centric heuristic as fallback (#216). The numerator anchors
+        // on the real prompt-token count of the last request and estimates
+        // only what was appended since (#231).
+        let context_window = compact::resolve_context_window(
+            config.model_registry.as_deref(),
+            route.as_ref().map_or_else(
+                || tool_ctx.config.provider.as_deref().unwrap_or("anthropic"),
+                |route| route.provider_id.as_str(),
+            ),
+            &effective_model,
+        );
+        let context_tokens = compact::estimate_context_tokens(messages, last_usage);
+
+        // Emit token warning events when approaching context limits.
+        // Thresholds mirror TypeScript autoCompact.ts: 80% → Warning, 95% → Critical.
+        let warning_state =
+            compact::calculate_token_warning_state_for_window(context_tokens, context_window);
+        if warning_state != compact::TokenWarningState::Ok {
+            if let Some(ref tx) = event_tx {
+                let _ = tx.send(QueryEvent::TokenWarning {
+                    state: warning_state,
+                    pct_used: context_tokens as f64 / context_window as f64,
+                });
             }
+        }
+
+        if config.auto_compact
+            && compact_before_request(
+                messages,
+                route.as_ref(),
+                client,
+                &effective_model,
+                context_tokens,
+                context_window,
+                config.max_tokens,
+                &mut compact_state,
+                config.session_journal.as_deref(),
+                event_tx.as_ref(),
+                &cancel_token,
+                tool_ctx,
+            )
+            .await
+        {
+            last_usage = None;
         }
 
         // Request-boundary invariant pass (issue #229 / MI-2). Compaction,
@@ -635,6 +857,7 @@ pub async fn run_query_loop(
         } else {
             tools
                 .iter()
+                .filter(|t| !tool_ctx.tool_is_disallowed(t.name()))
                 .map(|t| ApiToolDefinition::from(&t.to_definition()))
                 .collect()
         };
@@ -647,8 +870,11 @@ pub async fn run_query_loop(
         let effective_effort_level =
             effective_effort_for_turn(config.effort_level, messages.as_slice());
 
-        // Verification nudge: if there are incomplete todos for this session
-        // and the conversation has more than 2 turns, append a reminder.
+        // Assemble the [stable, dynamic] system blocks. Everything that varies
+        // per turn (todo nudge, goal and ultracode addenda, the transient
+        // output-style persona) is routed into the dynamic block through
+        // `append_system_prompt` / `output_style`, so the stable block stays
+        // byte-identical across turns and keeps its prompt-cache entry.
         let system = {
             // Build a (possibly patched) config for system-prompt assembly.
             // Agent prompt prefix and todo nudge are both applied here.
@@ -664,6 +890,19 @@ pub async fn run_query_loop(
                 patched.enabled_tools =
                     Some(tools.iter().map(|t| t.name().to_string()).collect());
             }
+            if patched.permission_mode.is_none() {
+                patched.permission_mode = Some(tool_ctx.config.permission_mode.clone());
+            }
+            if patched.additional_dirs.is_empty() {
+                patched.additional_dirs = tool_ctx
+                    .config
+                    .additional_dirs
+                    .iter()
+                    .map(|dir| dir.display().to_string())
+                    .collect();
+            }
+            patched.sandbox_state =
+                claurst_core::sandbox::render_sandbox_state(&tool_ctx.config.sandbox);
 
             // Apply agent system-prompt prefix: prepend before the main system prompt.
             if let Some(ref agent) = config.agent_definition {
@@ -690,11 +929,23 @@ pub async fn run_query_loop(
             if turn > 2 {
                 let nudge = build_todo_nudge(&tool_ctx.session_id);
                 if !nudge.is_empty() {
-                    patched.append_system_prompt = Some(match &config.append_system_prompt {
+                    patched.append_system_prompt = Some(match patched.append_system_prompt.take() {
                         Some(existing) => format!("{}\n\n{}", existing, nudge),
                         None => nudge,
                     });
                 }
+            }
+
+            // MCP server instructions (from `initialize`) for servers whose
+            // tools this run exposes. Appended after the dynamic boundary:
+            // servers connect and change their tools during a session.
+            if let Some(section) = tool_ctx.mcp_manager.as_ref().and_then(|manager| {
+                manager.instructions_prompt_section(|name| tools.iter().any(|t| t.name() == name))
+            }) {
+                patched.append_system_prompt = Some(match patched.append_system_prompt.take() {
+                    Some(existing) => format!("{}\n\n{}", existing, section),
+                    None => section,
+                });
             }
 
             // Goal system-prompt addendum (issue #230 / MI-3). Applied fresh
@@ -757,12 +1008,26 @@ pub async fn run_query_loop(
             effective_effort_level.and_then(|el| el.thinking_budget_tokens())
         });
 
-        if let Some(budget) = effective_thinking_budget {
-            req_builder = req_builder.thinking(ThinkingConfig::enabled(budget));
+        // Claude reasoning controls: adaptive thinking + `output_config.effort`
+        // on current models, `budget_tokens` on older ones (one table in
+        // `claurst_api::anthropic_reasoning`). Non-Claude models fall into the
+        // budget branch, which is the previous behaviour.
+        let anthropic_reasoning = claurst_api::anthropic_reasoning(
+            &effective_model,
+            effective_effort_level,
+            effective_thinking_budget,
+        );
+        let thinking_is_adaptive = anthropic_reasoning.is_adaptive();
+        if let Some(thinking) = anthropic_reasoning.thinking {
+            req_builder = req_builder.thinking(thinking);
+        }
+        if let Some(effort) = anthropic_reasoning.effort {
+            req_builder = req_builder.effort(effort);
         }
 
         // Apply temperature: explicit config value takes precedence, then agent override,
-        // then effort-level override.
+        // then effort-level override (not for adaptive-thinking models, which
+        // reject sampling parameters alongside thinking).
         let effective_temperature = config.temperature
             .or_else(|| {
                 config.agent_definition.as_ref()
@@ -770,13 +1035,19 @@ pub async fn run_query_loop(
                     .map(|t| t as f32)
             })
             .or_else(|| {
-                effective_effort_level.and_then(|el| el.temperature())
+                effective_effort_level
+                    .filter(|_| !thinking_is_adaptive)
+                    .and_then(|el| el.temperature())
             });
         if let Some(t) = effective_temperature {
             req_builder = req_builder.temperature(t);
         }
 
-        let request = req_builder.build();
+        // `request` is only ever sent through the Anthropic client below (the
+        // provider dispatch path builds its own `ProviderRequest`), so the
+        // Anthropic prompt-cache breakpoints are placed here unconditionally.
+        let mut request = req_builder.build();
+        request.apply_cache_breakpoints();
 
         // Create a stream handler that forwards to the event channel
         let handler: Arc<dyn StreamHandler> = if let Some(ref tx) = event_tx {
@@ -786,132 +1057,16 @@ pub async fn run_query_loop(
             Arc::new(claurst_api::streaming::NullStreamHandler)
         };
 
-        // Non-Anthropic provider dispatch: if the model is "provider/model"
-        // format and the registry has that provider, use it directly.
-        //
-        // Provider resolution priority:
-        //   1. Explicit "provider/model" format in the model string
-        //   2. config.provider setting (from --provider flag or settings.json)
-        //   3. Model registry lookup (e.g. "gemini-3-flash-preview" → google)
-        //   4. Default to "anthropic"
-        if let Some(ref registry) = config.provider_registry {
-            let (provider_id_str, model_id_str) = if let Some(p) = tool_ctx.config.provider.as_deref().filter(|p| *p != "anthropic") {
-                // Explicit non-Anthropic provider in config — use it.
-                // If the stored model is in canonical "provider/model" form,
-                // strip the top-level provider prefix before sending it to the
-                // provider adapter. If it contains an additional slash
-                // (e.g. "meta-llama/Llama-3.3..." on OpenRouter), preserve it.
-                let provider_prefix = format!("{}/", p);
-                let model_id = effective_model
-                    .strip_prefix(&provider_prefix)
-                    .unwrap_or(&effective_model)
-                    .to_string();
-                (p.to_string(), model_id)
-            } else if let Some((p, m)) = effective_model.split_once('/') {
-                // No explicit provider but model has "provider/model" format.
-                // Check whether `p` is a known provider or just a model
-                // namespace (e.g. "meta-llama/Llama-3" on OpenRouter).
-                let known_providers = [
-                    // Native (non-OpenAI-compat) providers
-                    "anthropic", "openai", "google", "azure", "amazon-bedrock",
-                    "github-copilot", "codex", "openai-codex", "cohere", "minimax",
-                    // Local / self-hosted
-                    "ollama",
-                    "lmstudio", "lm-studio",
-                    "llamacpp", "llama-cpp", "llama-server",
-                    // OpenAI-compat cloud providers
-                    "groq", "mistral", "deepseek", "xai", "perplexity", "cerebras",
-                    "openrouter", "togetherai", "together-ai", "deepinfra", "venice",
-                    "huggingface", "nvidia", "fireworks", "sambanova",
-                    // Additional OpenAI-compat providers
-                    "qwen", "alibaba", "siliconflow",
-                    "moonshot", "moonshotai",
-                    "zhipu", "zhipuai",
-                    "zai",
-                    "nebius", "novita", "ovhcloud", "scaleway",
-                    "vultr", "vultr-ai",
-                    "baseten", "friendli", "upstage", "stepfun",
-                ];
-                if known_providers.contains(&p) {
-                    (p.to_string(), m.to_string())
-                } else {
-                    // Treat the whole string as the model ID, fall through
-                    // to auto-detection below.
-                    let fallback_provider = tool_ctx.config.provider.as_deref().unwrap_or("anthropic");
-                    (fallback_provider.to_string(), effective_model.clone())
-                }
-            } else {
-                // No explicit provider set (or set to "anthropic"): try the
-                // model registry to auto-detect provider from the model name.
-                // Use the shared model registry from QueryConfig if available;
-                // otherwise construct a temporary one.
-                let temp_reg;
-                let model_reg: &claurst_api::ModelRegistry = if let Some(ref shared) = config.model_registry {
-                    shared
-                } else {
-                    temp_reg = {
-                        let mut r = claurst_api::ModelRegistry::new();
-                        if let Some(cache_dir) = dirs::cache_dir() {
-                            let cache_path = cache_dir.join("claurst").join("models_dev.json");
-                            r.load_cache(&cache_path);
-                        }
-                        r
-                    };
-                    &temp_reg
-                };
-                if let Some(detected_pid) = model_reg.find_provider_for_model(&effective_model) {
-                    let pid_str = detected_pid.to_string();
-                    if pid_str != "anthropic" {
-                        (pid_str, effective_model.clone())
-                    } else {
-                        ("anthropic".to_string(), effective_model.clone())
-                    }
-                } else {
-                    // Fall back to config.provider (may be "anthropic" or None→"anthropic")
-                    let p = tool_ctx.config.provider.as_deref().unwrap_or("anthropic");
-                    (p.to_string(), effective_model.clone())
-                }
-            };
-
-            // Dispatch through the provider path for non-Anthropic providers,
-            // AND for Anthropic when the pre-built client has no API key
-            // (user started without ANTHROPIC_API_KEY but added one via /connect).
-            let use_provider_dispatch = provider_id_str != "anthropic"
-                || client.api_key_is_empty();
-
+        // Non-Anthropic provider dispatch through the route resolved at the
+        // top of this iteration (see `resolve_provider_route`).
+        if let Some(route) = route {
+            let ProviderRoute {
+                provider_id: provider_id_str,
+                model_id: model_id_str,
+                use_provider_dispatch,
+                provider,
+            } = route;
             if use_provider_dispatch {
-                let pid = claurst_core::provider_id::ProviderId::new(&provider_id_str);
-
-                // Always prefer a fresh provider built from the auth_store so
-                // that keys added at runtime via /connect are picked up
-                // immediately — even when the provider was pre-registered at
-                // startup with a stale or missing key.
-                let runtime_provider =
-                    claurst_api::registry::runtime_provider_for(&provider_id_str);
-
-                let registry_provider = if runtime_provider.is_some() {
-                    // Fresh auth_store key available — use it instead of the
-                    // (possibly stale) registry entry.
-                    None
-                } else {
-                    registry.get(&pid).cloned()
-                };
-
-                let mut provider = runtime_provider.or(registry_provider);
-
-                // Rebuild providers using the unified base resolver so overrides
-                // from settings/env/defaults are applied consistently.
-                if claurst_api::registry::resolve_provider_api_base(
-                    &tool_ctx.config,
-                    &provider_id_str,
-                ).is_some() {
-                    if let Some(overridden) = claurst_api::registry::provider_from_config(
-                        &tool_ctx.config,
-                        &provider_id_str,
-                    ) {
-                        provider = Some(overridden);
-                    }
-                }
                 if let Some(provider) = provider {
                     debug!(provider = %provider_id_str, model = %model_id_str, "Dispatching to non-Anthropic provider");
 
@@ -942,7 +1097,11 @@ pub async fn run_query_loop(
                     // summary turn with no tools so the provider can only emit
                     // text (opencode's `toolChoice:"none"` equivalent).
                     let provider_tools: Vec<claurst_core::types::ToolDefinition> = if caps.tool_calling && !degradation_turn {
-                        tools.iter().map(|t| t.to_definition()).collect()
+                        tools
+                            .iter()
+                            .filter(|t| !tool_ctx.tool_is_disallowed(t.name()))
+                            .map(|t| t.to_definition())
+                            .collect()
                     } else {
                         Vec::new()
                     };
@@ -981,29 +1140,79 @@ pub async fn run_query_loop(
                         top_p: None,
                         top_k: None,
                         stop_sequences: vec![],
-                        thinking: if caps.thinking {
+                        thinking: if !caps.thinking {
+                            None
+                        } else if provider_id_str == "anthropic" {
+                            claurst_api::anthropic_reasoning(
+                                &model_id_str,
+                                effective_effort_level,
+                                effective_thinking_budget,
+                            )
+                            .thinking
+                        } else {
                             effective_thinking_budget
                                 .map(claurst_api::ThinkingConfig::enabled)
-                        } else {
-                            None
                         },
-                        provider_options: build_provider_options(
-                            &provider_id_str,
-                            &model_id_str,
-                            effective_effort_level,
-                            effective_thinking_budget,
-                        ),
+                        provider_options: {
+                            let mut options = build_provider_options(
+                                &provider_id_str,
+                                &model_id_str,
+                                effective_effort_level,
+                                effective_thinking_budget,
+                            );
+                            // ChatGPT routes its prompt cache on a stable
+                            // per-session key (official client: session id).
+                            if matches!(provider_id_str.as_str(), "codex" | "openai-codex") {
+                                if let Some(map) = options.as_object_mut() {
+                                    map.insert(
+                                        "prompt_cache_key".to_string(),
+                                        serde_json::json!(tool_ctx.session_id),
+                                    );
+                                }
+                            }
+                            options
+                        },
                     };
 
                     // Use create_message_stream so the TUI receives real-time
                     // text deltas instead of waiting for the full response.
-                    let mut stream = match provider.create_message_stream(provider_request).await {
+                    let connect = tokio::select! {
+                        _ = cancel_token.cancelled() => return QueryOutcome::Cancelled,
+                        r = provider.create_message_stream(provider_request) => r,
+                    };
+                    let mut stream = match connect {
                         Ok(s) => s,
                         Err(e) => {
+                            // Context-window error: compact once and retry,
+                            // before the transient-retry policy (#441, #439).
+                            if config.auto_compact
+                                && !overflow_recovery_used
+                                && provider_error_is_overflow(&e)
+                            {
+                                overflow_recovery_used = true;
+                                if compact_after_overflow(
+                                    messages,
+                                    provider.as_ref(),
+                                    &model_id_str,
+                                    config.max_tokens,
+                                    config.session_journal.as_deref(),
+                                    event_tx.as_ref(),
+                                    tool_ctx,
+                                )
+                                .await
+                                {
+                                    last_usage = None;
+                                    turn -= 1;
+                                    continue;
+                                }
+                            }
+                            if let claurst_api::RetryDecision::Retry { after } =
+                                claurst_api::retry::classify_provider_error(&e)
+                            {
+                                retry_turn!(e.to_string(), after);
+                            }
                             error!(provider = %provider_id_str, error = %e, "Provider stream failed");
-                            return QueryOutcome::Error(
-                                claurst_core::error::ClaudeError::Api(e.to_string())
-                            );
+                            return QueryOutcome::Error(ClaudeError::Api(e.to_string()));
                         }
                     };
 
@@ -1012,6 +1221,9 @@ pub async fn run_query_loop(
                     // Accumulate reasoning/thinking content for providers like
                     // DeepSeek that require reasoning_content to be sent back.
                     let mut thinking_chunks: Vec<String> = Vec::new();
+                    // Opaque reasoning state (Codex `encrypted_content`)
+                    // that must be replayed on the next request.
+                    let mut redacted_thinking_blocks: Vec<ContentBlock> = Vec::new();
                     // tool_call_blocks: index → (id, name, accumulated_json, thought_signature)
                     // thought_signature carries Gemini's opaque per-call signature
                     // through stream assembly so it survives into the persisted
@@ -1027,10 +1239,18 @@ pub async fn run_query_loop(
                     let provider_stall = tokio::time::sleep(provider_stall_timeout);
                     tokio::pin!(provider_stall);
                     let mut provider_stream_stalled = false;
+                    // Stream integrity (#439): only `MessageStop` marks a
+                    // complete response; a stream that just ends is truncated.
+                    let mut saw_message_stop = false;
                     // Set when the stream yields a mid-stream `Err`. The
                     // accumulated text/tool-calls are then incomplete and MUST
                     // NOT be assembled into a "completed" turn (issue #215).
-                    let mut provider_stream_error: Option<String> = None;
+                    // The error is kept for the overflow check; the decision
+                    // drives the retry policy (#439).
+                    let mut provider_stream_error: Option<(
+                        claurst_api::ProviderError,
+                        claurst_api::RetryDecision,
+                    )> = None;
 
                     loop {
                         tokio::select! {
@@ -1047,7 +1267,8 @@ pub async fn run_query_loop(
                                     None => break,
                                     Some(Err(e)) => {
                                         error!(provider = %provider_id_str, error = %e, "Provider stream error");
-                                        provider_stream_error = Some(e.to_string());
+                                        let decision = claurst_api::retry::classify_provider_error(&e);
+                                        provider_stream_error = Some((e, decision));
                                         break;
                                     }
                                     Some(Ok(evt)) => {
@@ -1069,6 +1290,12 @@ pub async fn run_query_loop(
                                                 content_block: ContentBlock::ToolUse { id, name, thought_signature, .. },
                                             } => {
                                                 tool_call_blocks.insert(*index, (id.clone(), name.clone(), String::new(), thought_signature.clone()));
+                                            }
+                                            claurst_api::StreamEvent::ContentBlockStart {
+                                                content_block: block @ ContentBlock::RedactedThinking { .. },
+                                                ..
+                                            } => {
+                                                redacted_thinking_blocks.push(block.clone());
                                             }
                                             claurst_api::StreamEvent::TextDelta { text, .. } => {
                                                 text_chunks.push(text.clone());
@@ -1098,7 +1325,30 @@ pub async fn run_query_loop(
                                                     merge_provider_stream_usage(&mut usage, u);
                                                 }
                                             }
-                                            claurst_api::StreamEvent::MessageStop => break,
+                                            claurst_api::StreamEvent::MessageStop => {
+                                                saw_message_stop = true;
+                                                break;
+                                            }
+                                            claurst_api::StreamEvent::Error { error_type, message } => {
+                                                error!(provider = %provider_id_str, error_type, message, "Provider in-band stream error");
+                                                provider_stream_error = Some((
+                                                    claurst_api::ProviderError::StreamError {
+                                                        provider: provider.id().clone(),
+                                                        message: format!("{error_type}: {message}"),
+                                                        partial_response: None,
+                                                    },
+                                                    claurst_api::retry::classify_stream_error(error_type, message),
+                                                ));
+                                                break;
+                                            }
+                                            claurst_api::StreamEvent::RateLimits { primary_used_percent, secondary_used_percent } => {
+                                                if let Some(ref tx) = event_tx {
+                                                    let _ = tx.send(QueryEvent::RateLimits {
+                                                        primary_used_percent: *primary_used_percent,
+                                                        secondary_used_percent: *secondary_used_percent,
+                                                    });
+                                                }
+                                            }
                                             _ => {}
                                         }
                                     }
@@ -1107,57 +1357,73 @@ pub async fn run_query_loop(
                         }
                     }
 
-                    // If the stream stalled (no data for 45s), retry.
-                    if provider_stream_stalled && retries_left > 0 {
-                        retries_left -= 1;
-                        warn!(provider = %provider_id_str, model = %model_id_str, retries_left, "Provider stream stalled — retrying");
-                        if let Some(ref tx) = event_tx {
-                            let _ = tx.send(QueryEvent::Status(format!(
-                                "No response for 45s — retrying ({} left)…",
-                                retries_left + 1
-                            )));
-                        }
-                        turn -= 1;
-                        continue;
+                    // A stalled stream is a transient failure: retry the turn
+                    // while the budget allows, never accept the partial output.
+                    if provider_stream_stalled {
+                        let reason = format!(
+                            "no data for {}s",
+                            provider_stall_timeout.as_secs()
+                        );
+                        retry_turn!(reason.clone(), None);
+                        return QueryOutcome::Error(ClaudeError::Api(format!(
+                            "Provider '{}' stream stalled (model '{}'): {}",
+                            provider_id_str, model_id_str, reason
+                        )));
                     }
 
                     // A mid-stream error means the accumulated text and
                     // tool-call JSON are incomplete/untrustworthy. Do NOT fall
                     // through to assemble and execute tools from a truncated
                     // stream (issue #215 — an Edit/Write could otherwise run
-                    // with empty `{}` args). Mirror the Anthropic branch's
-                    // retry semantics: retry the turn if retries remain,
-                    // otherwise surface the failure as a QueryOutcome::Error.
-                    if let Some(err) = provider_stream_error {
-                        if retries_left > 0 {
-                            retries_left -= 1;
-                            warn!(
-                                provider = %provider_id_str,
-                                model = %model_id_str,
-                                retries_left,
-                                error = %err,
-                                "Provider stream error — retrying turn"
-                            );
-                            if let Some(ref tx) = event_tx {
-                                let _ = tx.send(QueryEvent::Status(format!(
-                                    "Stream error — retrying ({} left)…",
-                                    retries_left + 1
-                                )));
+                    // with empty `{}` args). A context-window error compacts
+                    // once and retries; other failures follow the shared
+                    // retry policy, else surface a QueryOutcome::Error.
+                    if let Some((err, decision)) = provider_stream_error {
+                        if config.auto_compact
+                            && !overflow_recovery_used
+                            && provider_error_is_overflow(&err)
+                        {
+                            overflow_recovery_used = true;
+                            if compact_after_overflow(
+                                messages,
+                                provider.as_ref(),
+                                &model_id_str,
+                                config.max_tokens,
+                                config.session_journal.as_deref(),
+                                event_tx.as_ref(),
+                                tool_ctx,
+                            )
+                            .await
+                            {
+                                last_usage = None;
+                                turn -= 1;
+                                continue;
                             }
-                            turn -= 1;
-                            continue;
+                        }
+                        if let claurst_api::RetryDecision::Retry { after } = decision {
+                            retry_turn!(err.to_string(), after);
                         }
                         error!(
                             provider = %provider_id_str,
                             model = %model_id_str,
                             error = %err,
-                            "Provider stream error — retries exhausted; aborting turn"
+                            "Provider stream error — not retryable or retries exhausted"
                         );
                         return QueryOutcome::Error(ClaudeError::Api(format!(
                             "Provider '{}' stream error (model '{}'): {}",
                             provider_id_str, model_id_str, err
                         )));
                     }
+                    // Ended without `MessageStop`: truncated, never a finished turn.
+                    if !saw_message_stop {
+                        let reason = "stream ended before completion".to_string();
+                        retry_turn!(reason.clone(), None);
+                        return QueryOutcome::Error(ClaudeError::Api(format!(
+                            "Provider '{}' {} (model '{}'); retries exhausted",
+                            provider_id_str, reason, model_id_str
+                        )));
+                    }
+                    retry_attempt = 0;
 
                     // Build the content blocks from accumulated stream data.
                     let mut content_blocks: Vec<ContentBlock> = Vec::new();
@@ -1171,6 +1437,7 @@ pub async fn run_query_loop(
                             signature: String::new(),
                         });
                     }
+                    content_blocks.append(&mut redacted_thinking_blocks);
 
                     let combined_text = text_chunks.join("");
                     if !combined_text.is_empty() {
@@ -1186,11 +1453,11 @@ pub async fn run_query_loop(
                     // matching tool_result), but we must NOT execute the tool
                     // with empty/garbage input — instead we surface a tool
                     // error to the model so it can retry (issue #215).
-                    let mut malformed_tool_calls: std::collections::HashSet<String> =
-                        std::collections::HashSet::new();
+                    let mut malformed_tool_calls: std::collections::HashMap<String, String> =
+                        std::collections::HashMap::new();
                     for idx in tc_indices {
                         if let Some((id, name, json_str, thought_signature)) = tool_call_blocks.remove(&idx) {
-                            let input = match parse_tool_args(&json_str) {
+                            let input = match claurst_api::tool_json::parse_tool_input(&json_str) {
                                 Ok(v) => v,
                                 Err(e) => {
                                     warn!(
@@ -1200,7 +1467,7 @@ pub async fn run_query_loop(
                                         error = %e,
                                         "Tool-call arguments failed to parse (truncated/malformed JSON); surfacing a tool error instead of executing with empty args"
                                     );
-                                    malformed_tool_calls.insert(id.clone());
+                                    malformed_tool_calls.insert(id.clone(), e.to_string());
                                     // Placeholder input — this call is never executed.
                                     serde_json::json!({})
                                 }
@@ -1223,8 +1490,27 @@ pub async fn run_query_loop(
                         usage.cache_creation_input_tokens,
                         usage.cache_read_input_tokens,
                     );
+                    last_usage = Some(compact::UsageMark {
+                        prompt_tokens: usage.total_input(),
+                        message_count: messages.len(),
+                    });
+                    overflow_recovery_used = false;
 
                     messages.push(assistant_msg.clone());
+                    persist_step(config, messages);
+
+                    // PostModelTurn hooks (#447): a deny vetoes continuing.
+                    let model_turn_hooks = post_model_turn(&assistant_msg, tool_ctx).await;
+                    if model_turn_hooks.is_deny() {
+                        if let Some(ref tx) = event_tx {
+                            let _ = tx.send(QueryEvent::MessageCommitted(assistant_msg.clone()));
+                            let _ = tx.send(QueryEvent::Status(format!(
+                                "PostModelTurn hook stopped the turn: {}",
+                                model_turn_hooks.reason_or_default()
+                            )));
+                        }
+                        return QueryOutcome::EndTurn { message: assistant_msg, usage };
+                    }
 
                     // Handle tool-use turn: execute tools and loop.
                     let tool_use_blocks: Vec<_> = content_blocks.iter().filter_map(|b| {
@@ -1241,7 +1527,16 @@ pub async fn run_query_loop(
                     // compatible providers (Ollama, LM Studio, etc.) return
                     // finish_reason "stop" even when tool calls are present.
                     if !tool_use_blocks.is_empty() {
+                        if let Some(ref tx) = event_tx {
+                            let _ = tx.send(QueryEvent::MessageCommitted(assistant_msg.clone()));
+                        }
                         let mut tool_results = Vec::new();
+                        // Reject cascade (#445): once the user denies a call,
+                        // the rest of this turn's calls are not run.
+                        let batch_ctx = ToolContext {
+                            batch_rejection: claurst_tools::BatchRejection::default(),
+                            ..tool_ctx.clone()
+                        };
                         for (tool_id, tool_name, tool_input) in tool_use_blocks {
                             // Notify TUI that a tool is starting (matches Anthropic path).
                             if let Some(ref tx) = event_tx {
@@ -1251,16 +1546,15 @@ pub async fn run_query_loop(
                                     input_json: tool_input.to_string(),
                                 });
                             }
-                            let result = if malformed_tool_calls.contains(&tool_id) {
+                            let result = if let Some(err) = malformed_tool_calls.get(&tool_id) {
                                 // Never execute a tool whose arguments could not
                                 // be parsed — return an error the model can see
-                                // and recover from (issue #215).
-                                ToolResult::error(format!(
-                                    "Tool call '{}' was not executed: its arguments were malformed or truncated JSON. Retry the tool call with complete, valid JSON arguments.",
-                                    tool_name
-                                ))
+                                // and recover from (issues #215, #439).
+                                invalid_tool_input_result(&tool_name, err)
+                            } else if batch_ctx.batch_rejection.is_rejected() {
+                                ToolResult::error(claurst_tools::BATCH_REJECTED_MSG)
                             } else {
-                                execute_tool(&tool_name, &tool_input, tools, tool_ctx).await
+                                run_tool_with_hooks(&tool_name, tool_input, tools, &batch_ctx).await
                             };
                             if let Some(ref tx) = event_tx {
                                 let _ = tx.send(QueryEvent::ToolEnd {
@@ -1270,19 +1564,34 @@ pub async fn run_query_loop(
                                     is_error: result.is_error,
                                 });
                             }
+                            let is_error = result.is_error;
                             tool_results.push(ContentBlock::ToolResult {
                                 tool_use_id: tool_id,
-                                content: claurst_core::types::ToolResultContent::Text(result.content),
-                                is_error: Some(result.is_error),
+                                content: tool_result_for_history(
+                                    result.content,
+                                    result.images,
+                                    config.tool_result_max_bytes,
+                                ),
+                                is_error: Some(is_error),
                             });
                         }
-                        messages.push(Message {
+                        if let Some(context) = model_turn_hooks.additional_context {
+                            tool_results.push(ContentBlock::Text {
+                                text: format!("PostModelTurn hook context:\n{context}"),
+                            });
+                        }
+                        let results_msg = Message {
                             role: claurst_core::types::Role::User,
                             content: claurst_core::types::MessageContent::Blocks(tool_results),
                             uuid: None,
                             cost: None,
                             snapshot_patch: None,
-                        });
+                        };
+                        if let Some(ref tx) = event_tx {
+                            let _ = tx.send(QueryEvent::MessageCommitted(results_msg.clone()));
+                        }
+                        messages.push(results_msg);
+                        persist_step(config, messages);
                         continue; // loop for next turn
                     }
 
@@ -1317,6 +1626,7 @@ pub async fn run_query_loop(
                     }
 
                     if let Some(ref tx) = event_tx {
+                        let _ = tx.send(QueryEvent::MessageCommitted(assistant_msg.clone()));
                         let _ = tx.send(QueryEvent::TurnComplete {
                             stop_reason: stop_str.clone(),
                             turn,
@@ -1332,6 +1642,7 @@ pub async fn run_query_loop(
                         }
                     }
 
+                    fire_stop_hooks!(assistant_msg);
                     continue_or_end!(assistant_msg, usage);
                 } else if provider_id_str != "anthropic" {
                     // Non-Anthropic provider detected but no API key / credentials
@@ -1368,14 +1679,49 @@ pub async fn run_query_loop(
 
         // Send to API
         debug!(turn, model = %effective_model, "Sending API request");
-        let mut stream_rx = match client.create_message_stream(request, handler).await {
+        let connect = tokio::select! {
+            _ = cancel_token.cancelled() => return QueryOutcome::Cancelled,
+            r = client.create_message_stream_once(request, handler) => r,
+        };
+        let mut stream_rx = match connect {
             Ok(rx) => rx,
             Err(e) => {
-                // On overloaded/rate-limit errors, attempt one switch to the fallback model.
-                let err_str = e.to_string().to_lowercase();
-                if !used_fallback
-                    && (err_str.contains("overloaded") || err_str.contains("529") || err_str.contains("rate_limit"))
+                // Context-window error: compact once and retry, before the
+                // transient-retry policy (#441, #439).
+                if config.auto_compact
+                    && !overflow_recovery_used
+                    && claude_error_is_overflow(&e)
                 {
+                    overflow_recovery_used = true;
+                    let summariser = anthropic_summariser(client);
+                    if compact_after_overflow(
+                        messages,
+                        &summariser,
+                        &effective_model,
+                        config.max_tokens,
+                        config.session_journal.as_deref(),
+                        event_tx.as_ref(),
+                        tool_ctx,
+                    )
+                    .await
+                    {
+                        last_usage = None;
+                        turn -= 1;
+                        continue;
+                    }
+                }
+                if let claurst_api::RetryDecision::Retry { after } =
+                    claurst_api::retry::classify_claude_error(&e)
+                {
+                    retry_turn!(e.to_string(), after);
+                }
+                // Retries exhausted on an overloaded / rate-limited model:
+                // attempt one switch to the fallback model.
+                let unavailable = matches!(
+                    e,
+                    ClaudeError::RateLimit | ClaudeError::ApiStatus { status: 429 | 529, .. }
+                ) || e.to_string().to_lowercase().contains("overloaded");
+                if !used_fallback && unavailable {
                     if let Some(ref fb) = config.fallback_model {
                         warn!(
                             primary = %effective_model,
@@ -1390,6 +1736,7 @@ pub async fn run_query_loop(
                         }
                         effective_model = fb.clone();
                         used_fallback = true;
+                        retry_attempt = 0;
                         turn -= 1; // don't count this attempt against max_turns
                         continue;
                     }
@@ -1404,8 +1751,14 @@ pub async fn run_query_loop(
         // (some providers are slow; we don't want to give up too early).
         const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
         let mut accumulator = StreamAccumulator::new();
+        // Stream integrity (#439): an in-band `error` event or a stream that
+        // ends without `message_stop` is a failed attempt, never `end_turn`.
+        let mut stream_error: Option<(String, String)> = None;
+        let mut saw_message_stop = false;
         let stall_deadline = tokio::time::sleep(STALL_TIMEOUT);
         tokio::pin!(stall_deadline);
+        // Set when the stream reports a context-window error event.
+        let mut stream_overflow = false;
 
         let stream_stalled = loop {
             tokio::select! {
@@ -1427,9 +1780,17 @@ pub async fn run_query_loop(
                                     if error_type == "overloaded_error" {
                                         warn!(model = %effective_model, "API overloaded");
                                     }
+                                    if claurst_api::is_context_overflow(message) {
+                                        stream_overflow = true;
+                                    }
                                     error!(error_type, message, "Stream error");
+                                    stream_error = Some((error_type.clone(), message.clone()));
+                                    break false;
                                 }
-                                AnthropicStreamEvent::MessageStop => break false,
+                                AnthropicStreamEvent::MessageStop => {
+                                    saw_message_stop = true;
+                                    break false;
+                                }
                                 _ => {}
                             }
                         }
@@ -1439,19 +1800,63 @@ pub async fn run_query_loop(
             }
         };
 
-        if stream_stalled && retries_left > 0 {
-            retries_left -= 1;
-            warn!(model = %effective_model, retries_left, "Stream stalled — retrying request");
-            if let Some(ref tx) = event_tx {
-                let _ = tx.send(QueryEvent::Status(format!(
-                    "No response for 45s — retrying ({} left)…",
-                    retries_left + 1
-                )));
-            }
-            turn -= 1; // don't count this stalled attempt
-            continue;
+        // A stalled stream is a transient failure: retry the turn while the
+        // budget allows, never accept the partial output as a finished turn.
+        if stream_stalled {
+            let reason = format!("no data for {}s", STALL_TIMEOUT.as_secs());
+            retry_turn!(reason.clone(), None);
+            return QueryOutcome::Error(ClaudeError::Api(format!(
+                "Stream stalled (model '{}'): {}",
+                effective_model, reason
+            )));
         }
+        // A context-window error mid-stream: compact once and retry (before
+        // the transient-retry policy); if that is not possible, surface it
+        // rather than a partial turn.
+        if stream_overflow {
+            if config.auto_compact && !overflow_recovery_used {
+                overflow_recovery_used = true;
+                let summariser = anthropic_summariser(client);
+                if compact_after_overflow(
+                    messages,
+                    &summariser,
+                    &effective_model,
+                    config.max_tokens,
+                    config.session_journal.as_deref(),
+                    event_tx.as_ref(),
+                    tool_ctx,
+                )
+                .await
+                {
+                    last_usage = None;
+                    turn -= 1;
+                    continue;
+                }
+            }
+            return QueryOutcome::Error(ClaudeError::ContextWindowExceeded);
+        }
+        if let Some((error_type, message)) = stream_error {
+            let decision = claurst_api::retry::classify_stream_error(&error_type, &message);
+            let reason = format!("{error_type}: {message}");
+            if let claurst_api::RetryDecision::Retry { after } = decision {
+                retry_turn!(reason.clone(), after);
+            }
+            return QueryOutcome::Error(ClaudeError::Api(format!(
+                "Stream error (model '{}'): {}",
+                effective_model, reason
+            )));
+        }
+        if !saw_message_stop {
+            let reason = "stream ended before message_stop".to_string();
+            retry_turn!(reason.clone(), None);
+            return QueryOutcome::Error(ClaudeError::Api(format!(
+                "{} (model '{}'); retries exhausted",
+                reason, effective_model
+            )));
+        }
+        retry_attempt = 0;
 
+        let invalid_tool_inputs = accumulator.take_invalid_tool_inputs();
         let (mut assistant_msg, usage, stop_reason) = accumulator.finish();
 
         // Track costs
@@ -1461,6 +1866,11 @@ pub async fn run_query_loop(
             usage.cache_creation_input_tokens,
             usage.cache_read_input_tokens,
         );
+        last_usage = Some(compact::UsageMark {
+            prompt_tokens: usage.total_input(),
+            message_count: messages.len(),
+        });
+        overflow_recovery_used = false;
 
         // Budget guard: abort the loop if the configured USD cap is exceeded.
         if let Some(limit) = config.max_budget_usd {
@@ -1481,6 +1891,10 @@ pub async fn run_query_loop(
 
         // Append assistant message to conversation
         messages.push(assistant_msg.clone());
+        persist_step(config, messages);
+        if let Some(ref tx) = event_tx {
+            let _ = tx.send(QueryEvent::MessageCommitted(assistant_msg.clone()));
+        }
 
         // If the provider returned an unknown stop reason but the assistant
         // message contains tool_use blocks, treat it as tool_use so we don't
@@ -1496,158 +1910,17 @@ pub async fn run_query_loop(
             _ => raw_stop,
         };
 
-        // T1-3: Fire PostModelTurn hooks after the model samples a response.
-        // Hooks can inject blocking errors or veto continuation entirely.
-        {
-            let hook_result = fire_post_sampling_hooks(&assistant_msg, &tool_ctx.config);
-            if !hook_result.blocking_errors.is_empty() {
-                if hook_result.prevent_continuation {
-                    // Hard veto: push the errors into the conversation and abort.
-                    for err_msg in hook_result.blocking_errors {
-                        messages.push(err_msg);
-                    }
-                    if let Some(ref tx) = event_tx {
-                        let _ = tx.send(QueryEvent::Status(
-                            "PostModelTurn hook vetoed continuation.".to_string(),
-                        ));
-                    }
-                    let last = messages
-                        .last()
-                        .cloned()
-                        .unwrap_or_else(|| Message::assistant("Hook blocked continuation."));
-                    return QueryOutcome::EndTurn {
-                        message: last,
-                        usage,
-                    };
-                }
-                // Soft errors: inject them so the model can react next turn.
-                for err_msg in hook_result.blocking_errors {
-                    debug!("PostModelTurn hook injecting error message");
-                    messages.push(err_msg);
-                }
+        // PostModelTurn hooks (#447): a deny vetoes continuing; context is
+        // sent with this turn's tool results.
+        let model_turn_hooks = post_model_turn(&assistant_msg, tool_ctx).await;
+        if model_turn_hooks.is_deny() {
+            if let Some(ref tx) = event_tx {
+                let _ = tx.send(QueryEvent::Status(format!(
+                    "PostModelTurn hook stopped the turn: {}",
+                    model_turn_hooks.reason_or_default()
+                )));
             }
-        }
-
-        // Resolve the effective context window ONCE per turn for the active
-        // provider+model. Prefer the models.dev-backed registry value (correct
-        // for every provider — 1M Gemini/GPT windows, 32k local models) and
-        // fall back to the Claude-centric heuristic only when the registry has
-        // no usable entry. All threshold logic below keys off this. (#216)
-        let context_window = compact::resolve_context_window(
-            config.model_registry.as_deref(),
-            tool_ctx.config.provider.as_deref().unwrap_or("anthropic"),
-            &config.model,
-        );
-
-        // Numerator for every threshold below: prefer the REAL context-token
-        // count the provider just reported (input + cache-read + cache-creation
-        // = what the model actually saw) over the chars/4 estimate. With prompt
-        // caching the bare `input_tokens` field undercounts badly. Fall back to
-        // the estimate only before the first response / when usage is absent. (#231)
-        let real_usage = usage.total_input();
-        let context_tokens = compact::estimate_context_tokens(
-            messages,
-            (real_usage > 0).then_some(real_usage),
-        );
-
-        // Emit token warning events when approaching context limits.
-        // Thresholds mirror TypeScript autoCompact.ts: 80% → Warning, 95% → Critical.
-        {
-            let warning_state = compact::calculate_token_warning_state_for_window(
-                context_tokens,
-                context_window,
-            );
-            if warning_state != compact::TokenWarningState::Ok {
-                if let Some(ref tx) = event_tx {
-                    let pct_used = context_tokens as f64 / context_window as f64;
-                    let _ = tx.send(QueryEvent::TokenWarning {
-                        state: warning_state,
-                        pct_used,
-                    });
-                }
-            }
-        }
-
-        // Auto-compact: if context is near-full, summarise older messages now
-        // (before the next turn's API call would fail with prompt-too-long).
-        //
-        // Reactive compact (T1-1): when the CLAUDE_REACTIVE_COMPACT feature gate
-        // is enabled, we replace the proactive auto-compact path with reactive
-        // compact / context-collapse instead. This fires on every streaming turn
-        // so it can act before a prompt-too-long error is returned by the API.
-        //
-        // Feature gate check: CLAURST_FEATURE_REACTIVE_COMPACT=1
-        let reactive_compact_enabled =
-            claurst_core::feature_gates::is_feature_enabled("reactive_compact");
-
-        if reactive_compact_enabled {
-            // Reactive path: emergency collapse takes priority over normal compact.
-            let context_limit = context_window;
-            if compact::should_context_collapse(context_tokens, context_limit) {
-                if let Some(ref tx) = event_tx {
-                    let _ = tx.send(QueryEvent::Status(
-                        "Compacting context... (emergency collapse)".to_string(),
-                    ));
-                }
-                // Pass a clone so the live conversation survives a failed
-                // compaction; `*messages` is only overwritten on success (#213).
-                let outcome =
-                    compact::context_collapse(messages.clone(), client, config).await;
-                match apply_compact_result(messages, outcome) {
-                    Ok(tokens_freed) => {
-                        info!(tokens_freed, "Context-collapse complete");
-                    }
-                    Err(e) => {
-                        // `*messages` is left untouched — the conversation is intact.
-                        warn!(error = %e, "Context-collapse failed; conversation preserved");
-                    }
-                }
-            } else if compact::should_compact(context_tokens, context_limit) {
-                if let Some(ref tx) = event_tx {
-                    let _ = tx.send(QueryEvent::Status("Compacting context...".to_string()));
-                }
-                // Pass a clone so the live conversation survives a failed
-                // compaction; `*messages` is only overwritten on success (#213).
-                let outcome = compact::reactive_compact(
-                    messages.clone(),
-                    client,
-                    config,
-                    cancel_token.clone(),
-                    &[],
-                )
-                .await;
-                match apply_compact_result(messages, outcome) {
-                    Ok(tokens_freed) => {
-                        info!(tokens_freed, "Reactive compact complete");
-                    }
-                    // `*messages` is left untouched on both failure arms below.
-                    Err(claurst_core::error::ClaudeError::Cancelled) => {
-                        warn!("Reactive compact was cancelled; conversation preserved");
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "Reactive compact failed; conversation preserved");
-                    }
-                }
-            }
-        } else if stop == "end_turn" || stop == "tool_use" {
-            // Proactive auto-compact (original path, used when reactive compact is off).
-            if let Some(new_msgs) = compact::auto_compact_if_needed(
-                client,
-                messages,
-                context_tokens,
-                &config.model,
-                context_window,
-                &mut compact_state,
-            )
-            .await
-            {
-                *messages = new_msgs;
-                if let Some(ref tx) = event_tx {
-                    let _ = tx.send(QueryEvent::Status(
-                        "Context compacted to stay within limits.".to_string(),
-                    ));
-                }
-            }
+            return QueryOutcome::EndTurn { message: assistant_msg, usage };
         }
 
         if let Some(ref tx) = event_tx {
@@ -1658,39 +1931,9 @@ pub async fn run_query_loop(
             });
         }
 
-        // Helper closure for firing the Stop hook.
-        macro_rules! fire_stop_hook {
-            ($msg:expr) => {{
-                let stop_ctx = claurst_core::hooks::HookContext {
-                    event: "Stop".to_string(),
-                    tool_name: None,
-                    tool_input: None,
-                    tool_output: Some($msg.get_all_text()),
-                    is_error: None,
-                    session_id: Some(tool_ctx.session_id.clone()),
-                };
-                claurst_core::hooks::run_hooks(
-                    &tool_ctx.config.hooks,
-                    claurst_core::config::HookEvent::Stop,
-                    &stop_ctx,
-                    &tool_ctx.working_dir,
-                )
-                .await;
-            }};
-        }
-
         match stop {
             "end_turn" => {
-                fire_stop_hook!(assistant_msg);
-
-                // T1-3: Fire Stop hooks in background (fire-and-forget).
-                // `stop_hooks_with_full_behavior` spawns blocking tasks internally
-                // and returns immediately with an empty Vec.
-                let _bg = stop_hooks_with_full_behavior(
-                    &assistant_msg,
-                    &tool_ctx.config,
-                    tool_ctx.working_dir.clone(),
-                );
+                fire_stop_hooks!(assistant_msg);
 
                 // Asynchronously extract and persist session memories if warranted.
                 // Runs in a detached Tokio task so it doesn't block the query loop.
@@ -1848,8 +2091,8 @@ pub async fn run_query_loop(
                 // ---------------------------------------------------------------------------
                 // Streaming tool executor: parallel non-agent tool dispatch.
                 //
-                // Phase 1: Run PreToolUse hooks sequentially (they can block/deny execution
-                //          and may display interactive permission dialogs).
+                // Phase 1: Run PreToolUse hooks sequentially (they can deny, ask,
+                //          allow or rewrite the input, and may show permission dialogs).
                 // Phase 2: Dispatch all non-blocked tool executions concurrently via
                 //          futures::future::join_all, preserving original order.
                 // Phase 3: Fire PostToolUse hooks + emit events, then collect results.
@@ -1857,24 +2100,28 @@ pub async fn run_query_loop(
                 // This mirrors the TypeScript StreamingToolExecutor pattern.
                 // ---------------------------------------------------------------------------
 
-                // Intermediate record produced during Phase 1.
                 struct PreparedTool {
                     id: String,
                     name: String,
-                    input: Value,
-                    /// None means the pre-hook blocked execution; the String is the error reason.
-                    blocked_result: Option<ToolResult>,
+                    call: PreToolUse,
                 }
+
+                // Reject cascade (#445): the batch gets a fresh `BatchRejection`.
+                // When the user denies one call, the calls that have not
+                // started yet return an error instead of running, and calls
+                // that would prompt are rejected without asking. join_all
+                // polls in order and a prompt blocks the task until answered,
+                // so the calls after a prompted one have not started by then.
+                let batch_ctx = ToolContext {
+                    batch_rejection: claurst_tools::BatchRejection::default(),
+                    ..tool_ctx.clone()
+                };
+                let batch_ctx = &batch_ctx;
 
                 // Phase 1: sequential pre-hook pass.
                 let mut prepared: Vec<PreparedTool> = Vec::with_capacity(tool_blocks.len());
                 for block in tool_blocks {
                     if let ContentBlock::ToolUse { id, name, input, .. } = block {
-                        // Clone from the references returned by get_tool_use_blocks()
-                        let id = id.clone();
-                        let name = name.clone();
-                        let input = input.clone();
-
                         if let Some(ref tx) = event_tx {
                             let _ = tx.send(QueryEvent::ToolStart {
                                 tool_name: name.clone(),
@@ -1883,69 +2130,35 @@ pub async fn run_query_loop(
                             });
                         }
 
-                        let hooks = &tool_ctx.config.hooks;
-                        let hook_ctx = claurst_core::hooks::HookContext {
-                            event: "PreToolUse".to_string(),
-                            tool_name: Some(name.clone()),
-                            tool_input: Some(input.clone()),
-                            tool_output: None,
-                            is_error: None,
-                            session_id: Some(tool_ctx.session_id.clone()),
+                        // Invalid argument JSON (#439): answer with a tool
+                        // error, never run the tool or its hooks with `{}`.
+                        let call = if let Some(err) = invalid_tool_inputs.get(id) {
+                            PreToolUse::Blocked(invalid_tool_input_result(name, err))
+                        } else {
+                            pre_tool_use(name, input.clone(), batch_ctx).await
                         };
-                        let pre_outcome = claurst_core::hooks::run_hooks(
-                            hooks,
-                            claurst_core::config::HookEvent::PreToolUse,
-                            &hook_ctx,
-                            &tool_ctx.working_dir,
-                        )
-                        .await;
-
-                        let plugin_pre_outcome =
-                            claurst_plugins::run_global_pre_tool_hook(&name, &input);
-
-                        let blocked_result =
-                            if let claurst_core::hooks::HookOutcome::Blocked(reason) = pre_outcome {
-                                warn!(tool = %name, reason = %reason, "PreToolUse hook blocked execution");
-                                Some(claurst_tools::ToolResult::error(format!(
-                                    "Blocked by hook: {}",
-                                    reason
-                                )))
-                            } else if let claurst_plugins::HookOutcome::Deny(reason) = plugin_pre_outcome {
-                                warn!(tool = %name, reason = %reason, "Plugin PreToolUse hook blocked execution");
-                                Some(claurst_tools::ToolResult::error(format!(
-                                    "Blocked by plugin hook: {}",
-                                    reason
-                                )))
-                            } else {
-                                None
-                            };
-
-                        prepared.push(PreparedTool {
-                            id,
-                            name,
-                            input,
-                            blocked_result,
-                        });
+                        prepared.push(PreparedTool { id: id.clone(), name: name.clone(), call });
                     }
                 }
 
                 // Phase 2: build execution futures for non-blocked tools and join them.
-                // Blocked tools yield a ready future with the pre-computed error result.
-                // Non-blocked tools execute concurrently via join_all.
-                // Each async block owns its cloned name/input so there are no lifetime issues.
+                // Blocked tools yield a ready future with their error result.
+                // A call a hook allowed runs with that call's permission context.
+                // Every context of the batch shares `batch_ctx.batch_rejection`
+                // (hook contexts are clones of it), so a denial anywhere in the
+                // batch rejects the calls that have not started yet.
                 let exec_futures: Vec<_> = prepared
                     .iter()
-                    .map(|p| {
-                        if p.blocked_result.is_some() {
-                            let r = p.blocked_result.clone().unwrap();
-                            futures::future::Either::Left(async move { r })
-                        } else {
-                            let name = p.name.clone();
-                            let input = p.input.clone();
-                            futures::future::Either::Right(async move {
-                                execute_tool(&name, &input, tools, tool_ctx).await
-                            })
+                    .map(|p| match &p.call {
+                        PreToolUse::Blocked(result) => {
+                            futures::future::Either::Left(std::future::ready(result.clone()))
                         }
+                        PreToolUse::Run { input, ctx } => futures::future::Either::Right(execute_batch_call(
+                            &p.name,
+                            input,
+                            tools,
+                            ctx.as_deref().unwrap_or(batch_ctx),
+                        )),
                     })
                     .collect();
 
@@ -1962,34 +2175,13 @@ pub async fn run_query_loop(
                 // When the batch was cancelled we skip the awaiting PostToolUse
                 // hooks (they run external commands and would defeat the point of
                 // returning promptly) but still emit ToolEnd + build every result
-                // block so the conversation and TUI stay consistent.
+                // block so the conversation and TUI stay consistent. Calls that
+                // never ran get no PostToolUse.
                 let mut result_blocks: Vec<ContentBlock> =
-                    Vec::with_capacity(prepared.len());
-                for (p, result) in prepared.iter().zip(exec_results) {
-                    if !batch_cancelled {
-                        let hooks = &tool_ctx.config.hooks;
-                        let post_ctx = claurst_core::hooks::HookContext {
-                            event: "PostToolUse".to_string(),
-                            tool_name: Some(p.name.clone()),
-                            tool_input: Some(p.input.clone()),
-                            tool_output: Some(result.content.clone()),
-                            is_error: Some(result.is_error),
-                            session_id: Some(tool_ctx.session_id.clone()),
-                        };
-                        claurst_core::hooks::run_hooks(
-                            hooks,
-                            claurst_core::config::HookEvent::PostToolUse,
-                            &post_ctx,
-                            &tool_ctx.working_dir,
-                        )
-                        .await;
-
-                        claurst_plugins::run_global_post_tool_hook(
-                            &p.name,
-                            &p.input,
-                            &result.content,
-                            result.is_error,
-                        );
+                    Vec::with_capacity(prepared.len() + 1);
+                for (p, mut result) in prepared.iter().zip(exec_results) {
+                    if let (false, PreToolUse::Run { input, .. }) = (batch_cancelled, &p.call) {
+                        post_tool_use(&p.name, input, &mut result, tool_ctx).await;
                     }
 
                     if let Some(ref tx) = event_tx {
@@ -2001,16 +2193,31 @@ pub async fn run_query_loop(
                         });
                     }
 
+                    let is_error = result.is_error;
                     result_blocks.push(ContentBlock::ToolResult {
                         tool_use_id: p.id.clone(),
-                        content: ToolResultContent::Text(result.content),
-                        is_error: if result.is_error { Some(true) } else { None },
+                        content: tool_result_for_history(
+                            result.content,
+                            result.images,
+                            config.tool_result_max_bytes,
+                        ),
+                        is_error: if is_error { Some(true) } else { None },
+                    });
+                }
+                if let Some(context) = model_turn_hooks.additional_context {
+                    result_blocks.push(ContentBlock::Text {
+                        text: format!("PostModelTurn hook context:\n{context}"),
                     });
                 }
 
                 // Append tool results as a user message so the history remains
                 // valid (every tool_use is answered) even on cancellation.
-                messages.push(Message::user_blocks(result_blocks));
+                let results_msg = Message::user_blocks(result_blocks);
+                if let Some(ref tx) = event_tx {
+                    let _ = tx.send(QueryEvent::MessageCommitted(results_msg.clone()));
+                }
+                messages.push(results_msg);
+                persist_step(config, messages);
 
                 // If the batch was abandoned due to cancellation, stop the loop
                 // now rather than sending the (cancelled) results back to the model.
@@ -2022,12 +2229,7 @@ pub async fn run_query_loop(
                 continue;
             }
             "stop_sequence" => {
-                fire_stop_hook!(assistant_msg);
-                let _bg = stop_hooks_with_full_behavior(
-                    &assistant_msg,
-                    &tool_ctx.config,
-                    tool_ctx.working_dir.clone(),
-                );
+                fire_stop_hooks!(assistant_msg);
                 if let (Some(ref snap), Some(ref hash)) = (&shadow_snap, &initial_snapshot) {
                     let patch = snap.patch(hash).await;
                     if !patch.files.is_empty() {
@@ -2038,12 +2240,7 @@ pub async fn run_query_loop(
             }
             other => {
                 warn!(stop_reason = other, "Unknown stop reason, treating as end_turn");
-                fire_stop_hook!(assistant_msg);
-                let _bg = stop_hooks_with_full_behavior(
-                    &assistant_msg,
-                    &tool_ctx.config,
-                    tool_ctx.working_dir.clone(),
-                );
+                fire_stop_hooks!(assistant_msg);
                 if let (Some(ref snap), Some(ref hash)) = (&shadow_snap, &initial_snapshot) {
                     let patch = snap.patch(hash).await;
                     if !patch.files.is_empty() {
@@ -2122,22 +2319,43 @@ mod tests {
         assert_eq!(turn_usage.output_tokens, 75);
     }
 
+    #[test]
+    fn from_config_carries_effort_level_through() {
+        let cfg = claurst_core::config::Config {
+            effort: Some("high".to_string()),
+            ..Default::default()
+        };
+        let query_config = QueryConfig::from_config(&cfg);
+        assert_eq!(query_config.effort_level, Some(claurst_core::effort::EffortLevel::High));
+    }
+
+    #[test]
+    fn from_config_unset_effort_is_none() {
+        let cfg = claurst_core::config::Config::default();
+        let query_config = QueryConfig::from_config(&cfg);
+        assert_eq!(query_config.effort_level, None);
+    }
+
     fn make_config(sys: Option<&str>, append: Option<&str>) -> QueryConfig {
         QueryConfig {
             model: "claude-sonnet-4-6".to_string(),
             max_tokens: 4096,
             max_turns: 10,
+            max_turns_override: None,
+            degradation_enabled: true,
             system_prompt: sys.map(String::from),
             append_system_prompt: append.map(String::from),
+            session_context: None,
             output_style: claurst_core::system_prompt::OutputStyle::Default,
             output_style_prompt: None,
             working_directory: None,
+            available_skills: Vec::new(),
+            instruction_files: Vec::new(),
             thinking_budget: None,
             temperature: None,
-            tool_result_budget: 50_000,
+            tool_result_max_bytes: DEFAULT_TOOL_RESULT_MAX_BYTES,
             effort_level: None,
             command_queue: None,
-            skill_index: None,
             max_budget_usd: None,
             fallback_model: None,
             provider_registry: None,
@@ -2146,19 +2364,26 @@ mod tests {
             model_registry: None,
             managed_agents: None,
             enabled_tools: None,
+            permission_mode: None,
+            additional_dirs: Vec::new(),
             continuation: crate::continuation::ContinuationMode::Default,
+            retry: claurst_api::RetryConfig::default(),
+            auto_compact: true,
+            session_journal: None,
+            is_subagent: false,
+            sandbox_state: None,
         }
     }
 
-    // ---- parse_tool_args tests (issue #215) ---------------------------------
+    // ---- tool-argument parsing tests (issues #215, #439) ---------------------------------
 
     #[test]
     fn test_parse_tool_args_valid_object() {
         // A complete JSON object parses to the same value.
-        let v = parse_tool_args("{\"a\":1}").expect("valid JSON should parse");
+        let v = claurst_api::tool_json::parse_tool_input("{\"a\":1}").expect("valid JSON should parse");
         assert_eq!(v, serde_json::json!({ "a": 1 }));
 
-        let v = parse_tool_args("{\"path\": \"/tmp/x\", \"content\": \"hi\"}")
+        let v = claurst_api::tool_json::parse_tool_input("{\"path\": \"/tmp/x\", \"content\": \"hi\"}")
             .expect("valid JSON should parse");
         assert_eq!(v["path"], "/tmp/x");
         assert_eq!(v["content"], "hi");
@@ -2168,9 +2393,9 @@ mod tests {
     fn test_parse_tool_args_empty_is_empty_object() {
         // No-argument tool calls arrive as an empty (or whitespace-only)
         // buffer and must map to `{}` so the happy path still works.
-        assert_eq!(parse_tool_args("").unwrap(), serde_json::json!({}));
-        assert_eq!(parse_tool_args("   ").unwrap(), serde_json::json!({}));
-        assert_eq!(parse_tool_args("\n\t ").unwrap(), serde_json::json!({}));
+        assert_eq!(claurst_api::tool_json::parse_tool_input("").unwrap(), serde_json::json!({}));
+        assert_eq!(claurst_api::tool_json::parse_tool_input("   ").unwrap(), serde_json::json!({}));
+        assert_eq!(claurst_api::tool_json::parse_tool_input("\n\t ").unwrap(), serde_json::json!({}));
     }
 
     #[test]
@@ -2179,25 +2404,25 @@ mod tests {
         // an error, NOT silently become `{}` (which would run Edit/Write with
         // empty arguments).
         assert!(
-            parse_tool_args("{\"a\":").is_err(),
+            claurst_api::tool_json::parse_tool_input("{\"a\":").is_err(),
             "truncated JSON must be an error"
         );
         assert!(
-            parse_tool_args("{\"path\": \"/etc/passwd").is_err(),
+            claurst_api::tool_json::parse_tool_input("{\"path\": \"/etc/passwd").is_err(),
             "truncated string value must be an error"
         );
         assert!(
-            parse_tool_args("{not json}").is_err(),
+            claurst_api::tool_json::parse_tool_input("{not json}").is_err(),
             "invalid JSON must be an error"
         );
 
         // Regression guard: the failing cases must never resolve to `{}`.
         for bad in ["{\"a\":", "{\"path\": \"/etc/passwd", "{not json}"] {
-            let resolved = parse_tool_args(bad).unwrap_or(serde_json::json!({}));
+            let resolved = claurst_api::tool_json::parse_tool_input(bad).unwrap_or(serde_json::json!({}));
             // The OLD buggy behavior turned these into `{}`; assert we now
             // *detect* the error rather than relying on that fallback.
             assert!(
-                parse_tool_args(bad).is_err(),
+                claurst_api::tool_json::parse_tool_input(bad).is_err(),
                 "expected error for {:?}, but got {}",
                 bad,
                 resolved
@@ -2207,103 +2432,97 @@ mod tests {
 
     // ---- build_system_prompt tests ------------------------------------------
 
+    /// Unwrap the `[stable, dynamic]` system blocks and assert that the
+    /// internal boundary marker reaches neither of them.
+    fn prompt_halves(prompt: SystemPrompt) -> (String, String) {
+        let SystemPrompt::Blocks(blocks) = prompt else {
+            panic!("expected [stable, dynamic] system blocks");
+        };
+        assert_eq!(blocks.len(), 2, "expected exactly two system blocks");
+        for block in &blocks {
+            assert!(
+                !block.text.contains(claurst_core::system_prompt::SYSTEM_PROMPT_DYNAMIC_BOUNDARY),
+                "the boundary marker must never be sent to the model"
+            );
+        }
+        (blocks[0].text.clone(), blocks[1].text.clone())
+    }
+
     #[test]
     fn test_system_prompt_default_when_empty() {
         // The default prompt (no custom system prompt set) should include the
-        // Claurst attribution and standard sections.
+        // Claurst attribution and standard sections in the stable block.
         let cfg = make_config(None, None);
-        let prompt = build_system_prompt(&cfg);
-        if let SystemPrompt::Text(text) = prompt {
-            assert!(
-                text.contains("Claurst") || text.contains("Claude agent"),
-                "Default prompt should contain attribution: {}",
-                text
-            );
-            assert!(
-                text.contains(claurst_core::system_prompt::SYSTEM_PROMPT_DYNAMIC_BOUNDARY),
-                "Default prompt must contain the dynamic boundary marker"
-            );
-        } else {
-            panic!("Expected SystemPrompt::Text");
-        }
+        let (stable, _dynamic) = prompt_halves(build_system_prompt(&cfg));
+        assert!(
+            stable.contains("Claurst") || stable.contains("Claude agent"),
+            "Default prompt should contain attribution: {}",
+            stable
+        );
     }
 
     #[test]
     fn test_system_prompt_with_custom() {
-        // A custom system prompt is injected into the cacheable section as
+        // A custom system prompt is injected into the stable block as
         // <custom_instructions>; the default sections are still present.
         let cfg = make_config(Some("You are a code reviewer."), None);
-        let prompt = build_system_prompt(&cfg);
-        if let SystemPrompt::Text(text) = prompt {
-            assert!(
-                text.contains("You are a code reviewer."),
-                "Custom prompt text should appear in the output"
-            );
-            assert!(
-                text.contains("Claurst") || text.contains("Claude agent"),
-                "Default attribution should still be present"
-            );
-        } else {
-            panic!("Expected SystemPrompt::Text");
-        }
+        let (stable, _dynamic) = prompt_halves(build_system_prompt(&cfg));
+        assert!(
+            stable.contains("You are a code reviewer."),
+            "Custom prompt text should appear in the stable block"
+        );
+        assert!(
+            stable.contains("Claurst") || stable.contains("Claude agent"),
+            "Default attribution should still be present"
+        );
     }
 
     #[test]
     fn test_system_prompt_with_append() {
-        // Appended text lands after the dynamic boundary.
+        // Appended text lands in the dynamic block.
         let cfg = make_config(Some("Base prompt."), Some("Additional context."));
-        let prompt = build_system_prompt(&cfg);
-        if let SystemPrompt::Text(text) = prompt {
-            assert!(text.contains("Base prompt."));
-            assert!(text.contains("Additional context."));
-            // append_system_prompt appears after the boundary
-            let boundary_pos = text
-                .find(claurst_core::system_prompt::SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
-                .expect("boundary must exist");
-            let append_pos = text.find("Additional context.").unwrap();
-            assert!(
-                append_pos > boundary_pos,
-                "Appended text must appear after the dynamic boundary"
-            );
-        } else {
-            panic!("Expected SystemPrompt::Text");
-        }
+        let (stable, dynamic) = prompt_halves(build_system_prompt(&cfg));
+        assert!(stable.contains("Base prompt."));
+        assert!(!stable.contains("Additional context."));
+        assert!(dynamic.contains("Additional context."));
     }
 
     #[test]
     fn test_system_prompt_append_only() {
         // When only append is set, default sections are present plus the
-        // appended text after the dynamic boundary.
+        // appended text in the dynamic block.
         let cfg = make_config(None, Some("Appended text."));
-        let prompt = build_system_prompt(&cfg);
-        if let SystemPrompt::Text(text) = prompt {
-            assert!(
-                text.contains("Appended text."),
-                "Appended text must appear in the prompt"
-            );
-            let boundary_pos = text
-                .find(claurst_core::system_prompt::SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
-                .expect("boundary must exist");
-            let append_pos = text.find("Appended text.").unwrap();
-            assert!(
-                append_pos > boundary_pos,
-                "Appended text must appear after the dynamic boundary"
-            );
-        } else {
-            panic!("Expected SystemPrompt::Text");
-        }
+        let (stable, dynamic) = prompt_halves(build_system_prompt(&cfg));
+        assert!(!stable.contains("Appended text."));
+        assert!(
+            dynamic.contains("Appended text."),
+            "Appended text must appear in the dynamic block"
+        );
     }
 
     #[test]
     fn test_system_prompt_with_custom_output_style_prompt() {
         let mut cfg = make_config(None, None);
         cfg.output_style_prompt = Some("Answer like a pirate.".to_string());
-        let prompt = build_system_prompt(&cfg);
-        if let SystemPrompt::Text(text) = prompt {
-            assert!(text.contains("Answer like a pirate."));
-        } else {
-            panic!("Expected SystemPrompt::Text");
-        }
+        let (stable, dynamic) = prompt_halves(build_system_prompt(&cfg));
+        assert!(!stable.contains("Answer like a pirate."));
+        assert!(dynamic.contains("Answer like a pirate."));
+    }
+
+    #[test]
+    fn permission_mode_change_only_touches_the_dynamic_block() {
+        use claurst_core::config::PermissionMode;
+        let mut cfg = make_config(Some("Project rules."), None);
+        cfg.enabled_tools = Some(vec!["Bash".to_string(), "Edit".to_string()]);
+        cfg.permission_mode = Some(PermissionMode::Default);
+        let (stable_default, dynamic_default) = prompt_halves(build_system_prompt(&cfg));
+        cfg.permission_mode = Some(PermissionMode::Plan);
+        let (stable_plan, dynamic_plan) = prompt_halves(build_system_prompt(&cfg));
+
+        assert_eq!(stable_default, stable_plan, "the cached block must stay byte-identical");
+        assert!(dynamic_default.contains("Current permission mode: `default`"));
+        assert!(dynamic_plan.contains("Current permission mode: `plan`"));
+        assert!(!dynamic_plan.contains("`default`"));
     }
 
     // ---- QueryConfig tests --------------------------------------------------
@@ -2573,6 +2792,7 @@ mod tests {
             permission_manager: None,
             user_question_tx: None,
             cancel_token: tokio_util::sync::CancellationToken::new(),
+            batch_rejection: Default::default(),
         }
     }
 
@@ -2653,6 +2873,114 @@ mod tests {
                 level
             );
         }
+    }
+
+    /// #445: a tool covered by `disallowed_tools` is refused before it runs,
+    /// even a read-only one the central backstop would not gate.
+    #[tokio::test]
+    async fn disallowed_tool_is_refused_before_running() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockTool {
+            name: "MockSafe",
+            level: PermissionLevel::ReadOnly,
+            self_gates: false,
+            ran: ran.clone(),
+        })];
+        let mut manager = claurst_core::permissions::PermissionManager::new(
+            claurst_core::config::PermissionMode::BypassPermissions,
+            &claurst_core::config::Settings::default(),
+        );
+        manager.sync_config(&claurst_core::config::Config {
+            permission_mode: claurst_core::config::PermissionMode::BypassPermissions,
+            disallowed_tools: vec!["MockSafe".to_string()],
+            ..Default::default()
+        });
+        let ctx = ToolContext {
+            permission_manager: Some(Arc::new(std::sync::Mutex::new(manager))),
+            ..deny_all_context()
+        };
+
+        assert!(ctx.tool_is_disallowed("MockSafe"));
+        let result = execute_tool("MockSafe", &serde_json::json!({}), &tools, &ctx).await;
+        assert!(result.is_error);
+        assert!(result.content.contains("disallowed"), "{}", result.content);
+        assert!(!ran.load(AtomicOrdering::SeqCst), "a disallowed tool must not run");
+    }
+
+    /// #445: when the user denies a call in a parallel batch with a reason,
+    /// the reason reaches the model and the batch's remaining calls are
+    /// rejected instead of run.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn user_denial_rejects_the_rest_of_the_batch() {
+        let queue = Arc::new(parking_lot::Mutex::new(
+            claurst_tools::PendingPermissionStore::default(),
+        ));
+        // Answer the first prompt as the TUI does when the user types a
+        // reason and denies.
+        let responder_queue = queue.clone();
+        let responder = std::thread::spawn(move || loop {
+            let next = responder_queue.lock().queue.pop_front();
+            if let Some(mut pending) = next {
+                if let Some(tx) = pending.decision_tx.take() {
+                    let _ = tx.send(claurst_core::permissions::PermissionDecision::DenyWithFeedback(
+                        "use cargo check instead".to_string(),
+                    ));
+                }
+                return pending.request.tool_name;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        });
+
+        let asked_ran = Arc::new(AtomicBool::new(false));
+        let later_ran = Arc::new(AtomicBool::new(false));
+        let tools: Vec<Box<dyn Tool>> = vec![
+            Box::new(MockTool {
+                name: "MockExec",
+                level: PermissionLevel::Execute,
+                self_gates: false,
+                ran: asked_ran.clone(),
+            }),
+            Box::new(MockTool {
+                name: "MockSafe",
+                level: PermissionLevel::ReadOnly,
+                self_gates: false,
+                ran: later_ran.clone(),
+            }),
+        ];
+        let ctx = ToolContext {
+            non_interactive: false,
+            pending_permissions: Some(queue),
+            ..deny_all_context()
+        };
+        let input = serde_json::json!({});
+        let batch = vec![
+            execute_batch_call("MockExec", &input, &tools, &ctx),
+            execute_batch_call("MockSafe", &input, &tools, &ctx),
+        ];
+        let (results, cancelled) = run_tool_batch(batch, &ctx.cancel_token).await;
+
+        assert_eq!(responder.join().unwrap(), "MockExec");
+        assert!(!cancelled);
+        assert!(results[0].is_error);
+        assert!(
+            results[0].content.contains("The user said: use cargo check instead"),
+            "{}",
+            results[0].content
+        );
+        assert!(!asked_ran.load(AtomicOrdering::SeqCst));
+        assert!(results[1].is_error);
+        assert_eq!(results[1].content, claurst_tools::BATCH_REJECTED_MSG);
+        assert!(!later_ran.load(AtomicOrdering::SeqCst), "a call after the denial must not run");
+        assert!(ctx.batch_rejection.is_rejected());
+
+        // A fresh batch runs normally again.
+        let fresh = ToolContext {
+            batch_rejection: claurst_tools::BatchRejection::default(),
+            ..ctx.clone()
+        };
+        let result = execute_batch_call("MockSafe", &input, &tools, &fresh).await;
+        assert!(!result.is_error);
+        assert!(later_ran.load(AtomicOrdering::SeqCst));
     }
 
     #[test]
@@ -2763,6 +3091,8 @@ mod tests {
         id: claurst_core::provider_id::ProviderId,
         /// One entry per request: `true` when its tool set was empty.
         tools_empty_per_request: Arc<StdMutex<Vec<bool>>>,
+        /// One entry per request: the system prompt it carried.
+        systems_per_request: Arc<StdMutex<Vec<Option<SystemPrompt>>>>,
         /// When true, always end the turn with text (ignores tools). Otherwise
         /// emit a `tool_use` while tools are present and end the turn once
         /// they're gone (so the degradation turn ends the loop).
@@ -2806,6 +3136,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(tools_empty);
+            self.systems_per_request
+                .lock()
+                .unwrap()
+                .push(request.system_prompt.clone());
 
             let msg_id = uuid::Uuid::new_v4().to_string();
             let emit_tool_use = !self.always_end_turn && !tools_empty;
@@ -2899,10 +3233,36 @@ mod tests {
         tools: Vec<Box<dyn Tool>>,
         continuation: crate::continuation::ContinuationMode,
     ) -> (QueryOutcome, Vec<bool>, Vec<Message>) {
+        drive_loop_with_options(
+            always_end_turn,
+            max_turns,
+            tools,
+            continuation,
+            true,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// Same as [`drive_loop_with_mock`], plus explicit control over the
+    /// `degradation_enabled` flag on `QueryConfig`, the session-level
+    /// `max_turns_override`, and the agent definition's `max_turns` (the
+    /// latter two feed `effective_max_turns`).
+    async fn drive_loop_with_options(
+        always_end_turn: bool,
+        max_turns: u32,
+        tools: Vec<Box<dyn Tool>>,
+        continuation: crate::continuation::ContinuationMode,
+        degradation_enabled: bool,
+        max_turns_override: Option<u32>,
+        agent_max_turns: Option<u32>,
+    ) -> (QueryOutcome, Vec<bool>, Vec<Message>) {
         let recorded = Arc::new(StdMutex::new(Vec::new()));
         let provider = Arc::new(RecordingProvider {
             id: claurst_core::provider_id::ProviderId::new("mockprov"),
             tools_empty_per_request: recorded.clone(),
+            systems_per_request: Arc::new(StdMutex::new(Vec::new())),
             always_end_turn,
         });
         let mut registry = claurst_api::ProviderRegistry::new();
@@ -2922,6 +3282,14 @@ mod tests {
         let mut config = make_config(None, None);
         config.model = "mock-model".to_string();
         config.max_turns = max_turns;
+        config.degradation_enabled = degradation_enabled;
+        config.max_turns_override = max_turns_override;
+        if let Some(agent_turns) = agent_max_turns {
+            config.agent_definition = Some(claurst_core::AgentDefinition {
+                max_turns: Some(agent_turns),
+                ..Default::default()
+            });
+        }
         config.provider_registry = Some(registry);
         config.continuation = continuation;
 
@@ -2948,6 +3316,73 @@ mod tests {
 
         let recorded = recorded.lock().unwrap().clone();
         (outcome, recorded, messages)
+    }
+
+    /// Issue #440: across a scripted multi-turn run the stable system block is
+    /// byte-identical on every request and never carries the boundary marker,
+    /// while per-session and per-turn content stays in the dynamic block.
+    #[tokio::test]
+    async fn stable_system_block_is_byte_identical_across_turns() {
+        let systems = Arc::new(StdMutex::new(Vec::new()));
+        let provider = Arc::new(RecordingProvider {
+            id: claurst_core::provider_id::ProviderId::new("mockprov"),
+            tools_empty_per_request: Arc::new(StdMutex::new(Vec::new())),
+            systems_per_request: systems.clone(),
+            always_end_turn: false,
+        });
+        let mut registry = claurst_api::ProviderRegistry::new();
+        registry.register(provider);
+
+        let client = claurst_api::AnthropicClient::new(claurst_api::client::ClientConfig {
+            api_key: "test-key".to_string(),
+            ..Default::default()
+        })
+        .expect("build test client");
+
+        let mut ctx = deny_all_context();
+        ctx.session_id = "cache-stability-test".to_string();
+        ctx.config.provider = Some("mockprov".to_string());
+
+        let mut config = make_config(Some("Project rules."), Some("Appended."));
+        config.model = "mock-model".to_string();
+        config.max_turns = 1;
+        config.session_context = Some("# Git Status\n## main".to_string());
+        config.output_style = claurst_core::system_prompt::OutputStyle::Concise;
+        config.provider_registry = Some(Arc::new(registry));
+
+        let mut messages = vec![Message::user("start")];
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_query_loop(
+                &client,
+                &mut messages,
+                &noop_tools(),
+                &ctx,
+                &config,
+                claurst_core::cost::CostTracker::new(),
+                None,
+                tokio_util::sync::CancellationToken::new(),
+                None,
+            ),
+        )
+        .await
+        .expect("loop must not hang");
+        assert!(matches!(outcome, QueryOutcome::EndTurn { .. }));
+
+        // Turn 1 uses a tool, turn 2 is the tool-less summary turn.
+        let systems = systems.lock().unwrap().clone();
+        assert_eq!(systems.len(), 2, "expected a two-turn run");
+        let halves: Vec<(String, String)> = systems
+            .into_iter()
+            .map(|system| prompt_halves(system.expect("system prompt sent")))
+            .collect();
+        let (stable, dynamic) = &halves[0];
+        assert_eq!(stable, &halves[1].0, "stable block changed between turns");
+        assert!(stable.contains("Project rules."));
+        for volatile in ["# Git Status", "maximally concise", "Appended."] {
+            assert!(!stable.contains(volatile), "{volatile:?} leaked into the stable block");
+            assert!(dynamic.contains(volatile), "{volatile:?} missing from the dynamic block");
+        }
     }
 
     /// (a) A non-goal turn that ends with `end_turn` stops after exactly one
@@ -3014,6 +3449,131 @@ mod tests {
                 .any(|m| m.get_all_text().contains("maximum number of steps")),
             "the tool-less summary prompt must be injected into the history"
         );
+    }
+
+    /// (c-1) Turn-cap precedence (PR #398 review): the session override set
+    /// via `/turns` must win over the agent definition's cap, which in turn
+    /// wins over the plain config cap. Without the override field, a
+    /// `max_turns: Some(20)` agent definition would silently ignore the
+    /// user's `/turns 1`.
+    #[tokio::test]
+    async fn turns_override_wins_over_agent_and_config_caps() {
+        // Without an override, the agent definition wins over config:
+        // agent cap 3 > config cap 5 → the loop stops at 3 tool turns + 1
+        // degradation summary turn (4 requests, the last tool-less).
+        let (_outcome, recorded, _msgs) = drive_loop_with_options(
+            false,
+            5,
+            noop_tools(),
+            crate::continuation::ContinuationMode::Default,
+            true,
+            None,
+            Some(3),
+        )
+        .await;
+        assert_eq!(
+            recorded.len(),
+            4,
+            "agent cap 3 must beat config cap 5 (3 tool turns + degradation), got {:?}",
+            recorded
+        );
+
+        // With the override, it beats the agent definition: override 2 wins
+        // over agent cap 3 → 2 tool turns + 1 degradation turn (3 requests).
+        let (_outcome, recorded, _msgs) = drive_loop_with_options(
+            false,
+            5,
+            noop_tools(),
+            crate::continuation::ContinuationMode::Default,
+            true,
+            Some(2),
+            Some(3),
+        )
+        .await;
+        assert_eq!(
+            recorded.len(),
+            3,
+            "session override 2 must beat agent cap 3 (2 tool turns + degradation), got {:?}",
+            recorded
+        );
+
+        // The override can also RAISE the cap above the agent definition
+        // (what `/turns off` relies on): override 4 over agent cap 1 → 4 tool
+        // turns + 1 degradation turn (5 requests), more than the agent cap.
+        let (_outcome, recorded, _msgs) = drive_loop_with_options(
+            false,
+            1,
+            noop_tools(),
+            crate::continuation::ContinuationMode::Default,
+            true,
+            Some(4),
+            Some(1),
+        )
+        .await;
+        assert_eq!(
+            recorded.len(),
+            5,
+            "session override 4 must lift agent cap 1 (4 tool turns + degradation), got {:?}",
+            recorded
+        );
+    }
+
+    /// (c-2) With `degradation_summary_enabled: false`, hitting the turn cap
+    /// returns cold immediately: NO extra tool-less summary request is made
+    /// and the summary prompt is never injected into the history.
+    #[tokio::test]
+    async fn max_steps_with_degradation_disabled_returns_cold() {
+        // max_turns = 2: turns 1 & 2 are tool_use turns, turn 3 exceeds the cap.
+        // With the flag off the loop must stop after exactly 2 requests.
+        let (outcome, recorded, msgs) = drive_loop_with_options(
+            false,
+            2,
+            noop_tools(),
+            crate::continuation::ContinuationMode::Default,
+            false,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, QueryOutcome::EndTurn { .. }),
+            "the disabled-flag loop must still end with EndTurn (cold return)"
+        );
+        assert_eq!(
+            recorded.len(),
+            2,
+            "no extra summary request must be dispatched when the flag is off, got {:?}",
+            recorded
+        );
+        assert!(
+            recorded.iter().all(|&empty| !empty),
+            "tools must stay enabled on every dispatched turn: {:?}",
+            recorded
+        );
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| m.get_all_text().contains("maximum number of steps")),
+            "the summary prompt must NOT be injected when the flag is off"
+        );
+        // The cold return must carry the last assistant message verbatim.
+        let last_assistant = msgs
+            .iter()
+            .rev()
+            .find(|m| m.role == claurst_core::types::Role::Assistant)
+            .cloned();
+        if let QueryOutcome::EndTurn { message, .. } = &outcome {
+            let returned_text = message.get_all_text();
+            let expected_text = last_assistant
+                .as_ref()
+                .map(|m| m.get_all_text())
+                .unwrap_or_default();
+            assert_eq!(
+                returned_text, expected_text,
+                "cold return must carry the last assistant message"
+            );
+        }
     }
 
     /// (b) The goal continuation guards, exercised against an in-memory store:
@@ -3223,5 +3783,1481 @@ mod tests {
         let msgs = vec![Message::user("rocky, review this function")];
         let (_style, prompt) = effective_output_style_for_turn(&cfg, &msgs);
         assert!(prompt.unwrap().contains("Project Hail Mary"));
+    }
+
+    // ---- Issue #439: unified retry policy, driven through the real loop -----
+
+    /// One scripted provider response: a request-level error, or the stream
+    /// items to yield for that request.
+    enum ScriptStep {
+        Fail(claurst_api::ProviderError),
+        Stream(Vec<Result<claurst_api::StreamEvent, claurst_api::ProviderError>>),
+    }
+
+    /// A provider double that replays `ScriptStep`s in order (one per
+    /// request) and then answers with a plain `end_turn` text response.
+    struct ScriptedProvider {
+        id: claurst_core::provider_id::ProviderId,
+        steps: StdMutex<std::collections::VecDeque<ScriptStep>>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    fn text_turn(text: &str) -> Vec<Result<claurst_api::StreamEvent, claurst_api::ProviderError>> {
+        use claurst_api::provider_types::StopReason;
+        use claurst_api::StreamEvent;
+        vec![
+            Ok(StreamEvent::MessageStart {
+                id: uuid::Uuid::new_v4().to_string(),
+                model: "mock-model".to_string(),
+                usage: UsageInfo::default(),
+            }),
+            Ok(StreamEvent::TextDelta { index: 0, text: text.to_string() }),
+            Ok(StreamEvent::MessageDelta {
+                stop_reason: Some(StopReason::EndTurn),
+                usage: Some(UsageInfo::default()),
+            }),
+            Ok(StreamEvent::MessageStop),
+        ]
+    }
+
+    #[async_trait::async_trait]
+    impl claurst_api::LlmProvider for ScriptedProvider {
+        fn id(&self) -> &claurst_core::provider_id::ProviderId {
+            &self.id
+        }
+        fn name(&self) -> &str {
+            "scripted-mock"
+        }
+
+        async fn create_message(
+            &self,
+            _request: claurst_api::ProviderRequest,
+        ) -> Result<claurst_api::ProviderResponse, claurst_api::ProviderError> {
+            unimplemented!("these tests only use create_message_stream")
+        }
+
+        async fn create_message_stream(
+            &self,
+            _request: claurst_api::ProviderRequest,
+        ) -> Result<
+            std::pin::Pin<
+                Box<
+                    dyn futures::Stream<
+                            Item = Result<claurst_api::StreamEvent, claurst_api::ProviderError>,
+                        > + Send,
+                >,
+            >,
+            claurst_api::ProviderError,
+        > {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let step = self.steps.lock().unwrap().pop_front();
+            let events = match step {
+                Some(ScriptStep::Fail(e)) => return Err(e),
+                Some(ScriptStep::Stream(events)) => events,
+                None => text_turn("final answer"),
+            };
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+
+        async fn health_check(
+            &self,
+        ) -> Result<claurst_api::ProviderStatus, claurst_api::ProviderError> {
+            Ok(claurst_api::ProviderStatus::Healthy)
+        }
+
+        fn capabilities(&self) -> claurst_api::ProviderCapabilities {
+            claurst_api::ProviderCapabilities {
+                streaming: true,
+                tool_calling: true,
+                thinking: false,
+                image_input: false,
+                pdf_input: false,
+                audio_input: false,
+                video_input: false,
+                caching: false,
+                structured_output: false,
+                system_prompt_style: claurst_api::SystemPromptStyle::TopLevel,
+            }
+        }
+    }
+
+    struct ScriptedRun {
+        outcome: QueryOutcome,
+        calls: usize,
+        events: Vec<QueryEvent>,
+        messages: Vec<Message>,
+    }
+
+    /// Drive `run_query_loop` against a `ScriptedProvider` with a fast retry
+    /// policy (1 ms base back-off) and collect every emitted event.
+    async fn drive_scripted(
+        steps: Vec<ScriptStep>,
+        max_retries: u32,
+        tools: Vec<Box<dyn Tool>>,
+    ) -> ScriptedRun {
+        drive_scripted_with(steps, max_retries, tools, None, Vec::new(), None, None).await
+    }
+
+    /// [`drive_scripted`] with an explicit turn cap and queued user messages
+    /// (drained by the loop at the top of each turn).
+    async fn drive_scripted_with(
+        steps: Vec<ScriptStep>,
+        max_retries: u32,
+        tools: Vec<Box<dyn Tool>>,
+        max_turns: Option<u32>,
+        mut pending: Vec<String>,
+        history: Option<Vec<Message>>,
+        command_queue: Option<CommandQueue>,
+    ) -> ScriptedRun {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = Arc::new(ScriptedProvider {
+            id: claurst_core::provider_id::ProviderId::new("scriptprov"),
+            steps: StdMutex::new(steps.into()),
+            calls: calls.clone(),
+        });
+        let mut registry = claurst_api::ProviderRegistry::new();
+        registry.register(provider);
+
+        let client = claurst_api::AnthropicClient::new(claurst_api::client::ClientConfig {
+            api_key: "test-key".to_string(),
+            ..Default::default()
+        })
+        .expect("build test client");
+
+        let mut ctx = deny_all_context();
+        ctx.session_id = "retry-test".to_string();
+        ctx.config.provider = Some("scriptprov".to_string());
+
+        let mut config = make_config(None, None);
+        config.model = "mock-model".to_string();
+        config.provider_registry = Some(Arc::new(registry));
+        config.retry = claurst_api::RetryConfig {
+            max_retries,
+            initial_delay: std::time::Duration::from_millis(1),
+            ..claurst_api::RetryConfig::default()
+        };
+        if let Some(max_turns) = max_turns {
+            config.max_turns = max_turns;
+        }
+        config.command_queue = command_queue;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut messages = history.unwrap_or_else(|| vec![Message::user("start")]);
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_query_loop(
+                &client,
+                &mut messages,
+                &tools,
+                &ctx,
+                &config,
+                claurst_core::cost::CostTracker::new(),
+                Some(tx),
+                tokio_util::sync::CancellationToken::new(),
+                Some(&mut pending),
+            ),
+        )
+        .await
+        .expect("loop must not hang");
+
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+        ScriptedRun {
+            outcome,
+            calls: calls.load(std::sync::atomic::Ordering::SeqCst),
+            events,
+            messages,
+        }
+    }
+
+    fn pid_scripted() -> claurst_core::provider_id::ProviderId {
+        claurst_core::provider_id::ProviderId::new("scriptprov")
+    }
+
+    fn server_error(status: u16) -> claurst_api::ProviderError {
+        claurst_api::parse_error_response(status, "upstream unavailable", &pid_scripted())
+    }
+
+    #[tokio::test]
+    async fn retry_503_then_success_completes_the_turn() {
+        let run = drive_scripted(vec![ScriptStep::Fail(server_error(503))], 5, noop_tools()).await;
+        assert!(
+            matches!(run.outcome, QueryOutcome::EndTurn { .. }),
+            "a 503 followed by success must complete the turn"
+        );
+        assert_eq!(run.calls, 2, "one failed attempt plus one successful retry");
+        assert!(
+            run.events.iter().any(|e| matches!(
+                e,
+                QueryEvent::Retry { attempt: 1, max_attempts: 5, reason, .. }
+                    if reason.contains("503")
+            )),
+            "the retry must be reported: {:?}",
+            run.events
+        );
+        assert!(
+            run.messages.iter().any(|m| m.get_all_text().contains("final answer")),
+            "the retried response must land in the history"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_401_is_never_retried() {
+        let auth = claurst_api::parse_error_response(
+            401,
+            r#"{"error":{"message":"invalid api key"}}"#,
+            &pid_scripted(),
+        );
+        let run = drive_scripted(vec![ScriptStep::Fail(auth)], 5, noop_tools()).await;
+        assert!(matches!(run.outcome, QueryOutcome::Error(_)), "401 must surface an error");
+        assert_eq!(run.calls, 1, "401 must not be retried");
+    }
+
+    #[tokio::test]
+    async fn retry_429_honours_server_retry_after() {
+        let rate = claurst_api::ProviderError::RateLimited {
+            provider: pid_scripted(),
+            retry_after: Some(std::time::Duration::from_millis(20)),
+        };
+        let started = std::time::Instant::now();
+        let run = drive_scripted(vec![ScriptStep::Fail(rate)], 5, noop_tools()).await;
+        assert!(matches!(run.outcome, QueryOutcome::EndTurn { .. }));
+        assert_eq!(run.calls, 2);
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(20),
+            "the loop must wait at least the server-requested Retry-After"
+        );
+        assert!(
+            run.events
+                .iter()
+                .any(|e| matches!(e, QueryEvent::Retry { delay_ms: 20, .. })),
+            "the Retry event carries the server-requested delay: {:?}",
+            run.events
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_budget_exhaustion_surfaces_an_error() {
+        let steps = (0..3).map(|_| ScriptStep::Fail(server_error(502))).collect();
+        let run = drive_scripted(steps, 2, noop_tools()).await;
+        assert!(
+            matches!(run.outcome, QueryOutcome::Error(_)),
+            "exhausted retries must end the turn with an error"
+        );
+        assert_eq!(run.calls, 3, "initial attempt + 2 retries");
+    }
+
+    #[tokio::test]
+    async fn retry_mid_stream_error_then_success() {
+        let mut cut = text_turn("partial");
+        cut.truncate(2);
+        cut.push(Err(claurst_api::ProviderError::StreamError {
+            provider: pid_scripted(),
+            message: "Stream read error: connection reset".to_string(),
+            partial_response: None,
+        }));
+        let run = drive_scripted(vec![ScriptStep::Stream(cut)], 5, noop_tools()).await;
+        assert!(matches!(run.outcome, QueryOutcome::EndTurn { .. }));
+        assert_eq!(run.calls, 2);
+        assert!(
+            !run.messages.iter().any(|m| m.get_all_text().contains("partial")),
+            "output from the failed attempt must not be kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_stream_cut_without_message_stop_then_success() {
+        let mut cut = text_turn("half an ans");
+        cut.truncate(2); // MessageStart + one delta, then the stream just ends
+        let run = drive_scripted(vec![ScriptStep::Stream(cut)], 5, noop_tools()).await;
+        assert!(matches!(run.outcome, QueryOutcome::EndTurn { .. }));
+        assert_eq!(run.calls, 2, "a truncated stream must be retried");
+        assert!(
+            !run.messages.iter().any(|m| m.get_all_text().contains("half an ans")),
+            "the truncated attempt must not be kept as a finished turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn truncated_stream_with_no_retries_is_an_error_not_end_turn() {
+        let mut cut = text_turn("half");
+        cut.truncate(2);
+        let run = drive_scripted(vec![ScriptStep::Stream(cut)], 0, noop_tools()).await;
+        assert!(
+            matches!(run.outcome, QueryOutcome::Error(_)),
+            "a truncated stream must end the turn with a visible error"
+        );
+    }
+
+    /// A tool-use turn whose argument JSON is `args`, then `end_turn`.
+    fn tool_call_turn(args: &str) -> Vec<Result<claurst_api::StreamEvent, claurst_api::ProviderError>> {
+        use claurst_api::provider_types::StopReason;
+        use claurst_api::StreamEvent;
+        vec![
+            Ok(StreamEvent::MessageStart {
+                id: uuid::Uuid::new_v4().to_string(),
+                model: "mock-model".to_string(),
+                usage: UsageInfo::default(),
+            }),
+            Ok(StreamEvent::ContentBlockStart {
+                index: 1,
+                content_block: ContentBlock::ToolUse {
+                    id: "call-1".to_string(),
+                    name: "noop_tool".to_string(),
+                    input: serde_json::json!({}),
+                    thought_signature: None,
+                },
+            }),
+            Ok(StreamEvent::InputJsonDelta { index: 1, partial_json: args.to_string() }),
+            Ok(StreamEvent::ContentBlockStop { index: 1 }),
+            Ok(StreamEvent::MessageDelta {
+                stop_reason: Some(StopReason::ToolUse),
+                usage: Some(UsageInfo::default()),
+            }),
+            Ok(StreamEvent::MessageStop),
+        ]
+    }
+
+    fn recording_tool() -> (Vec<Box<dyn Tool>>, Arc<AtomicBool>) {
+        let ran = Arc::new(AtomicBool::new(false));
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockTool {
+            name: "noop_tool",
+            level: PermissionLevel::ReadOnly,
+            self_gates: false,
+            ran: ran.clone(),
+        })];
+        (tools, ran)
+    }
+
+    fn tool_result_for(messages: &[Message], id: &str) -> Option<(String, bool)> {
+        messages.iter().find_map(|m| match &m.content {
+            claurst_core::types::MessageContent::Blocks(blocks) => blocks.iter().find_map(|b| match b {
+                ContentBlock::ToolResult { tool_use_id, content, is_error } if tool_use_id == id => {
+                    let text = match content {
+                        ToolResultContent::Text(t) => t.clone(),
+                        other => format!("{other:?}"),
+                    };
+                    Some((text, is_error.unwrap_or(false)))
+                }
+                _ => None,
+            }),
+            _ => None,
+        })
+    }
+
+    #[tokio::test]
+    async fn malformed_tool_json_is_repaired_and_the_tool_runs() {
+        let (tools, ran) = recording_tool();
+        let run = drive_scripted(
+            vec![ScriptStep::Stream(tool_call_turn("{\"note\": \"a\nb\",}"))],
+            0,
+            tools,
+        )
+        .await;
+        assert!(matches!(run.outcome, QueryOutcome::EndTurn { .. }));
+        assert!(ran.load(AtomicOrdering::SeqCst), "repaired arguments must run the tool");
+        let (_, is_error) = tool_result_for(&run.messages, "call-1").expect("tool result");
+        assert!(!is_error);
+    }
+
+    #[tokio::test]
+    async fn unrepairable_tool_json_is_rejected_without_running_the_tool() {
+        let (tools, ran) = recording_tool();
+        let run = drive_scripted(
+            vec![ScriptStep::Stream(tool_call_turn("{\"path\": \"/etc/pas"))],
+            0,
+            tools,
+        )
+        .await;
+        assert!(matches!(run.outcome, QueryOutcome::EndTurn { .. }));
+        assert!(!ran.load(AtomicOrdering::SeqCst), "the tool must not run with `{{}}`");
+        let (text, is_error) = tool_result_for(&run.messages, "call-1").expect("tool result");
+        assert!(is_error);
+        assert!(
+            text.contains("invalid JSON input for tool noop_tool"),
+            "the model must see why: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn retried_degradation_turn_injects_the_summary_prompt_once() {
+        // max_turns = 0 makes the first turn the tool-less summary turn. A
+        // queued message drained after the injection sits after the prompt;
+        // the retry must still remove it before re-injecting.
+        let run = drive_scripted_with(
+            vec![ScriptStep::Fail(server_error(503))],
+            5,
+            noop_tools(),
+            Some(0),
+            vec!["typed during the attempt".to_string()],
+            None,
+            None,
+        )
+        .await;
+        assert!(matches!(run.outcome, QueryOutcome::EndTurn { .. }));
+        assert_eq!(run.calls, 2);
+        let prompts = run
+            .messages
+            .iter()
+            .filter(|m| m.get_all_text() == MAX_STEPS_DEGRADATION_MSG)
+            .count();
+        assert_eq!(prompts, 1, "summary prompt must appear exactly once");
+    }
+
+    // ---- Issue #441: compaction check points --------------------------------
+
+    /// Scripted outcome for one main (non-summary) request.
+    #[derive(Clone, Copy)]
+    enum MainStep {
+        /// Fail with a provider context-window error.
+        Overflow,
+        /// End the turn with text.
+        Reply,
+    }
+
+    /// A provider double for compaction tests. Summarisation requests (the
+    /// summariser system prompt, no tools) get a canned summary; main requests
+    /// replay `script`. Every request is logged as `"summary"`, or as
+    /// `"main:compacted"` / `"main:plain"` depending on whether the history it
+    /// carried starts with a compaction summary.
+    struct CompactionProvider {
+        id: claurst_core::provider_id::ProviderId,
+        script: StdMutex<std::collections::VecDeque<MainStep>>,
+        log: Arc<StdMutex<Vec<String>>>,
+    }
+
+    fn scripted_text(
+        text: &str,
+    ) -> Vec<Result<claurst_api::StreamEvent, claurst_api::ProviderError>> {
+        use claurst_api::provider_types::StopReason;
+        use claurst_api::StreamEvent;
+        vec![
+            Ok(StreamEvent::MessageStart {
+                id: uuid::Uuid::new_v4().to_string(),
+                model: "mock-model".to_string(),
+                usage: UsageInfo::default(),
+            }),
+            Ok(StreamEvent::TextDelta { index: 0, text: text.to_string() }),
+            Ok(StreamEvent::MessageDelta {
+                stop_reason: Some(StopReason::EndTurn),
+                usage: Some(UsageInfo::default()),
+            }),
+            Ok(StreamEvent::MessageStop),
+        ]
+    }
+
+    #[async_trait::async_trait]
+    impl claurst_api::LlmProvider for CompactionProvider {
+        fn id(&self) -> &claurst_core::provider_id::ProviderId {
+            &self.id
+        }
+        fn name(&self) -> &str {
+            "compaction-mock"
+        }
+
+        async fn create_message(
+            &self,
+            _request: claurst_api::ProviderRequest,
+        ) -> Result<claurst_api::ProviderResponse, claurst_api::ProviderError> {
+            unimplemented!("compaction only uses create_message_stream")
+        }
+
+        async fn create_message_stream(
+            &self,
+            request: claurst_api::ProviderRequest,
+        ) -> Result<
+            std::pin::Pin<
+                Box<
+                    dyn futures::Stream<
+                            Item = Result<claurst_api::StreamEvent, claurst_api::ProviderError>,
+                        > + Send,
+                >,
+            >,
+            claurst_api::ProviderError,
+        > {
+            let is_summary = matches!(
+                &request.system_prompt,
+                Some(claurst_api::SystemPrompt::Text(text)) if text.contains("conversation summaries")
+            );
+            if is_summary {
+                self.log.lock().unwrap().push("summary".to_string());
+                return Ok(Box::pin(futures::stream::iter(scripted_text(
+                    "<summary>Earlier work, condensed.</summary>",
+                ))));
+            }
+
+            let compacted = request
+                .messages
+                .first()
+                .is_some_and(|m| m.get_all_text().contains("<compact-summary>"));
+            self.log.lock().unwrap().push(
+                if compacted { "main:compacted" } else { "main:plain" }.to_string(),
+            );
+            let step = self.script.lock().unwrap().pop_front().unwrap_or(MainStep::Reply);
+            match step {
+                MainStep::Overflow => Err(claurst_api::ProviderError::ContextOverflow {
+                    provider: self.id.clone(),
+                    message: "prompt is too long".to_string(),
+                    max_tokens: None,
+                }),
+                MainStep::Reply => Ok(Box::pin(futures::stream::iter(scripted_text("done")))),
+            }
+        }
+
+        async fn health_check(
+            &self,
+        ) -> Result<claurst_api::ProviderStatus, claurst_api::ProviderError> {
+            Ok(claurst_api::ProviderStatus::Healthy)
+        }
+
+        fn capabilities(&self) -> claurst_api::ProviderCapabilities {
+            claurst_api::ProviderCapabilities {
+                streaming: true,
+                tool_calling: true,
+                thinking: false,
+                image_input: false,
+                pdf_input: false,
+                audio_input: false,
+                video_input: false,
+                caching: false,
+                structured_output: false,
+                system_prompt_style: claurst_api::SystemPromptStyle::TopLevel,
+            }
+        }
+    }
+
+    /// `count` alternating user/assistant messages of `size` chars each,
+    /// starting and ending with a user message (`count` must be odd).
+    fn long_history(count: usize, size: usize) -> Vec<Message> {
+        (0..count)
+            .map(|i| {
+                let text = format!("turn {} {}", i, "x".repeat(size));
+                if i % 2 == 0 { Message::user(text) } else { Message::assistant(text) }
+            })
+            .collect()
+    }
+
+    /// Drive `run_query_loop` against [`CompactionProvider`] registered under
+    /// the non-Anthropic id `mockprov`. The mock model has no registry entry,
+    /// so the window falls back to the 100k heuristic and the threshold is
+    /// min(90k, 100k - min(32k, 25k)) = 75k tokens.
+    async fn drive_compaction_loop(
+        history: Vec<Message>,
+        script: Vec<MainStep>,
+        auto_compact: bool,
+    ) -> (QueryOutcome, Vec<String>, Vec<Message>) {
+        drive_journaled_compaction_loop(history, script, auto_compact, None).await
+    }
+
+    /// [`drive_compaction_loop`] with a session journal attached.
+    async fn drive_journaled_compaction_loop(
+        history: Vec<Message>,
+        script: Vec<MainStep>,
+        auto_compact: bool,
+        journal: Option<Arc<claurst_core::session_journal::SessionJournal>>,
+    ) -> (QueryOutcome, Vec<String>, Vec<Message>) {
+        let log = Arc::new(StdMutex::new(Vec::new()));
+        let provider = Arc::new(CompactionProvider {
+            id: claurst_core::provider_id::ProviderId::new("mockprov"),
+            script: StdMutex::new(script.into()),
+            log: log.clone(),
+        });
+        let mut registry = claurst_api::ProviderRegistry::new();
+        registry.register(provider);
+
+        let client = claurst_api::AnthropicClient::new(claurst_api::client::ClientConfig {
+            api_key: "test-key".to_string(),
+            ..Default::default()
+        })
+        .expect("build test client");
+
+        let mut ctx = deny_all_context();
+        ctx.session_id = "compaction-test".to_string();
+        ctx.config.provider = Some("mockprov".to_string());
+
+        let mut config = make_config(None, None);
+        config.model = "mock-model".to_string();
+        config.provider_registry = Some(Arc::new(registry));
+        config.auto_compact = auto_compact;
+        config.session_journal = journal;
+
+        let mut messages = history;
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_query_loop(
+                &client,
+                &mut messages,
+                &noop_tools(),
+                &ctx,
+                &config,
+                claurst_core::cost::CostTracker::new(),
+                None,
+                tokio_util::sync::CancellationToken::new(),
+                None,
+            ),
+        )
+        .await
+        .expect("loop must not hang");
+
+        let log = log.lock().unwrap().clone();
+        (outcome, log, messages)
+    }
+
+    /// Over the threshold, the history is compacted through the active
+    /// (non-Anthropic) provider before the request is sent.
+    #[tokio::test]
+    async fn compaction_triggers_at_threshold_before_request() {
+        // 11 × 30k chars ≈ 110k estimated tokens > 75k threshold.
+        let (outcome, log, msgs) =
+            drive_compaction_loop(long_history(11, 30_000), vec![MainStep::Reply], true).await;
+
+        assert!(matches!(outcome, QueryOutcome::EndTurn { .. }));
+        assert_eq!(log, vec!["summary", "main:compacted"]);
+        assert!(msgs[0].get_all_text().contains("Earlier work, condensed."));
+        assert!(msgs.len() < 11, "history must shrink, got {} messages", msgs.len());
+    }
+
+    #[tokio::test]
+    async fn no_compaction_below_threshold() {
+        let (_outcome, log, _msgs) =
+            drive_compaction_loop(long_history(3, 1_000), vec![MainStep::Reply], true).await;
+        assert_eq!(log, vec!["main:plain"]);
+    }
+
+    /// `--no-auto-compact` (auto_compact = false) leaves an over-threshold
+    /// history alone.
+    #[tokio::test]
+    async fn auto_compact_disabled_skips_threshold_compaction() {
+        let (_outcome, log, msgs) =
+            drive_compaction_loop(long_history(11, 30_000), vec![MainStep::Reply], false).await;
+        assert_eq!(log, vec!["main:plain"]);
+        assert_eq!(msgs.len(), 12, "history untouched plus the reply");
+    }
+
+    /// A context-window error compacts once and retries the request.
+    #[tokio::test]
+    async fn overflow_error_compacts_and_retries() {
+        // 7 × 20k chars ≈ 47k estimated tokens: under the threshold, so only
+        // the provider's overflow error triggers compaction.
+        let (outcome, log, msgs) = drive_compaction_loop(
+            long_history(7, 20_000),
+            vec![MainStep::Overflow, MainStep::Reply],
+            true,
+        )
+        .await;
+
+        assert!(matches!(outcome, QueryOutcome::EndTurn { .. }), "{:?}", outcome);
+        assert_eq!(log, vec!["main:plain", "summary", "main:compacted"]);
+        assert!(msgs[0].get_all_text().contains("<compact-summary>"));
+    }
+
+    /// A second overflow on the retried request surfaces the error.
+    #[tokio::test]
+    async fn repeated_overflow_surfaces_the_error() {
+        let (outcome, log, _msgs) = drive_compaction_loop(
+            long_history(7, 20_000),
+            vec![MainStep::Overflow, MainStep::Overflow],
+            true,
+        )
+        .await;
+
+        assert!(matches!(outcome, QueryOutcome::Error(_)), "{:?}", outcome);
+        assert_eq!(log, vec!["main:plain", "summary", "main:compacted"]);
+    }
+
+    #[tokio::test]
+    async fn overflow_with_auto_compact_disabled_surfaces_the_error() {
+        let (outcome, log, _msgs) = drive_compaction_loop(
+            long_history(7, 20_000),
+            vec![MainStep::Overflow],
+            false,
+        )
+        .await;
+
+        assert!(matches!(outcome, QueryOutcome::Error(_)), "{:?}", outcome);
+        assert_eq!(log, vec!["main:plain"]);
+    }
+
+    // ---- Issue #441: per-item tool-result cap -------------------------------
+
+    /// A read-only tool named like the one `RecordingProvider` calls, whose
+    /// output is far over the per-item cap.
+    struct BigOutputTool;
+
+    #[async_trait::async_trait]
+    impl Tool for BigOutputTool {
+        fn name(&self) -> &str { "noop_tool" }
+        fn description(&self) -> &str { "emits oversized output" }
+        fn permission_level(&self) -> PermissionLevel { PermissionLevel::ReadOnly }
+        fn input_schema(&self) -> Value { serde_json::json!({"type": "object"}) }
+        async fn execute(&self, _input: Value, _ctx: &ToolContext) -> ToolResult {
+            ToolResult::success(format!("FIRST LINE\n{}\nLAST LINE", "y".repeat(200_000)))
+        }
+    }
+
+    /// Each tool result is capped once, when appended: head and tail kept,
+    /// the omitted size noted.
+    #[tokio::test]
+    async fn tool_results_are_capped_head_and_tail_on_insert() {
+        let (_outcome, _recorded, msgs) = drive_loop_with_mock(
+            false,
+            1,
+            vec![Box::new(BigOutputTool)],
+            crate::continuation::ContinuationMode::Default,
+        )
+        .await;
+
+        let result = msgs
+            .iter()
+            .flat_map(|m| match &m.content {
+                claurst_core::types::MessageContent::Blocks(blocks) => blocks.as_slice(),
+                _ => &[],
+            })
+            .find_map(|b| match b {
+                ContentBlock::ToolResult { content: ToolResultContent::Text(t), .. } => Some(t),
+                _ => None,
+            })
+            .expect("tool result in history");
+        assert!(result.starts_with("FIRST LINE"));
+        assert!(result.ends_with("LAST LINE"));
+        assert!(result.contains("bytes omitted from the middle"));
+        assert!(result.len() <= DEFAULT_TOOL_RESULT_MAX_BYTES + 100, "{}", result.len());
+    }
+
+    // ---- Issue #449: per-step session persistence ---------------------------
+
+    /// A tool named like the one `RecordingProvider` calls that records how
+    /// many messages the session journal holds while it runs.
+    struct JournalProbeTool {
+        dir: std::path::PathBuf,
+        session_id: String,
+        seen: Arc<StdMutex<Vec<usize>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for JournalProbeTool {
+        fn name(&self) -> &str { "noop_tool" }
+        fn description(&self) -> &str { "reads the session journal" }
+        fn permission_level(&self) -> PermissionLevel { PermissionLevel::ReadOnly }
+        fn input_schema(&self) -> Value { serde_json::json!({"type": "object"}) }
+        async fn execute(&self, _input: Value, _ctx: &ToolContext) -> ToolResult {
+            let persisted = claurst_core::session_journal::load(&self.dir, &self.session_id)
+                .map(|loaded| loaded.session.messages.len())
+                .unwrap_or(0);
+            self.seen.lock().unwrap().push(persisted);
+            ToolResult::success("ok".to_string())
+        }
+    }
+
+    /// Each assistant message is on disk before its tools run and each
+    /// tool-result batch before the next request, so a crash loses at most
+    /// the step in flight. The loop never writes a snapshot itself: the
+    /// session below is rebuilt from the journal alone.
+    #[tokio::test]
+    async fn every_step_is_journaled_before_the_next_one_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = claurst_core::history::ConversationSession::new("mock-model".to_string());
+        let journal = claurst_core::session_journal::SessionJournal::new(dir.path(), &session);
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+
+        let provider = Arc::new(RecordingProvider {
+            id: claurst_core::provider_id::ProviderId::new("mockprov"),
+            tools_empty_per_request: Arc::new(StdMutex::new(Vec::new())),
+            systems_per_request: Arc::new(StdMutex::new(Vec::new())),
+            always_end_turn: false,
+        });
+        let mut registry = claurst_api::ProviderRegistry::new();
+        registry.register(provider);
+        let client = claurst_api::AnthropicClient::new(claurst_api::client::ClientConfig {
+            api_key: "test-key".to_string(),
+            ..Default::default()
+        })
+        .expect("build test client");
+
+        let mut ctx = deny_all_context();
+        ctx.session_id = session.id.clone();
+        ctx.config.provider = Some("mockprov".to_string());
+        let mut config = make_config(None, None);
+        config.model = "mock-model".to_string();
+        config.max_turns = 2;
+        config.provider_registry = Some(Arc::new(registry));
+        config.session_journal = Some(journal);
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(JournalProbeTool {
+            dir: dir.path().to_path_buf(),
+            session_id: session.id.clone(),
+            seen: seen.clone(),
+        })];
+
+        let mut messages = vec![Message::user("start")];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_query_loop(
+                &client,
+                &mut messages,
+                &tools,
+                &ctx,
+                &config,
+                claurst_core::cost::CostTracker::new(),
+                None,
+                tokio_util::sync::CancellationToken::new(),
+                None,
+            ),
+        )
+        .await
+        .expect("loop must not hang");
+
+        // The tools ran with [start, tool_use] and then with
+        // [start, tool_use, results, tool_use] already journaled.
+        assert_eq!(*seen.lock().unwrap(), [2, 4]);
+        let loaded = claurst_core::session_journal::load(dir.path(), &session.id).unwrap();
+        assert!(loaded.rebuilt, "no snapshot was written by the loop");
+        let persisted: Vec<String> = loaded.session.messages.iter().map(|m| m.get_all_text()).collect();
+        let live: Vec<String> = messages.iter().map(|m| m.get_all_text()).collect();
+        assert_eq!(persisted, live);
+    }
+
+    /// A compaction inside the loop is journaled with the head it replaced,
+    /// so a resumed session starts from the summary and /rewind can still
+    /// reach the original messages.
+    #[tokio::test]
+    async fn loop_compaction_is_journaled_with_the_replaced_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = claurst_core::history::ConversationSession::new("mock-model".to_string());
+        let journal = claurst_core::session_journal::SessionJournal::new(dir.path(), &session);
+        let history = long_history(11, 30_000);
+        let first = history[0].get_all_text();
+
+        let (outcome, log, msgs) = drive_journaled_compaction_loop(
+            history,
+            vec![MainStep::Reply],
+            true,
+            Some(journal),
+        )
+        .await;
+        assert!(matches!(outcome, QueryOutcome::EndTurn { .. }));
+        assert_eq!(log, vec!["summary", "main:compacted"]);
+
+        let resumed = claurst_core::session_journal::load(dir.path(), &session.id)
+            .unwrap()
+            .session;
+        assert_eq!(resumed.messages.len(), msgs.len());
+        assert!(resumed.messages[0].get_all_text().contains("Earlier work, condensed."));
+        assert_eq!(resumed.compactions.len(), 1);
+        let replaced = &resumed.compactions[0].replaced;
+        assert_eq!(replaced.len(), resumed.compactions[0].replaced_len());
+        assert_eq!(replaced[0].get_all_text(), first);
+        assert_eq!(resumed.rewind_timeline().count(), replaced.len() + msgs.len());
+    }
+
+    /// #439 x #441: a context-window error compacts once and retries; it is
+    /// not treated as a transient failure (no `Retry` event, no back-off).
+    #[tokio::test]
+    async fn overflow_compacts_once_then_retries_without_a_retry_event() {
+        let overflow = claurst_api::ProviderError::ContextOverflow {
+            provider: pid_scripted(),
+            message: "prompt is too long".to_string(),
+            max_tokens: None,
+        };
+        // Request 1 overflows; request 2 is the summariser; request 3 succeeds.
+        let run = drive_scripted_with(
+            vec![
+                ScriptStep::Fail(overflow),
+                ScriptStep::Stream(text_turn("<summary>Earlier work, condensed.</summary>")),
+            ],
+            5,
+            noop_tools(),
+            None,
+            Vec::new(),
+            Some(long_history(7, 20_000)),
+            None,
+        )
+        .await;
+        assert_eq!(run.calls, 3, "overflow, summary, retried request");
+        assert!(matches!(run.outcome, QueryOutcome::EndTurn { .. }), "{:?}", run.events);
+        assert!(
+            !run.events.iter().any(|e| matches!(e, QueryEvent::Retry { .. })),
+            "an overflow must not be reported as a transient retry: {:?}",
+            run.events
+        );
+        assert_eq!(
+            run.events.iter().filter(|e| matches!(e, QueryEvent::Compacted(_))).count(),
+            1,
+            "exactly one compaction: {:?}",
+            run.events
+        );
+    }
+
+    // ---- Issue #444: steering through the command queue ---------------------
+
+    /// A tool that, while it runs, does what the TUI does when the user
+    /// presses Enter mid-turn: push steers into the shared queue.
+    struct SteerWhileRunningTool {
+        queue: CommandQueue,
+        steers: Vec<&'static str>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for SteerWhileRunningTool {
+        fn name(&self) -> &str { "noop_tool" }
+        fn description(&self) -> &str { "pushes steers while running" }
+        fn permission_level(&self) -> PermissionLevel { PermissionLevel::ReadOnly }
+        fn input_schema(&self) -> Value { serde_json::json!({"type": "object"}) }
+        async fn execute(&self, _input: Value, _ctx: &ToolContext) -> ToolResult {
+            for steer in &self.steers {
+                self.queue.push(
+                    QueuedCommand::InjectUserMessage((*steer).to_string()),
+                    CommandPriority::Normal,
+                );
+            }
+            ToolResult::success("tool done")
+        }
+    }
+
+    fn texts_of(messages: &[Message]) -> Vec<(Role, String)> {
+        messages.iter().map(|m| (m.role.clone(), m.get_all_text())).collect()
+    }
+
+    #[tokio::test]
+    async fn steer_is_delivered_after_tool_results_before_the_next_request() {
+        let queue = CommandQueue::new();
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(SteerWhileRunningTool {
+            queue: queue.clone(),
+            steers: vec!["also check the docs", "and the tests"],
+        })];
+        let run = drive_scripted_with(
+            vec![ScriptStep::Stream(tool_call_turn("{}"))],
+            0,
+            tools,
+            None,
+            Vec::new(),
+            None,
+            Some(queue.clone()),
+        )
+        .await;
+        assert!(matches!(run.outcome, QueryOutcome::EndTurn { .. }));
+        assert_eq!(run.calls, 2, "the steers ride the request after the tool batch");
+        assert!(queue.is_empty(), "the step boundary drained the queue");
+
+        let history = texts_of(&run.messages);
+        let result_at = run
+            .messages
+            .iter()
+            .position(|m| !m.get_tool_result_blocks().is_empty())
+            .expect("tool result in history");
+        assert_eq!(
+            &history[result_at + 1..result_at + 3],
+            &[
+                (Role::User, "also check the docs".to_string()),
+                (Role::User, "and the tests".to_string()),
+            ],
+            "steers follow the tool results in the order typed: {history:?}"
+        );
+        assert_eq!(history.last().map(|(role, _)| role.clone()), Some(Role::Assistant));
+
+        let injected: Vec<&Vec<String>> = run
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                QueryEvent::InputInjected(texts) => Some(texts),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            injected,
+            [&vec!["also check the docs".to_string(), "and the tests".to_string()]]
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_input_is_drained_before_the_first_request_of_a_turn() {
+        // The idle wake-up path: a turn starts with only a queued notice, and
+        // the loop delivers it before its first request.
+        let queue = CommandQueue::new();
+        queue.push(
+            QueuedCommand::InjectUserMessage(
+                "<background-shell id=\"t1\" state=\"completed\">ok</background-shell>".into(),
+            ),
+            CommandPriority::Normal,
+        );
+        let history = vec![Message::user("start"), Message::assistant("started it")];
+        let run = drive_scripted_with(
+            Vec::new(),
+            0,
+            noop_tools(),
+            None,
+            Vec::new(),
+            Some(history),
+            Some(queue.clone()),
+        )
+        .await;
+        assert!(matches!(run.outcome, QueryOutcome::EndTurn { .. }));
+        assert_eq!(run.calls, 1);
+        assert!(queue.is_empty());
+        let history = texts_of(&run.messages);
+        assert_eq!(history[2].0, Role::User);
+        assert!(history[2].1.starts_with("<background-shell "), "{history:?}");
+        assert_eq!(history[3], (Role::Assistant, "final answer".to_string()));
+    }
+
+    #[tokio::test]
+    async fn an_empty_queue_injects_nothing() {
+        let queue = CommandQueue::new();
+        let run = drive_scripted_with(
+            vec![ScriptStep::Stream(tool_call_turn("{}"))],
+            0,
+            noop_tools(),
+            None,
+            Vec::new(),
+            None,
+            Some(queue),
+        )
+        .await;
+        assert!(matches!(run.outcome, QueryOutcome::EndTurn { .. }));
+        assert!(!run.events.iter().any(|e| matches!(e, QueryEvent::InputInjected(_))));
+        assert_eq!(run.messages.iter().filter(|m| m.role == Role::User).count(), 2);
+    }
+}
+
+/// Hook call sites in `run_query_loop` (#447), driven through the provider
+/// branch by a scripted provider and real `sh` hook fixtures.
+#[cfg(all(test, unix))]
+mod hook_loop_tests {
+    use super::*;
+    use claurst_core::config::{HookCommand, HookEvent, HookMap, HookMatcher, HookType};
+    use claurst_core::permissions::{PermissionDecision, PermissionHandler, PermissionRequest};
+    use std::collections::VecDeque;
+    use std::path::Path;
+    use std::sync::Mutex as StdMutex;
+
+    /// One scripted model response.
+    enum Step {
+        /// Call `rec_tool` with this JSON input.
+        Tool(&'static str),
+        /// End the turn with this text.
+        Text(&'static str),
+    }
+
+    struct ScriptedProvider {
+        id: claurst_core::provider_id::ProviderId,
+        steps: StdMutex<VecDeque<Step>>,
+        requests: Arc<StdMutex<usize>>,
+    }
+
+    #[async_trait::async_trait]
+    impl claurst_api::LlmProvider for ScriptedProvider {
+        fn id(&self) -> &claurst_core::provider_id::ProviderId {
+            &self.id
+        }
+        fn name(&self) -> &str {
+            "scripted-mock"
+        }
+
+        async fn create_message(
+            &self,
+            _request: claurst_api::ProviderRequest,
+        ) -> Result<claurst_api::ProviderResponse, claurst_api::ProviderError> {
+            unimplemented!("these tests only use create_message_stream")
+        }
+
+        async fn create_message_stream(
+            &self,
+            _request: claurst_api::ProviderRequest,
+        ) -> Result<
+            std::pin::Pin<
+                Box<
+                    dyn futures::Stream<
+                            Item = Result<claurst_api::StreamEvent, claurst_api::ProviderError>,
+                        > + Send,
+                >,
+            >,
+            claurst_api::ProviderError,
+        > {
+            use claurst_api::provider_types::StopReason;
+            use claurst_api::StreamEvent;
+
+            *self.requests.lock().unwrap() += 1;
+            let step = self.steps.lock().unwrap().pop_front().unwrap_or(Step::Text("done"));
+            let start = Ok(StreamEvent::MessageStart {
+                id: uuid::Uuid::new_v4().to_string(),
+                model: "mock-model".to_string(),
+                usage: UsageInfo::default(),
+            });
+            let events = match step {
+                Step::Tool(input) => vec![
+                    start,
+                    Ok(StreamEvent::ContentBlockStart {
+                        index: 0,
+                        content_block: ContentBlock::ToolUse {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            name: "rec_tool".to_string(),
+                            input: serde_json::json!({}),
+                            thought_signature: None,
+                        },
+                    }),
+                    Ok(StreamEvent::InputJsonDelta { index: 0, partial_json: input.to_string() }),
+                    Ok(StreamEvent::MessageDelta {
+                        stop_reason: Some(StopReason::ToolUse),
+                        usage: Some(UsageInfo::default()),
+                    }),
+                    Ok(StreamEvent::MessageStop),
+                ],
+                Step::Text(text) => vec![
+                    start,
+                    Ok(StreamEvent::TextDelta { index: 0, text: text.to_string() }),
+                    Ok(StreamEvent::MessageDelta {
+                        stop_reason: Some(StopReason::EndTurn),
+                        usage: Some(UsageInfo::default()),
+                    }),
+                    Ok(StreamEvent::MessageStop),
+                ],
+            };
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+
+        async fn health_check(
+            &self,
+        ) -> Result<claurst_api::ProviderStatus, claurst_api::ProviderError> {
+            Ok(claurst_api::ProviderStatus::Healthy)
+        }
+
+        fn capabilities(&self) -> claurst_api::ProviderCapabilities {
+            claurst_api::ProviderCapabilities {
+                streaming: true,
+                tool_calling: true,
+                thinking: false,
+                image_input: false,
+                pdf_input: false,
+                audio_input: false,
+                video_input: false,
+                caching: false,
+                structured_output: false,
+                system_prompt_style: claurst_api::SystemPromptStyle::TopLevel,
+            }
+        }
+    }
+
+    /// Records every input it runs with. Execute-level and not self-gating,
+    /// so the central permission backstop asks before it runs. With
+    /// `nested`, it also asks permission for that tool while running, the way
+    /// the Agent tool's sub-agent does, and records `{"nested_allowed": bool}`.
+    struct RecTool {
+        inputs: Arc<StdMutex<Vec<Value>>>,
+        nested: Option<&'static str>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for RecTool {
+        fn name(&self) -> &str {
+            "rec_tool"
+        }
+        fn description(&self) -> &str {
+            "records its inputs"
+        }
+        fn permission_level(&self) -> PermissionLevel {
+            PermissionLevel::Execute
+        }
+        fn input_schema(&self) -> Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, input: Value, ctx: &ToolContext) -> ToolResult {
+            self.inputs.lock().unwrap().push(input);
+            if let Some(nested) = self.nested {
+                let allowed = ctx.check_permission(nested, "nested call", false).is_ok();
+                self.inputs.lock().unwrap().push(serde_json::json!({ "nested_allowed": allowed }));
+            }
+            ToolResult::success("rec ran")
+        }
+    }
+
+    struct FixedHandler(PermissionDecision);
+
+    impl PermissionHandler for FixedHandler {
+        fn check_permission(&self, _request: &PermissionRequest) -> PermissionDecision {
+            self.0.clone()
+        }
+        fn request_permission(&self, request: &PermissionRequest) -> PermissionDecision {
+            self.check_permission(request)
+        }
+    }
+
+    fn on(hooks: &mut HookMap, event: HookEvent, matcher: Option<&str>, command: String) {
+        hooks.entry(event).or_default().push(HookMatcher {
+            matcher: matcher.map(str::to_string),
+            hooks: vec![HookCommand { kind: HookType::Command, command, timeout: Some(10), plugin: None }],
+        });
+    }
+
+    /// Append the hook's stdin payload to `file`, one JSON object per line.
+    fn log_payload(file: &Path) -> String {
+        format!("cat >> '{0}'; echo >> '{0}'", file.display())
+    }
+
+    fn read_payloads(file: &Path) -> Vec<Value> {
+        std::fs::read_to_string(file)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    struct Run {
+        outcome: QueryOutcome,
+        history: String,
+        tool_inputs: Vec<Value>,
+        requests: usize,
+    }
+
+    async fn drive(hooks: HookMap, steps: Vec<Step>, permission: PermissionDecision, is_subagent: bool) -> Run {
+        drive_nested(hooks, steps, permission, is_subagent, None).await
+    }
+
+    async fn drive_nested(
+        hooks: HookMap,
+        steps: Vec<Step>,
+        permission: PermissionDecision,
+        is_subagent: bool,
+        nested: Option<&'static str>,
+    ) -> Run {
+        let requests = Arc::new(StdMutex::new(0));
+        let provider = Arc::new(ScriptedProvider {
+            id: claurst_core::provider_id::ProviderId::new("mockprov"),
+            steps: StdMutex::new(steps.into()),
+            requests: requests.clone(),
+        });
+        let mut registry = claurst_api::ProviderRegistry::new();
+        registry.register(provider);
+
+        let client = claurst_api::AnthropicClient::new(claurst_api::client::ClientConfig {
+            api_key: "test-key".to_string(),
+            ..Default::default()
+        })
+        .expect("build test client");
+
+        let config = Config { provider: Some("mockprov".to_string()), hooks, ..Default::default() };
+        let ctx = ToolContext {
+            working_dir: std::env::temp_dir(),
+            permission_mode: claurst_core::config::PermissionMode::Default,
+            permission_handler: Arc::new(FixedHandler(permission)),
+            cost_tracker: claurst_core::cost::CostTracker::new(),
+            session_id: "hook-loop-test".to_string(),
+            file_history: Arc::new(parking_lot::Mutex::new(claurst_core::file_history::FileHistory::new())),
+            current_turn: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            non_interactive: true,
+            mcp_manager: None,
+            config,
+            managed_agent_config: None,
+            completion_notifier: None,
+            pending_permissions: None,
+            permission_manager: None,
+            user_question_tx: None,
+            cancel_token: tokio_util::sync::CancellationToken::new(),
+            batch_rejection: Default::default(),
+        };
+
+        let query_config = QueryConfig {
+            model: "mock-model".to_string(),
+            max_turns: 6,
+            provider_registry: Some(Arc::new(registry)),
+            is_subagent,
+            ..Default::default()
+        };
+
+        let inputs = Arc::new(StdMutex::new(Vec::new()));
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(RecTool { inputs: inputs.clone(), nested })];
+        let mut messages = vec![Message::user("start")];
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_query_loop(
+                &client,
+                &mut messages,
+                &tools,
+                &ctx,
+                &query_config,
+                claurst_core::cost::CostTracker::new(),
+                None,
+                tokio_util::sync::CancellationToken::new(),
+                None,
+            ),
+        )
+        .await
+        .expect("loop must not hang");
+
+        let tool_inputs = inputs.lock().unwrap().clone();
+        let requests = *requests.lock().unwrap();
+        Run { outcome, history: serde_json::to_string(&messages).unwrap(), tool_inputs, requests }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stop_fires_exactly_once_per_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let stop_log = dir.path().join("stop.log");
+        let mut hooks = HookMap::new();
+        on(&mut hooks, HookEvent::Stop, None, log_payload(&stop_log));
+        on(&mut hooks, HookEvent::SubagentStop, None, log_payload(&stop_log));
+
+        let run = drive(hooks, vec![Step::Tool("{}"), Step::Text("finished")], PermissionDecision::Allow, false).await;
+
+        assert!(matches!(run.outcome, QueryOutcome::EndTurn { .. }));
+        let payloads = read_payloads(&stop_log);
+        assert_eq!(payloads.len(), 1, "one Stop for one finished turn: {payloads:?}");
+        assert_eq!(payloads[0]["hook_event_name"], "Stop");
+        assert_eq!(payloads[0]["session_id"], "hook-loop-test");
+        assert_eq!(payloads[0]["stop_hook_active"], false);
+        assert_eq!(payloads[0]["last_assistant_message"], "finished");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn subagent_loop_fires_subagent_stop_instead_of_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let stop_log = dir.path().join("stop.log");
+        let mut hooks = HookMap::new();
+        on(&mut hooks, HookEvent::Stop, None, log_payload(&stop_log));
+        on(&mut hooks, HookEvent::SubagentStop, None, log_payload(&stop_log));
+
+        drive(hooks, vec![Step::Text("sub done")], PermissionDecision::Allow, true).await;
+
+        let payloads = read_payloads(&stop_log);
+        assert_eq!(payloads.len(), 1, "{payloads:?}");
+        assert_eq!(payloads[0]["hook_event_name"], "SubagentStop");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stop_hook_block_feeds_reason_back_and_continues() {
+        let dir = tempfile::tempdir().unwrap();
+        let stop_log = dir.path().join("stop.log");
+        let mut hooks = HookMap::new();
+        // Block the first stop only: once `stop_hook_active` is set, allow.
+        on(
+            &mut hooks,
+            HookEvent::Stop,
+            None,
+            format!(
+                "p=$(cat); echo \"$p\" >> '{}'; case \"$p\" in *'\"stop_hook_active\":true'*) exit 0;; esac; echo 'run the tests' >&2; exit 2",
+                stop_log.display()
+            ),
+        );
+
+        let run = drive(hooks, vec![Step::Text("first"), Step::Text("second")], PermissionDecision::Allow, false).await;
+
+        assert_eq!(run.requests, 2, "a blocked stop continues the loop once");
+        assert!(run.history.contains("Stop hook feedback: run the tests"), "{}", run.history);
+        let payloads = read_payloads(&stop_log);
+        assert_eq!(payloads.len(), 2);
+        assert_eq!(payloads[0]["stop_hook_active"], false);
+        assert_eq!(payloads[1]["stop_hook_active"], true);
+        match run.outcome {
+            QueryOutcome::EndTurn { message, .. } => assert_eq!(message.get_all_text(), "second"),
+            other => panic!("unexpected outcome {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pre_tool_use_deny_blocks_the_call() {
+        let mut hooks = HookMap::new();
+        on(&mut hooks, HookEvent::PreToolUse, Some("rec_tool"), "echo 'not today' >&2; exit 2".into());
+
+        let run = drive(hooks, vec![Step::Tool(r#"{"x":1}"#), Step::Text("ok")], PermissionDecision::Allow, false).await;
+
+        assert!(run.tool_inputs.is_empty(), "denied tool must not run");
+        assert!(run.history.contains("Blocked by PreToolUse hook: not today"), "{}", run.history);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn matcher_that_does_not_select_the_tool_leaves_it_alone() {
+        let mut hooks = HookMap::new();
+        on(&mut hooks, HookEvent::PreToolUse, Some("Edit|Write"), "exit 2".into());
+
+        let run = drive(hooks, vec![Step::Tool(r#"{"x":1}"#), Step::Text("ok")], PermissionDecision::Allow, false).await;
+
+        assert_eq!(run.tool_inputs, vec![serde_json::json!({"x": 1})]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn updated_input_replaces_input_and_post_tool_use_adds_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let post_log = dir.path().join("post.log");
+        let mut hooks = HookMap::new();
+        on(&mut hooks, HookEvent::PreToolUse, None, r#"echo '{"updatedInput":{"x":2}}'"#.into());
+        on(
+            &mut hooks,
+            HookEvent::PostToolUse,
+            Some("rec_.*"),
+            format!(
+                "cat >> '{0}'; echo >> '{0}'; echo '{{\"additionalContext\":\"lint clean\"}}'",
+                post_log.display()
+            ),
+        );
+
+        let run = drive(hooks, vec![Step::Tool(r#"{"x":1}"#), Step::Text("ok")], PermissionDecision::Allow, false).await;
+
+        assert_eq!(run.tool_inputs, vec![serde_json::json!({"x": 2})]);
+        let post = read_payloads(&post_log);
+        assert_eq!(post.len(), 1);
+        assert_eq!(post[0]["hook_event_name"], "PostToolUse");
+        assert_eq!(post[0]["tool_name"], "rec_tool");
+        assert_eq!(post[0]["tool_input"], serde_json::json!({"x": 2}));
+        assert_eq!(post[0]["tool_response"]["content"], "rec ran");
+        assert!(run.history.contains("PostToolUse hook context:\\nlint clean"), "{}", run.history);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hook_allow_skips_the_prompt_but_not_a_denial() {
+        let mut allow_hooks = HookMap::new();
+        on(&mut allow_hooks, HookEvent::PreToolUse, None, r#"echo '{"decision":"allow"}'"#.into());
+
+        // The policy would ask (a hard denial when non-interactive): the
+        // hook's allow answers the prompt.
+        let ask = PermissionDecision::Ask { reason: "policy asks".into() };
+        let run = drive(allow_hooks.clone(), vec![Step::Tool("{}"), Step::Text("ok")], ask, false).await;
+        assert_eq!(run.tool_inputs.len(), 1, "allow must answer the permission prompt");
+
+        // An explicit policy denial still wins.
+        let run = drive(allow_hooks, vec![Step::Tool("{}"), Step::Text("ok")], PermissionDecision::Deny, false).await;
+        assert!(run.tool_inputs.is_empty(), "allow must not override a denial");
+    }
+
+    /// A hook allowing a call (say, `Agent`) approves that call's own
+    /// prompts only, never prompts for other tools raised while it runs
+    /// (the sub-agent's Bash or Write calls).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hook_allow_does_not_approve_nested_tool_calls() {
+        let mut hooks = HookMap::new();
+        on(&mut hooks, HookEvent::PreToolUse, Some("rec_tool"), r#"echo '{"decision":"allow"}'"#.into());
+
+        let ask = PermissionDecision::Ask { reason: "policy asks".into() };
+        let run = drive_nested(hooks, vec![Step::Tool("{}"), Step::Text("ok")], ask, false, Some("Bash")).await;
+
+        assert_eq!(
+            run.tool_inputs,
+            vec![serde_json::json!({}), serde_json::json!({ "nested_allowed": false })],
+            "the allowed tool runs; its nested Bash prompt is still denied non-interactively"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hook_ask_prompts_even_when_policy_allows() {
+        let mut hooks = HookMap::new();
+        on(&mut hooks, HookEvent::PreToolUse, None, r#"echo '{"decision":"ask","reason":"double-check"}'"#.into());
+
+        // Non-interactive: the forced prompt cannot be answered, so it denies.
+        let run = drive(hooks, vec![Step::Tool("{}"), Step::Text("ok")], PermissionDecision::Allow, false).await;
+
+        assert!(run.tool_inputs.is_empty(), "ask must not run the tool unprompted");
+        assert!(run.history.contains("double-check"), "{}", run.history);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn post_model_turn_deny_stops_before_tools_run() {
+        let mut hooks = HookMap::new();
+        on(&mut hooks, HookEvent::PostModelTurn, None, "echo 'budget' >&2; exit 2".into());
+
+        let run = drive(hooks, vec![Step::Tool("{}"), Step::Text("never")], PermissionDecision::Allow, false).await;
+
+        assert!(matches!(run.outcome, QueryOutcome::EndTurn { .. }));
+        assert!(run.tool_inputs.is_empty());
+        assert_eq!(run.requests, 1);
     }
 }

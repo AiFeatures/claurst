@@ -88,110 +88,16 @@ fn default_transport() -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Hook event types
-// ---------------------------------------------------------------------------
-
-/// All lifecycle events that plugin hooks can subscribe to.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub enum HookEventKind {
-    PreToolUse,
-    PostToolUse,
-    PostToolUseFailure,
-    PermissionDenied,
-    Notification,
-    UserPromptSubmit,
-    SessionStart,
-    SessionEnd,
-    Stop,
-    StopFailure,
-    SubagentStart,
-    SubagentStop,
-    PreCompact,
-    PostCompact,
-    PermissionRequest,
-    Setup,
-    TeammateIdle,
-    TaskCreated,
-    TaskCompleted,
-    Elicitation,
-    ElicitationResult,
-    ConfigChange,
-    WorktreeCreate,
-    WorktreeRemove,
-    InstructionsLoaded,
-    CwdChanged,
-    FileChanged,
-}
-
-impl std::fmt::Display for HookEventKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = match self {
-            HookEventKind::PreToolUse => "PreToolUse",
-            HookEventKind::PostToolUse => "PostToolUse",
-            HookEventKind::PostToolUseFailure => "PostToolUseFailure",
-            HookEventKind::PermissionDenied => "PermissionDenied",
-            HookEventKind::Notification => "Notification",
-            HookEventKind::UserPromptSubmit => "UserPromptSubmit",
-            HookEventKind::SessionStart => "SessionStart",
-            HookEventKind::SessionEnd => "SessionEnd",
-            HookEventKind::Stop => "Stop",
-            HookEventKind::StopFailure => "StopFailure",
-            HookEventKind::SubagentStart => "SubagentStart",
-            HookEventKind::SubagentStop => "SubagentStop",
-            HookEventKind::PreCompact => "PreCompact",
-            HookEventKind::PostCompact => "PostCompact",
-            HookEventKind::PermissionRequest => "PermissionRequest",
-            HookEventKind::Setup => "Setup",
-            HookEventKind::TeammateIdle => "TeammateIdle",
-            HookEventKind::TaskCreated => "TaskCreated",
-            HookEventKind::TaskCompleted => "TaskCompleted",
-            HookEventKind::Elicitation => "Elicitation",
-            HookEventKind::ElicitationResult => "ElicitationResult",
-            HookEventKind::ConfigChange => "ConfigChange",
-            HookEventKind::WorktreeCreate => "WorktreeCreate",
-            HookEventKind::WorktreeRemove => "WorktreeRemove",
-            HookEventKind::InstructionsLoaded => "InstructionsLoaded",
-            HookEventKind::CwdChanged => "CwdChanged",
-            HookEventKind::FileChanged => "FileChanged",
-        };
-        write!(f, "{}", s)
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Hook definitions (hooks.json / inline hooks in manifest)
 // ---------------------------------------------------------------------------
 
-/// A single hook command entry (mirrors the TS `HookEntry`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PluginHookEntry {
-    /// Shell command to run. Receives the event JSON on stdin.
-    pub command: String,
-    /// Optional tool-name filter — only fires for this tool (PreToolUse / PostToolUse).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub matcher: Option<String>,
-    /// If true, a non-zero exit code blocks the operation.
-    #[serde(default)]
-    pub blocking: bool,
-}
-
-/// A matcher + list of hooks for one event.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct PluginHookMatcher {
-    /// Optional glob/regex pattern to match tool names.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub matcher: Option<String>,
-    pub hooks: Vec<PluginHookEntry>,
-}
-
-/// The hooks configuration object (`hooks.json` or inline in `plugin.json`).
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+/// A plugin's hooks (`hooks/hooks.json` or the manifest's inline `hooks`),
+/// in the same shape as settings hooks (`docs/hooks.md`). They run through
+/// the core hook engine.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct PluginHooksConfig {
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    /// Map of event name → list of matchers.
-    #[serde(flatten)]
-    pub events: HashMap<String, Vec<PluginHookMatcher>>,
+    pub events: claurst_core::config::HookMap,
 }
 
 // ---------------------------------------------------------------------------

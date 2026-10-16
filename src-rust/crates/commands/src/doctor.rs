@@ -168,6 +168,10 @@ impl SlashCommand for DoctorCommand {
         } else {
             lines.push(format!("  ✗ Config dir missing: {}", config_dir.display()));
         }
+        lines.push(format!(
+            "  • Log file: {}",
+            claurst_core::paths::log_file_path_in(&config_dir).display()
+        ));
 
         // Settings validation — try loading ~/.claurst/settings.json
         let settings_path = config_dir.join("settings.json");
@@ -252,12 +256,16 @@ impl SlashCommand for DoctorCommand {
 
         // ── Hooks ───────────────────────────────────────────────────────────
         lines.push("Hooks".to_string());
-        let hook_count: usize = ctx.config.hooks.values().map(|v| v.len()).sum();
-        if hook_count == 0 {
+        let hook_count: usize = ctx.config.hooks.values().flatten().map(|g| g.hooks.len()).sum();
+        let plugin_hook_count: usize = claurst_core::hooks::plugin_hooks()
+            .map_or(0, |hooks| hooks.values().flatten().map(|g| g.hooks.len()).sum());
+        if hook_count + plugin_hook_count == 0 {
             lines.push("  • No hooks configured".to_string());
         } else {
-            lines.push(format!("  ✓ {hook_count} hook(s) configured across {} event(s)",
-                ctx.config.hooks.len()));
+            lines.push(format!(
+                "  ✓ {hook_count} settings hook(s) across {} event(s), {plugin_hook_count} plugin hook(s)",
+                ctx.config.hooks.len()
+            ));
         }
         lines.push(String::new());
 

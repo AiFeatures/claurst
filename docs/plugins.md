@@ -1,27 +1,33 @@
 # Plugins
 
-Claurst's plugin system lets you extend the agent with additional slash commands, agents, skills, MCP servers, LSP servers, and lifecycle hooks — all packaged in a single directory.
+Claurst's plugin system lets you extend the agent with additional slash commands, MCP servers, and lifecycle hooks, packaged in a single directory. Markdown files in a plugin's `agents/` directory are added to the prompt of Agent-tool sub-agents. The manifest also accepts skills, output styles and LSP servers, but those are not loaded yet (see the field reference).
 
 ---
 
 ## Plugin Discovery
 
-Plugins are loaded from the `~/.claurst/plugins/` directory. Each subdirectory that contains a valid `plugin.toml` or `plugin.json` manifest is treated as a plugin.
+Plugins are loaded from `~/.claurst/plugins/` (user plugins) and from `<project>/.claurst/plugins/` (project plugins). Each subdirectory that contains a valid `plugin.json` or `plugin.toml` manifest is treated as a plugin. `--bare` skips plugin loading at startup.
+
+Every discovered plugin is enabled. The `enabledPlugins` / `disabledPlugins` settings written by `/plugin enable` and `/plugin disable` are not consulted when plugins load.
 
 ```
 ~/.claurst/plugins/
 ├── my-plugin/
 │   ├── plugin.toml          <- manifest
 │   ├── commands/            <- *.md slash command definitions
-│   ├── agents/              <- *.md agent definitions
+│   ├── agents/              <- *.md appended to the default system prompt of Agent-tool sub-agents
 │   ├── skills/              <- subdirectories with SKILL.md
 │   ├── hooks/               <- hooks.json (optional)
-│   └── output-styles/       <- *.md or *.json style definitions
+│   └── output-styles/       <- scanned, not used
 └── another-plugin/
     └── plugin.json
 ```
 
-Both `plugin.toml` (TOML format) and `plugin.json` (JSON format) are supported. The loader normalises camelCase and snake_case field names, so manifests written in either convention are accepted.
+Both `plugin.toml` (TOML format) and `plugin.json` (JSON format) are supported; when a directory has both, `plugin.json` is used. The loader normalises camelCase and snake_case field names, so manifests written in either convention are accepted.
+
+### Plugin commands
+
+Every `.md` file under `commands/` (searched recursively) and every path listed in the manifest's `commands` field becomes a slash command named `<plugin>:<file stem>` regardless of subdirectory; `commands/build/deploy.md` in `my-plugin` is `/my-plugin:deploy`. A `SKILL.md` among them becomes `/<plugin>:<its directory name>`. Running the command sends the file's content as a user message, with `Arguments: <args>` appended when arguments are given. Plugin commands are read from disk each time they run.
 
 ---
 
@@ -47,7 +53,7 @@ repository = "https://github.com/you/my-plugin"
 # Extra command files beyond the commands/ directory
 commands = ["./extra/review.md"]
 
-# Extra agent markdown files beyond the agents/ directory
+# Extra agent markdown files (parsed, not loaded yet)
 agents = ["./agents/reviewer.md"]
 
 # Extra skill directories beyond the skills/ directory
@@ -63,7 +69,7 @@ type    = "stdio"
 [mcp_servers.env]
 API_TOKEN = "${MY_SERVICE_TOKEN}"
 
-# Inline LSP server definitions
+# Inline LSP server definitions (parsed, not started yet)
 [[lsp_servers]]
 name    = "pyright"
 command = "pyright-langserver"
@@ -74,7 +80,7 @@ restart_on_crash = true
 [lsp_servers.extension_to_language]
 ".py" = "python"
 
-# User-configurable options (surfaced in /plugin info)
+# User-configurable options (parsed, not used yet)
 [user_config.api_token]
 type        = "string"
 title       = "API Token"
@@ -88,10 +94,10 @@ title       = "Max Results"
 description = "Maximum items to return per query"
 default     = 20
 
-# Capability grants (omit to allow all)
+# Capability grants for plugin slash commands (omit to allow all)
 capabilities = ["read_files", "network", "shell"]
 
-# Marketplace identifier
+# Marketplace identifier (parsed, not used)
 marketplace_id = "you/my-plugin"
 ```
 
@@ -163,25 +169,27 @@ marketplace_id = "you/my-plugin"
 | `homepage` | string | URL for the plugin's home page |
 | `repository` | string | URL for the source repository |
 | `license` | string | SPDX license identifier (e.g. `"MIT"`) |
-| `keywords` | array of strings | Tags used in marketplace search |
-| `marketplace_id` | string | Unique identifier in the plugin marketplace (e.g. `"author/plugin-name"`) |
+| `keywords` | array of strings | Tags (parsed, not used) |
+| `marketplace_id` | string | Parsed, not used; there is no plugin marketplace |
 
 ### Content Declarations
 
 | Field | Type | Description |
 |---|---|---|
 | `commands` | array of strings | Paths to extra slash command `.md` files or directories, relative to the plugin root. Supplements the `commands/` directory. |
-| `agents` | array of strings | Paths to extra agent `.md` files. Supplements the `agents/` directory. |
-| `skills` | array of strings | Paths to extra skill directories (each must contain a `SKILL.md`). Supplements the `skills/` directory. |
-| `output_styles` | array of strings | Paths to extra output style definitions. |
+| `agents` | array of strings | Parsed, not read; the `agents/` directory is used (see above). |
+| `skills` | array of strings | Paths to extra skill directories (each must contain a `SKILL.md`). Supplements the `skills/` directory. Plugin skill directories are not yet part of the session skill registry; to use a plugin's skills today, add its `skills/` directory to `skills.paths` (see [Skills](configuration.md#skills)). |
+| `output_styles` | array of strings | Parsed, not used: plugin output styles (this field and the `output-styles/` directory) are not loaded. |
 
 ### mcp_servers
 
-An array of inline MCP server definitions. Each entry is identical to an `McpServerConfig` (see the MCP documentation). In `plugin.json` the field can also be written as `"mcpServers"` with an object mapping (the loader converts it to the array form automatically).
+An array of inline MCP server definitions with `name`, `command`, `args`, `env`, `url` and `type` (see [MCP](mcp.md)); `headers` and the timeout fields are not read from plugins. In `plugin.json` the field can also be written as `"mcpServers"` with an object mapping (the loader converts it to the array form automatically).
+
+Servers from plugins in a project's `.claurst/plugins/` are tagged as project servers and need the same approval as project `mcp_servers`; user and system plugin servers connect without a prompt. Plugin servers are appended to the server list at startup (unless a configured server has that name) but are not started by the initial connect; they start the next time the MCP runtime is rebuilt in the TUI (`r` in the `/mcp` panel, approving a project server, finishing `/mcp auth`, or `/import-config`). They never start in headless or ACP runs. `/plugin reload` does not add or remove servers.
 
 ### lsp_servers
 
-An array of LSP server definitions for language-aware editing support:
+Parsed and counted in the `/reload-plugins` summary, but not started: the `LSP` tool only uses `config.lsp_servers` from settings (see [LspTool](tools.md#lsptool)). Accepted fields:
 
 | Field | Type | Description |
 |---|---|---|
@@ -199,11 +207,11 @@ An array of LSP server definitions for language-aware editing support:
 
 ### hooks
 
-Either a path string pointing to a `hooks.json` file inside the plugin directory, or an inline hooks configuration object (see the Hooks section below).
+An inline hooks configuration object (see [Hooks](#hooks) below). A `hooks/hooks.json` file in the plugin directory takes precedence over it.
 
 ### user_config
 
-A map of option keys to `PluginUserConfigOption` objects, allowing the plugin to declare user-configurable settings that are surfaced by `/plugin info`:
+A map of option keys to `PluginUserConfigOption` objects declaring user-configurable settings. The field is parsed but not used: `/plugin info` does not show it and no values are passed to the plugin.
 
 | Field | Type | Description |
 |---|---|---|
@@ -216,91 +224,15 @@ A map of option keys to `PluginUserConfigOption` objects, allowing the plugin to
 
 ### capabilities
 
-An optional array of capability category strings. When present, the plugin is restricted to only those categories. Omit the field entirely to allow all capabilities (backwards compatibility behaviour). An empty array (`[]`) grants no capabilities.
-
-Known categories: `"read_files"`, `"write_files"`, `"network"`, `"shell"`, `"browser"`, `"mcp"`.
+An optional array of capability strings. It is checked only when one of the plugin's slash commands runs: a markdown command needs `"read_files"`. Omit the field to allow everything; an empty array (`[]`) blocks the plugin's markdown commands. Hooks and MCP servers are not restricted by it.
 
 ---
 
-## Hook Events
+## Hooks
 
-Plugins can run shell commands in response to lifecycle events. Hooks receive a JSON payload on stdin describing the event.
+Plugins can ship hooks: shell commands that run on session events. Plugin hooks use exactly the same format, events, input and output as settings hooks, and run through the same engine, after the user's settings hooks. See [Hooks](hooks.md) for the events (`PreToolUse`, `PostToolUse`, `UserPromptSubmit`, `Stop`, `SubagentStop`, `SessionStart`, `SessionEnd`, `Notification`, `PreCompact`, `PostModelTurn`), the JSON on stdin, exit code 2 and the stdout JSON fields.
 
-### Available Events
-
-| Event | When it fires |
-|---|---|
-| `PreToolUse` | Before any tool is executed |
-| `PostToolUse` | After a tool returns its result |
-| `PostToolUseFailure` | After a tool call throws an error |
-| `PermissionDenied` | When a permission request is rejected |
-| `PermissionRequest` | When a permission is requested (before decision) |
-| `Notification` | General notification from the agent |
-| `UserPromptSubmit` | When the user submits a prompt |
-| `SessionStart` | At the beginning of a session |
-| `SessionEnd` | At clean session shutdown |
-| `Stop` | When the model finishes its turn |
-| `StopFailure` | When the stop sequence fails |
-| `SubagentStart` | When a sub-agent is spawned |
-| `SubagentStop` | When a sub-agent finishes |
-| `PreCompact` | Before context compaction |
-| `PostCompact` | After context compaction |
-| `Setup` | During plugin setup phase |
-| `TeammateIdle` | When a teammate agent becomes idle |
-| `TaskCreated` | When a task is created |
-| `TaskCompleted` | When a task finishes |
-| `Elicitation` | When the model requests clarification |
-| `ElicitationResult` | When elicitation receives a response |
-| `ConfigChange` | When configuration is modified |
-| `WorktreeCreate` | When a git worktree is created |
-| `WorktreeRemove` | When a git worktree is removed |
-| `InstructionsLoaded` | When CLAUDE.md / instructions are loaded |
-| `CwdChanged` | When the working directory changes |
-| `FileChanged` | When a watched file changes |
-
-### HookEntry Fields
-
-Each hook entry in a hooks configuration:
-
-| Field | Type | Description |
-|---|---|---|
-| `command` | string | Shell command to run. Receives event JSON on stdin. |
-| `matcher` | string | Optional tool-name filter. Supports `*` wildcard (e.g. `"File*"`, `"*Tool"`). Only relevant for `PreToolUse` / `PostToolUse`. |
-| `blocking` | bool | If `true`, a non-zero exit code blocks the operation. Non-blocking hooks (default) only log a warning on failure. |
-
-### Hooks Configuration Format
-
-Hooks can be defined inline in the manifest or in a separate `hooks/hooks.json` file. Both the flat form and the wrapped form are accepted:
-
-**Flat form:**
-
-```json
-{
-  "PreToolUse": [
-    {
-      "matcher": "Bash",
-      "hooks": [
-        {
-          "command": "echo \"About to run Bash tool\" >&2",
-          "blocking": false
-        }
-      ]
-    }
-  ],
-  "Stop": [
-    {
-      "hooks": [
-        {
-          "command": "notify-send 'Claurst finished'",
-          "blocking": false
-        }
-      ]
-    }
-  ]
-}
-```
-
-**Wrapped form (with description):**
+Hooks are read from `hooks/hooks.json` in the plugin directory or, if there is none, from the manifest's inline `hooks` object. Both the plain events map and a wrapped form with a description are accepted:
 
 ```json
 {
@@ -308,30 +240,32 @@ Hooks can be defined inline in the manifest or in a separate `hooks/hooks.json` 
   "hooks": {
     "PostToolUse": [
       {
-        "matcher": "Edit",
+        "matcher": "Edit|Write",
         "hooks": [
-          {
-            "command": "python3 lint_check.py",
-            "blocking": true
-          }
+          { "type": "command", "command": "\"$CLAUDE_PLUGIN_ROOT\"/scripts/lint.sh", "timeout": 30 }
         ]
       }
+    ],
+    "Stop": [
+      { "hooks": [{ "type": "command", "command": "notify-send 'Claurst finished'" }] }
     ]
   }
 }
 ```
 
-When a blocking hook exits non-zero, Claurst denies the operation and reports the hook's stderr as the reason.
+Entries for events Claurst does not implement are skipped with a warning.
 
-**Environment variables available to hook processes:**
+**Trust.** Hooks from plugins in `~/.claurst/plugins/` run like your own hooks. Hooks from plugins found in a project's `.claurst/plugins/` are ignored (a warning is logged and `/plugin info` marks them as not run), for the same reason project settings cannot define hooks: they come from the repository, not from you.
+
+**Environment variables available to plugin hook processes:**
 
 | Variable | Value |
 |---|---|
 | `CLAUDE_PLUGIN_ROOT` | Absolute path to the plugin directory |
 | `CLAUDE_PLUGIN_NAME` | Plugin name from the manifest |
-| `CLAUDE_TOOL_NAME` | Tool name (PostToolUse hooks only) |
-| `CLAUDE_TOOL_INPUT` | Tool input as JSON string (PostToolUse hooks only) |
-| `CLAUDE_TOOL_RESULT` | Tool result as JSON string (PostToolUse hooks only) |
+| `CLAUDE_PROJECT_DIR` | The session's working directory |
+
+Plugin hooks are registered when Claurst starts and re-registered by `/plugin reload` and `/reload-plugins` (never under `--bare`). `/hooks` lists them with the plugin's name.
 
 ---
 
@@ -340,16 +274,16 @@ When a blocking hook exits non-zero, Claurst denies the operation and reports th
 The `/plugin` slash command manages plugins from within an interactive session:
 
 ```
-/plugin                      — list all installed plugins
+/plugin                      — list all installed plugins (alias: /plugins)
 /plugin list                 — list all installed plugins with status
-/plugin info <name>          — show detailed info about a plugin
-/plugin enable <name>        — enable a plugin (persisted to settings)
-/plugin disable <name>       — disable a plugin (persisted to settings)
-/plugin install <path>       — install a plugin from a local directory
-/plugin reload               — reload all plugins from disk
+/plugin info <name>          — show version, source, path, commands and hooks of a plugin
+/plugin enable <name>        — add the name to enabledPlugins in the global settings
+/plugin disable <name>       — add the name to disabledPlugins in the global settings
+/plugin install <path>       — copy a local plugin directory to ~/.claurst/plugins/<name>
+/plugin reload               — reload plugins from disk (alias: /plugin refresh)
 ```
 
-After enabling or disabling a plugin, run `/plugin reload` or use `/reload-plugins` to apply changes in the current session without restarting.
+`enabledPlugins` and `disabledPlugins` are not read when plugins load, so `/plugin enable` and `/plugin disable` currently have no effect on which plugins run.
 
 ### /reload-plugins
 
@@ -357,23 +291,13 @@ After enabling or disabling a plugin, run `/plugin reload` or use `/reload-plugi
 /reload-plugins
 ```
 
-Rescans `~/.claurst/plugins/`, re-reads all manifests, and refreshes the active hook registry, commands, agents, skills, and MCP server definitions. Use this after making changes to a plugin directory or after installing a new plugin.
+Rescans `~/.claurst/plugins/` and `<project>/.claurst/plugins/`, re-reads all manifests, re-registers plugin hooks, and reports what changed. Use this after changing a plugin's hooks or installing a new plugin. Plugin MCP servers are only picked up at startup.
 
 ---
 
-## Plugin Marketplace Integration
+## No Plugin Marketplace
 
-Plugins published to the Claurst marketplace have a `marketplace_id` field in their manifest (e.g. `"author/plugin-name"`). The marketplace integration allows:
-
-- Browsing available plugins
-- Installing plugins by ID
-- Updating installed plugins to newer versions
-
-```
-/plugin install author/plugin-name     — install from the marketplace
-```
-
-Locally installed plugins (via a file path) do not require a `marketplace_id`.
+There is no plugin marketplace. `/plugin install` accepts only a local directory path, and the manifest's `marketplace_id` is not used.
 
 ---
 
@@ -384,7 +308,7 @@ Locally installed plugins (via a file path) do not require a `marketplace_id`.
 
 name        = "code-quality"
 version     = "0.3.1"
-description = "Runs linters and formatters as blocking pre-tool hooks"
+description = "Runs linters and formatters after file edits"
 license     = "MIT"
 keywords    = ["lint", "format", "quality"]
 
@@ -407,20 +331,11 @@ default     = false
   "hooks": {
     "PostToolUse": [
       {
-        "matcher": "Edit",
+        "matcher": "Edit|Write",
         "hooks": [
           {
-            "command": "eslint --fix \"$CLAUDE_TOOL_INPUT\" 2>&1 || true",
-            "blocking": false
-          }
-        ]
-      },
-      {
-        "matcher": "Write",
-        "hooks": [
-          {
-            "command": "prettier --write \"$CLAUDE_TOOL_INPUT\" 2>&1 || true",
-            "blocking": false
+            "type": "command",
+            "command": "f=$(jq -r .tool_input.file_path); eslint --fix \"$f\" >/dev/null 2>&1; prettier --write \"$f\" >/dev/null 2>&1; exit 0"
           }
         ]
       }

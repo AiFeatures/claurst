@@ -14,6 +14,7 @@
 
 mod oauth_flow;
 mod codex_oauth_flow;
+mod headless;
 mod upgrade;
 
 // ---------------------------------------------------------------------------
@@ -43,73 +44,13 @@ use claurst_core::{
     cost::CostTracker,
     permissions::{AutoPermissionHandler, InteractivePermissionHandler, PermissionManager},
 };
-use async_trait::async_trait;
-use claurst_core::types::ToolDefinition;
-use claurst_tools::{PermissionLevel, Tool, ToolContext, ToolResult};
+use claurst_core::hooks::{HookEventData, SessionEndReason, SessionStartSource};
+use claurst_tools::ToolContext;
 use clap::{ArgAction, Parser, ValueEnum};
 use parking_lot::Mutex as ParkingMutex;
 use std::{path::PathBuf, sync::Arc};
 use tracing::{debug, info, warn};
-use tracing_subscriber::EnvFilter;
-
-// ---------------------------------------------------------------------------
-// MCP tool wrapper: makes MCP server tools look like native cc-tools.
-// ---------------------------------------------------------------------------
-
-struct McpToolWrapper {
-    tool_def: ToolDefinition,
-    server_name: String,
-    manager: Arc<claurst_mcp::McpManager>,
-}
-
-#[async_trait]
-impl Tool for McpToolWrapper {
-    fn name(&self) -> &str {
-        &self.tool_def.name
-    }
-
-    fn description(&self) -> &str {
-        &self.tool_def.description
-    }
-
-    fn permission_level(&self) -> PermissionLevel {
-        // MCP tools run external processes – treat as Execute.
-        PermissionLevel::Execute
-    }
-
-    fn input_schema(&self) -> serde_json::Value {
-        self.tool_def.input_schema.clone()
-    }
-
-    async fn execute(&self, input: serde_json::Value, ctx: &ToolContext) -> ToolResult {
-        let desc = format!("Run MCP tool {}", self.tool_def.name);
-        if let Err(e) = ctx.check_permission(self.name(), &desc, false) {
-            return ToolResult::error(e.to_string());
-        }
-
-        // Strip the server-name prefix to get the bare tool name.
-        let prefix = format!("{}_", self.server_name);
-        let bare_name = self
-            .tool_def
-            .name
-            .strip_prefix(&prefix)
-            .unwrap_or(&self.tool_def.name);
-
-        let args = if input.is_null() { None } else { Some(input) };
-
-        match self.manager.call_tool(&self.tool_def.name, args).await {
-            Ok(result) => {
-                let text = claurst_mcp::mcp_result_to_string(&result);
-                if result.is_error {
-                    ToolResult::error(text)
-                } else {
-                    ToolResult::success(text)
-                }
-            }
-            Err(e) => ToolResult::error(format!("MCP tool '{}' failed: {}", bare_name, e)),
-        }
-    }
-}
+use tracing_subscriber::{fmt::writer::BoxMakeWriter, EnvFilter};
 
 // ---------------------------------------------------------------------------
 // CLI argument definition (matches TypeScript main.tsx flags)
@@ -142,8 +83,8 @@ struct Cli {
     #[arg(long = "resume", num_args(0..=1), default_missing_value("__last__"))]
     resume: Option<String>,
 
-    /// Maximum number of agentic turns
-    #[arg(long = "max-turns", default_value_t = 10)]
+    /// Maximum number of agentic turns; reaching it ends a headless run with exit code 2
+    #[arg(long = "max-turns", default_value_t = claurst_core::constants::MAX_TURNS_DEFAULT)]
     max_turns: u32,
 
     /// Custom system prompt
@@ -161,6 +102,11 @@ struct Cli {
     /// Output format
     #[arg(long = "output-format", value_enum, default_value_t = CliOutputFormat::Text)]
     output_format: CliOutputFormat,
+
+    /// JSON Schema (inline JSON or a file path) for a structured final answer:
+    /// adds the StructuredOutput tool and reports its input as `structured_output`
+    #[arg(long = "json-schema", value_name = "FILE|JSON")]
+    json_schema: Option<String>,
 
     /// Enable verbose logging
     #[arg(long = "verbose", short = 'v', action = ArgAction::SetTrue)]
@@ -213,7 +159,7 @@ struct Cli {
     #[arg(long = "input-format", value_enum, default_value_t = CliInputFormat::Text)]
     input_format: CliInputFormat,
 
-    /// Session ID to tag this headless run (for tracking in logs/hooks)
+    /// Session ID for this run: continues that session if it exists, else creates it
     #[arg(long = "session-id")]
     session_id_flag: Option<String>,
 
@@ -229,7 +175,7 @@ struct Cli {
     #[arg(long = "thinking", value_name = "TOKENS")]
     thinking: Option<u32>,
 
-    /// Continue the most recent conversation
+    /// Continue the most recent session (same as --resume without an id)
     #[arg(short = 'c', long = "continue", action = ArgAction::SetTrue)]
     continue_session: bool,
 
@@ -237,11 +183,13 @@ struct Cli {
     #[arg(long = "system-prompt-file")]
     system_prompt_file: Option<PathBuf>,
 
-    /// Tools to allow (comma-separated, default: all)
+    /// Allow without prompting, for this session (comma- or space-separated
+    /// rules: Tool, Tool(pattern) or *; e.g. "Read,Bash(git status *)")
     #[arg(long = "allowed-tools", value_name = "TOOLS")]
     allowed_tools: Option<String>,
 
-    /// Tools to disallow (comma-separated)
+    /// Deny in every mode, for this session (same syntax as --allowed-tools;
+    /// a tool-wide entry also hides the tool from the model)
     #[arg(long = "disallowed-tools", value_name = "TOOLS")]
     disallowed_tools: Option<String>,
 
@@ -253,7 +201,7 @@ struct Cli {
     #[arg(long = "disable-slash-commands", action = ArgAction::SetTrue)]
     disable_slash_commands: bool,
 
-    /// Run in bare mode (no hooks, no plugins, no AGENTS.md)
+    /// Run in bare mode (no hooks, no plugins, no AGENTS.md, no project skills)
     #[arg(long = "bare", action = ArgAction::SetTrue)]
     bare: bool,
 
@@ -351,19 +299,15 @@ fn resolve_bridge_config(
     bridge_config.is_active().then_some(bridge_config)
 }
 
-fn handle_exit_key(app: &mut claurst_tui::app::App, key: crossterm::event::KeyEvent, cancel: &Option<tokio_util::sync::CancellationToken>) -> bool {
+fn handle_exit_key(app: &mut claurst_tui::app::App, key: crossterm::event::KeyEvent) -> bool {
     if !key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
         return false;
     }
 
     match key.code {
         crossterm::event::KeyCode::Char('c') => {
-            // Cancel background task first, then let app handle state cleanup
-            if app.is_streaming {
-                if let Some(ref ct) = cancel {
-                    ct.cancel();
-                }
-            }
+            // During a turn the app interrupts it and sets `cancel_requested`;
+            // the main loop then cancels the token, as for Esc (#444).
             app.handle_key_event(key);
             true
         }
@@ -437,6 +381,7 @@ async fn main() -> anyhow::Result<()> {
                     remote_session_url: None,
                     mcp_manager: None,
                     mcp_auth_runner: None,
+                    permission_manager: None,
                 };
                 // Collect remaining args after the command name
                 let rest: Vec<&str> = raw_args[2..].iter().map(|s| s.as_str()).collect();
@@ -471,12 +416,30 @@ async fn main() -> anyhow::Result<()> {
         .add_directive("rmcp::service::client=error".parse().expect("valid rmcp directive"))
         // Suppress error/warn logs from providers and query — errors are already shown as error modals
         .add_directive("claurst_api::providers::free=off".parse().expect("valid directive"))
-        .add_directive("claurst_query=off".parse().expect("valid directive"));
-    tracing_subscriber::fmt()
+        .add_directive("claurst_query=off".parse().expect("valid directive"))
+        // Unreadable system cert files are recoverable (other roots still load).
+        .add_directive("rustls_platform_verifier=error".parse().expect("valid directive"));
+
+    // Determine mode early (needed for log routing, settings error reporting,
+    // auth error handling, and permission handler selection).
+    let is_headless = cli.print || cli.prompt.is_some();
+
+    let log_builder = tracing_subscriber::fmt()
         .with_env_filter(log_filter)
-        .with_target(false)
-        .without_time()
-        .init();
+        .with_target(false);
+    if is_headless {
+        // Keep stdout clean for the response / JSON stream.
+        log_builder.without_time().with_writer(std::io::stderr).init();
+    } else {
+        // The TUI owns the terminal in raw mode; any log line written to
+        // stdout/stderr lands on top of the frame (#396). Log to a file instead,
+        // and drop output entirely if the file cannot be opened.
+        let writer = match claurst_core::paths::open_log_file(&claurst_core::paths::log_file_path()) {
+            Ok(file) => BoxMakeWriter::new(std::sync::Mutex::new(file)),
+            Err(_) => BoxMakeWriter::new(std::io::sink),
+        };
+        log_builder.with_ansi(false).with_writer(writer).init();
+    }
 
     // Determine working directory
     let cwd = cli
@@ -485,10 +448,6 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
     debug!(cwd = %cwd.display(), "Starting Claurst");
-
-    // Determine mode early (needed for settings error reporting, auth error
-    // handling, and permission handler selection).
-    let is_headless = cli.print || cli.prompt.is_some();
 
     // Load settings from disk (hierarchical: global < project). A malformed
     // global file is kept intact; interactive mode displays the error in the
@@ -529,8 +488,13 @@ async fn main() -> anyhow::Result<()> {
     config.disable_claude_mds = cli.no_claude_md || cli.bare;
     if cli.bare {
         // Bare mode runs no event hooks. Drop any hooks resolved from
-        // settings so no `run_hooks` call site has anything to execute.
+        // settings, and refuse plugin hooks for the whole process (a plugin
+        // reload must not add them back), so `run_hooks` has nothing to run.
         config.hooks.clear();
+        claurst_core::hooks::disable_plugin_hooks();
+        // Nor does it list or run skills from the repository's own skill
+        // directories (global and bundled skills stay).
+        config.skills.skip_project_dirs = true;
     }
     if let Some(sp) = cli.system_prompt.clone() {
         config.custom_system_prompt = Some(sp);
@@ -547,10 +511,41 @@ async fn main() -> anyhow::Result<()> {
             );
         }
         config.permission_mode = PermissionMode::BypassPermissions;
+    } else if config.yolo_mode {
+        // YOLO mode from global settings.json: same root/sudo guard.
+        #[cfg(unix)]
+        if nix::unistd::Uid::effective().is_root() {
+            anyhow::bail!(
+                "yoloMode cannot be used with root/sudo privileges for security reasons"
+            );
+        }
+        config.permission_mode = PermissionMode::BypassPermissions;
     } else {
         config.permission_mode = cli.permission_mode.into();
     }
     config.additional_dirs = cli.add_dir.clone();
+    // --allowed-tools / --disallowed-tools extend the configured lists for
+    // this session only; the permission manager turns them into rules.
+    for (flag, list, target) in [
+        ("--allowed-tools", cli.allowed_tools.as_deref(), &mut config.allowed_tools),
+        ("--disallowed-tools", cli.disallowed_tools.as_deref(), &mut config.disallowed_tools),
+    ] {
+        for spec in list.map(claurst_core::permissions::split_rule_specs).unwrap_or_default() {
+            if claurst_core::permissions::parse_rule_spec(
+                &spec,
+                claurst_core::permissions::PermissionAction::Allow,
+            )
+            .is_none()
+            {
+                anyhow::bail!(
+                    "Invalid {} entry {:?}: expected Tool, Tool(pattern) or *",
+                    flag,
+                    spec
+                );
+            }
+            target.push(spec);
+        }
+    }
     if cli.no_auto_compact {
         config.auto_compact = false;
     }
@@ -571,36 +566,69 @@ async fn main() -> anyhow::Result<()> {
             .api_base = Some(base.clone());
     }
 
-    // --dump-system-prompt fast path
-    if cli.dump_system_prompt {
-        let ctx = ContextBuilder::new(cwd.clone())
-            .disable_claude_mds(config.disable_claude_mds);
-        let sys = ctx.build_system_context().await;
-        let user = ctx.build_user_context().await;
-        println!("{}\n\n{}", sys, user);
-        return Ok(());
-    }
+    // --json-schema: validated up front so a bad schema fails before any work.
+    let structured_output_tool = match cli.json_schema.as_deref() {
+        None => None,
+        Some(_) if !is_headless => anyhow::bail!("--json-schema requires --print"),
+        Some(raw) => Some(headless::structured_output_tool(raw).context("invalid --json-schema")?),
+    };
+
+    // AGENTS.md / CLAUDE.md instruction files, loaded once per session and
+    // sent in the cached system block.
+    let instruction_files = if config.disable_claude_mds {
+        Vec::new()
+    } else {
+        claurst_core::claudemd::load_instruction_files(
+            &cwd,
+            &claurst_core::claudemd::default_global_dirs(),
+        )
+    };
 
     // Build context
-    let ctx_builder = ContextBuilder::new(cwd.clone())
-        .disable_claude_mds(config.disable_claude_mds);
-    let system_ctx = ctx_builder.build_system_context().await;
-    let user_ctx = ctx_builder.build_user_context().await;
+    let system_ctx = ContextBuilder::new(cwd.clone()).build_system_context().await;
 
-    // Build system prompt
-    let mut system_parts = vec![
-        include_str!("system_prompt.txt").to_string(),
-        system_ctx,
-        user_ctx,
-    ];
-    if let Some(ref custom) = config.custom_system_prompt {
-        // replace base system prompt
-        system_parts[0] = custom.clone();
+    // Session-stable additions to the default prompt, which
+    // `claurst_core::system_prompt::build_system_prompt` assembles on its own
+    // (identity, capabilities, guidelines). Only session-stable text goes here
+    // (it lands in the cached system block); `system_ctx` (git status, IDE
+    // context) is passed separately as `session_context` and sent in the
+    // dynamic block.
+    let system_prompt = [config.custom_system_prompt.clone(), config.append_system_prompt.clone()]
+        .into_iter()
+        .flatten()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    // --dump-system-prompt fast path: print the stable and dynamic blocks
+    // assembled the way the first turn of this session would send them.
+    if cli.dump_system_prompt {
+        let opts = claurst_core::system_prompt::SystemPromptOptions {
+            custom_system_prompt: (!system_prompt.is_empty()).then_some(system_prompt),
+            session_context: Some(system_ctx),
+            output_style: config.effective_output_style(),
+            custom_output_style_prompt: config.resolve_output_style_prompt(),
+            working_directory: Some(cwd.display().to_string()),
+            additional_dirs: config
+                .additional_dirs
+                .iter()
+                .map(|dir| dir.display().to_string())
+                .collect(),
+            enabled_tools: Some(
+                claurst_tools::all_tools()
+                    .iter()
+                    .map(|tool| tool.name().to_string())
+                    .collect(),
+            ),
+            permission_mode: Some(config.permission_mode.clone()),
+            instruction_files,
+            ..Default::default()
+        };
+        let prompt = claurst_core::system_prompt::build_system_prompt(&opts);
+        let (stable, dynamic) = claurst_core::system_prompt::split_at_dynamic_boundary(&prompt);
+        println!("{stable}\n\n{dynamic}");
+        return Ok(());
     }
-    if let Some(ref append) = config.append_system_prompt {
-        system_parts.push(append.clone());
-    }
-    let system_prompt = system_parts.join("\n\n");
 
     // Initialize API client.
     // Try config/env first; fall back to saved OAuth tokens.
@@ -639,6 +667,7 @@ async fn main() -> anyhow::Result<()> {
         api_key: api_key.clone(),
         api_base: config.resolve_anthropic_api_base(),
         use_bearer_auth,
+        retry: claurst_api::RetryConfig::with_max_retries(config.max_retries),
         ..Default::default()
     };
     let client = Arc::new(
@@ -662,10 +691,17 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    let permission_manager = Arc::new(std::sync::Mutex::new(PermissionManager::new(
-        config.permission_mode.clone(),
-        &settings,
-    )));
+    // Approvals saved "for this project" live under the claurst home, keyed
+    // by the repository root (or the working directory outside a repo).
+    let mut permission_manager =
+        PermissionManager::new(config.permission_mode.clone(), &settings).with_project_store(
+            claurst_core::permissions::project_approvals_path(
+                &claurst_core::config::Settings::config_dir(),
+                &claurst_core::permissions::approvals_project_root(&cwd),
+            ),
+        );
+    permission_manager.sync_config(&config);
+    let permission_manager = Arc::new(std::sync::Mutex::new(permission_manager));
 
     let permission_handler: Arc<dyn claurst_core::PermissionHandler> = if is_headless {
         Arc::new(AutoPermissionHandler::with_manager(permission_manager.clone()))
@@ -691,7 +727,7 @@ async fn main() -> anyhow::Result<()> {
     // processes. User/global servers are unaffected. The untrusted project
     // servers are surfaced to the TUI for an approval prompt, or skipped (with
     // a notice) in headless mode unless trust was granted.
-    let mcp_project_root = claurst_core::mcp_trust::project_root_for(&cwd);
+    let mut mcp_project_root = claurst_core::mcp_trust::project_root_for(&cwd);
     let mcp_decision = {
         let store = claurst_core::mcp_trust::McpTrustStore::load();
         claurst_core::mcp_trust::partition_mcp_servers(
@@ -702,7 +738,7 @@ async fn main() -> anyhow::Result<()> {
             &store,
         )
     };
-    let pending_project_mcp = mcp_decision.pending.clone();
+    let mut pending_project_mcp = mcp_decision.pending.clone();
     if !pending_project_mcp.is_empty() {
         let names: Vec<&str> = pending_project_mcp.iter().map(|s| s.name.as_str()).collect();
         if is_headless {
@@ -719,7 +755,16 @@ async fn main() -> anyhow::Result<()> {
             );
         }
     }
-    let mcp_manager_arc = connect_mcp_manager_arc(&mcp_decision.allowed).await;
+    // Servers connect concurrently in the background; the TUI draws
+    // immediately and picks up tools as servers finish. Headless runs have no
+    // later turn to pick them up, so they wait (bounded by the per-server
+    // connect/catalog timeouts) before the tool list is built.
+    let mcp_manager_arc = start_mcp_manager(&mcp_decision.allowed);
+    if is_headless {
+        if let Some(manager) = mcp_manager_arc.as_ref() {
+            manager.wait_until_settled().await;
+        }
+    }
 
     let pending_permissions = Arc::new(ParkingMutex::new(claurst_tools::PendingPermissionStore::default()));
 
@@ -750,6 +795,7 @@ async fn main() -> anyhow::Result<()> {
         // Placeholder token; `run_query_loop` rebinds it to the loop's actual
         // cancel token so the parallel tool executor honours Ctrl-C (issue #218).
         cancel_token: tokio_util::sync::CancellationToken::new(),
+        batch_rejection: Default::default(),
     };
 
     // Hourly shadow-snapshot GC loop: only runs when snapshot is explicitly enabled.
@@ -793,9 +839,10 @@ async fn main() -> anyhow::Result<()> {
     {
         let plugin_cmd_count = plugin_registry.all_command_defs().len();
         let plugin_hook_count = plugin_registry
-            .build_hook_registry()
+            .hook_map()
             .values()
-            .map(|v| v.len())
+            .flatten()
+            .map(|group| group.hooks.len())
             .sum::<usize>();
         info!(
             plugins = plugin_registry.enabled_count(),
@@ -811,12 +858,48 @@ async fn main() -> anyhow::Result<()> {
             .iter()
             .map(|s| s.name.clone())
             .collect();
+        let mut plugin_servers = Vec::new();
         for mcp_server in plugin_registry.all_mcp_servers() {
             if !existing_names.contains(&mcp_server.name) {
+                plugin_servers.push(mcp_server.clone());
                 config.mcp_servers.push(mcp_server);
             }
         }
+
+        // SECURITY (#493): servers from a project's `.claurst/plugins/` are
+        // project-origin. The manager above started before plugins loaded, so
+        // they would only launch on the next MCP-runtime rebuild, which re-runs
+        // the trust gate; queue the unapproved ones for the TUI approval prompt
+        // here, like servers from a project's settings file.
+        let plugin_pending = pending_project_plugin_mcp(
+            &plugin_servers,
+            &mut mcp_project_root,
+            &cwd,
+            settings.trust_project_mcp_servers,
+            &claurst_core::mcp_trust::McpTrustStore::load(),
+        );
+        if !plugin_pending.is_empty() {
+            let names: Vec<&str> = plugin_pending.iter().map(|s| s.name.as_str()).collect();
+            if is_headless {
+                warn!(
+                    servers = ?names,
+                    "Skipping MCP server(s) from project plugins pending approval. \
+                     Approve them in the interactive TUI, or pass --trust-project-mcp \
+                     (or set trustProjectMcpServers) to launch them in headless mode."
+                );
+            } else {
+                info!(
+                    servers = ?names,
+                    "MCP server(s) from project plugins require approval before launching."
+                );
+            }
+        }
+        pending_project_mcp.extend(plugin_pending);
     }
+    // Plugin hooks run through the core hook engine after settings hooks
+    // (#447); the registry is then shared with commands and tools.
+    claurst_plugins::set_global_hooks(&plugin_registry);
+    claurst_plugins::set_global_registry(plugin_registry);
 
     // Build model registry for dynamic model/provider resolution.
     // The registry is pre-populated with a hardcoded snapshot and enriched
@@ -827,9 +910,28 @@ async fn main() -> anyhow::Result<()> {
     let mut query_config = claurst_query::QueryConfig::from_config_with_registry(&config, &model_registry);
     query_config.model_registry = Some(model_registry.clone());
     query_config.max_turns = cli.max_turns;
-    query_config.system_prompt = Some(system_prompt);
+    query_config.system_prompt = (!system_prompt.is_empty()).then_some(system_prompt);
     query_config.append_system_prompt = None;
+    query_config.session_context = Some(system_ctx);
     query_config.working_directory = Some(cwd.display().to_string());
+    query_config.instruction_files = instruction_files;
+    // Skills are discovered once per session: the listing goes into the
+    // cached system block, so it must not change between turns. Discovery
+    // walks the filesystem and may `git clone` skills.urls, so it runs on the
+    // blocking pool. Headless runs wait for it here; the TUI starts at once
+    // and installs the result when it arrives (see `run_interactive`).
+    let skill_discovery = {
+        let cwd = cwd.clone();
+        let skills_config = config.skills.clone();
+        tokio::task::spawn_blocking(move || claurst_core::SkillRegistry::discover(&cwd, &skills_config))
+    };
+    let skill_discovery = if is_headless {
+        let registry = skill_discovery.await.context("Skill discovery failed")?;
+        query_config.available_skills = registry.listings();
+        None
+    } else {
+        Some(skill_discovery)
+    };
     if let Some(tokens) = cli.thinking {
         query_config.thinking_budget = Some(tokens);
     }
@@ -846,6 +948,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(ref fb) = cli.fallback_model {
         query_config.fallback_model = Some(fb.clone());
     }
+    query_config.auto_compact = !cli.no_auto_compact;
     // Wire in the provider registry so non-Anthropic providers can be dispatched.
     let provider_registry = std::sync::Arc::new(provider_registry);
     query_config.provider_registry = Some(provider_registry.clone());
@@ -871,6 +974,17 @@ async fn main() -> anyhow::Result<()> {
     } else {
         tools
     };
+    // StructuredOutput is offered only with --json-schema. The list was built
+    // above and has no other owner yet.
+    let tools = match structured_output_tool {
+        Some(tool) => {
+            let mut list = Arc::try_unwrap(tools)
+                .map_err(|_| anyhow::anyhow!("the tool list is already shared"))?;
+            list.push(Box::new(tool));
+            Arc::new(list)
+        }
+        None => tools,
+    };
 
     // Spawn the background cron scheduler (fires cron tasks at scheduled times).
     // Cancelled automatically when the process exits since we use a shared token.
@@ -885,7 +999,7 @@ async fn main() -> anyhow::Result<()> {
 
     // --print mode (headless)
     let result = if is_headless {
-        run_headless(
+        let code = run_headless(
             &cli,
             client,
             tools,
@@ -893,7 +1007,13 @@ async fn main() -> anyhow::Result<()> {
             query_config,
             cost_tracker,
         )
-        .await
+        .await;
+        cron_cancel.cancel();
+        match code {
+            Ok(0) => Ok(()),
+            Ok(code) => std::process::exit(code),
+            Err(e) => Err(e),
+        }
     } else {
         let auth_store = claurst_core::AuthStore::load();
         let has_saved_credentials = !auth_store.credentials.is_empty()
@@ -910,13 +1030,16 @@ async fn main() -> anyhow::Result<()> {
             tool_ctx,
             query_config,
             cost_tracker,
-            cli.resume,
+            // -c is `--resume` without an id: the most recent session.
+            cli.resume
+                .or_else(|| cli.continue_session.then(|| "__last__".to_string())),
             bridge_config,
             has_credentials,
             model_registry,
             user_question_rx,
             pending_project_mcp,
             mcp_project_root,
+            skill_discovery,
         )
         .await
     };
@@ -925,7 +1048,39 @@ async fn main() -> anyhow::Result<()> {
     result
 }
 
-async fn connect_mcp_manager_arc(
+/// Gate the MCP servers that plugins contributed (#493) and return the
+/// project-origin ones still pending approval, for the TUI approval prompt.
+///
+/// The startup gate ran before plugins loaded, so these servers were never
+/// queued; the MCP-runtime rebuild re-runs the gate before launching them. A
+/// repo with project plugins but no `.claurst/settings.json` has no root from
+/// `project_root_for`, so approvals are keyed by `cwd`, the directory the
+/// project plugins were loaded from.
+fn pending_project_plugin_mcp(
+    plugin_servers: &[claurst_core::config::McpServerConfig],
+    mcp_project_root: &mut Option<PathBuf>,
+    cwd: &std::path::Path,
+    trust_all_project: bool,
+    store: &claurst_core::mcp_trust::McpTrustStore,
+) -> Vec<claurst_core::config::McpServerConfig> {
+    if !plugin_servers
+        .iter()
+        .any(|s| s.origin == claurst_core::config::McpServerOrigin::Project)
+    {
+        return Vec::new();
+    }
+    let root = mcp_project_root.get_or_insert_with(|| cwd.to_path_buf());
+    claurst_core::mcp_trust::partition_mcp_servers(
+        plugin_servers,
+        Some(root.as_path()),
+        trust_all_project,
+        &std::collections::HashSet::new(),
+        store,
+    )
+    .pending
+}
+
+fn start_mcp_manager(
     servers: &[claurst_core::config::McpServerConfig],
 ) -> Option<Arc<claurst_mcp::McpManager>> {
     if servers.is_empty() {
@@ -933,9 +1088,20 @@ async fn connect_mcp_manager_arc(
     }
 
     info!(count = servers.len(), "Connecting to MCP servers");
-    let mcp_manager = Arc::new(claurst_mcp::McpManager::connect_all(servers).await);
-    mcp_manager.clone().spawn_notification_poll_loop();
-    Some(mcp_manager)
+    Some(claurst_mcp::McpManager::start(servers))
+}
+
+/// The session tool list: built-ins, Agent and every connected MCP tool,
+/// narrowed by the active agent's access level.
+fn tools_for_session(
+    mcp_manager: Option<Arc<claurst_mcp::McpManager>>,
+    query_config: &claurst_query::QueryConfig,
+) -> Arc<Vec<Box<dyn claurst_tools::Tool>>> {
+    let tools = build_tools_with_mcp(mcp_manager);
+    match query_config.agent_definition.as_ref() {
+        Some(def) => filter_tools_for_agent(tools, &def.access),
+        None => tools,
+    }
 }
 
 fn build_tools_with_mcp(
@@ -945,14 +1111,7 @@ fn build_tools_with_mcp(
     v.push(Box::new(claurst_query::AgentTool));
 
     if let Some(ref manager_arc) = mcp_manager {
-        for (server_name, tool_def) in manager_arc.all_tool_definitions() {
-            let wrapper = McpToolWrapper {
-                tool_def,
-                server_name,
-                manager: manager_arc.clone(),
-            };
-            v.push(Box::new(wrapper));
-        }
+        v.extend(claurst_tools::mcp_tools(manager_arc));
         debug!(total_tools = v.len(), "MCP tools registered");
     }
 
@@ -1355,6 +1514,7 @@ async fn refresh_provider_runtime_state(
         api_key,
         api_base: config.resolve_anthropic_api_base(),
         use_bearer_auth,
+        retry: claurst_api::RetryConfig::with_max_retries(config.max_retries),
         ..Default::default()
     };
     let client = Arc::new(
@@ -1400,6 +1560,7 @@ async fn reload_provider_runtime_state(
         api_key,
         api_base: config.resolve_anthropic_api_base(),
         use_bearer_auth,
+        retry: claurst_api::RetryConfig::with_max_retries(config.max_retries),
         ..Default::default()
     };
     let client = Arc::new(
@@ -1475,11 +1636,9 @@ async fn run_headless(
     client: Arc<claurst_api::AnthropicClient>,
     tools: Arc<Vec<Box<dyn claurst_tools::Tool>>>,
     tool_ctx: ToolContext,
-    query_config: claurst_query::QueryConfig,
+    mut query_config: claurst_query::QueryConfig,
     cost_tracker: Arc<CostTracker>,
-) -> anyhow::Result<()> {
-    use claurst_query::{QueryEvent, QueryOutcome};
-    use tokio::sync::mpsc;
+) -> anyhow::Result<i32> {
     use tokio_util::sync::CancellationToken;
 
     // Build initial messages list from input.
@@ -1542,7 +1701,7 @@ async fn run_headless(
 
         if prompt.is_empty() {
             eprintln!("Error: No prompt provided. Use --print <prompt> or pipe text to stdin.");
-            std::process::exit(1);
+            return Ok(1);
         }
 
         vec![claurst_core::types::Message::user(prompt)]
@@ -1556,170 +1715,138 @@ async fn run_headless(
 
     if messages.is_empty() {
         eprintln!("Error: No messages provided.");
-        std::process::exit(1);
+        return Ok(1);
     }
 
-    let is_json_output = matches!(cli.output_format, CliOutputFormat::Json | CliOutputFormat::StreamJson);
-    let is_stream_json = matches!(cli.output_format, CliOutputFormat::StreamJson);
+    let started = std::time::Instant::now();
+    let cwd = tool_ctx.working_dir.display().to_string();
 
-    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<QueryEvent>();
+    // -c / --resume [id] / --session-id pick the session; the new prompt is
+    // appended to its history and the run is saved like an interactive one.
+    let opened = match headless::session_target(
+        cli.resume.as_deref(),
+        cli.continue_session,
+        cli.session_id_flag.as_deref(),
+        &tool_ctx.session_id,
+    ) {
+        Ok(target) => headless::open_session(target, &query_config.model, &cwd).await,
+        Err(e) => Err(e),
+    };
+    let mut session = match opened {
+        Ok(session) => session,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            return Ok(1);
+        }
+    };
+    let mut tool_ctx = tool_ctx;
+    tool_ctx.session_id = session.id.clone();
+    let mut history = std::mem::take(&mut session.messages);
+
+    // Hooks (#447): SessionStart, then UserPromptSubmit for a text prompt.
+    let start_source =
+        if history.is_empty() { SessionStartSource::Startup } else { SessionStartSource::Resume };
+    session_start_hooks(&tool_ctx, &mut query_config, start_source).await;
+    if cli.input_format != CliInputFormat::StreamJson {
+        if let Some(prompt_msg) = messages.first_mut() {
+            let prompt = prompt_msg.get_all_text();
+            let hooks = user_prompt_submit_hooks(&tool_ctx, &prompt).await;
+            if hooks.is_deny() {
+                eprintln!("Prompt blocked by UserPromptSubmit hook: {}", hooks.reason_or_default());
+                session_end_hooks(&tool_ctx, SessionEndReason::Other).await;
+                return Ok(1);
+            }
+            append_prompt_context(prompt_msg, hooks.additional_context);
+        }
+    }
+    history.extend(messages);
+    // A resumed session keeps its model unless --model overrides it, as in
+    // the TUI. (A new session already records the configured model.)
+    if cli.model.is_none() && !session.model.is_empty() {
+        query_config.model.clone_from(&session.model);
+    }
+    let model = query_config.model.clone();
+
+    let mut sink = headless::HeadlessSink::new(
+        cli.output_format,
+        session.id.clone(),
+        std::io::stdout(),
+        std::io::stderr(),
+    );
+    sink.init(headless::InitInfo {
+        model: &query_config.model,
+        cwd: &cwd,
+        tools: tools.iter().map(|t| t.name()).collect(),
+        permission_mode: &tool_ctx.permission_mode,
+    })?;
+
+    // Ctrl-C cancels the loop; the run still reports a `cancelled` result
+    // and exits 130.
     let cancel = CancellationToken::new();
-    let client_clone = client.clone();
-    let tool_ctx_clone = tool_ctx.clone();
-    let qcfg = query_config.clone();
-    let tracker_clone = cost_tracker.clone();
-    let event_tx_clone = event_tx.clone();
-    let cancel_clone = cancel.clone();
-
-    let query_handle = tokio::spawn(async move {
-        claurst_query::run_query_loop(
-            client_clone.as_ref(),
-            &mut messages,
-            tools.as_slice(),
-            &tool_ctx_clone,
-            &qcfg,
-            tracker_clone,
-            Some(event_tx_clone),
-            cancel_clone,
-            None,
-        )
-        .await
+    let interrupt = cancel.clone();
+    let ctrl_c = tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            interrupt.cancel();
+        }
     });
+    // `drive` takes the context; SessionEnd needs it after the run.
+    let end_ctx = tool_ctx.clone();
+    let (outcome, messages) = headless::drive(
+        client,
+        tools,
+        tool_ctx,
+        query_config,
+        cost_tracker.clone(),
+        history,
+        cancel,
+        &mut sink,
+    )
+    .await?;
+    ctrl_c.abort();
 
-    // Drop the original tx so the channel closes when the task drops its clone
-    drop(event_tx);
-
-    // Drain events and print streaming text
-    let mut full_text = String::new();
-
-    while let Some(event) = event_rx.recv().await {
-        match &event {
-            QueryEvent::Stream(claurst_api::AnthropicStreamEvent::ContentBlockDelta {
-                delta: claurst_api::streaming::ContentDelta::TextDelta { text },
-                ..
-            }) => {
-                full_text.push_str(text);
-                if !is_json_output {
-                    print!("{}", text);
-                    use std::io::Write;
-                    std::io::stdout().flush().ok();
-                } else if is_stream_json {
-                    let chunk = serde_json::json!({ "type": "text_delta", "text": text });
-                    println!("{}", chunk);
-                }
-            }
-            QueryEvent::ToolStart { tool_name, .. } => {
-                if !is_json_output {
-                    eprintln!("\n[{}...]", tool_name);
-                } else {
-                    let ev = serde_json::json!({ "type": "tool_start", "tool": tool_name });
-                    println!("{}", ev);
-                }
-            }
-            QueryEvent::Error(msg) => {
-                if is_json_output {
-                    let ev = serde_json::json!({ "type": "error", "error": msg });
-                    eprintln!("{}", ev);
-                } else {
-                    eprintln!("\nError: {}", msg);
-                }
-            }
-            _ => {}
-        }
+    let result = sink.result(&outcome, &cost_tracker, started.elapsed());
+    sink.finish(&result)?;
+    // An empty history means the loop task panicked; keep the saved session.
+    if !messages.is_empty() {
+        let compactions = sink.take_compactions();
+        headless::save_session(&mut session, messages, compactions, &model, &cost_tracker).await;
+    }
+    if cli.verbose {
+        eprintln!(
+            "Tokens: {} in / {} out | Cost: ${:.4}",
+            cost_tracker.input_tokens(),
+            cost_tracker.output_tokens(),
+            cost_tracker.total_cost_usd(),
+        );
     }
 
-    // Wait for the query task to finish and get the final outcome
-    let outcome = query_handle.await.unwrap_or(QueryOutcome::Error(
-        claurst_core::error::ClaudeError::Other("Query task panicked".to_string()),
-    ));
-
-    // Final output
-    match cli.output_format {
-        CliOutputFormat::Json => {
-            match outcome {
-                QueryOutcome::EndTurn { message, usage } => {
-                    let result_text = if full_text.is_empty() {
-                        message.get_all_text()
-                    } else {
-                        full_text
-                    };
-                    let out = serde_json::json!({
-                        "type": "result",
-                        "result": result_text,
-                        "usage": {
-                            "input_tokens": usage.input_tokens,
-                            "output_tokens": usage.output_tokens,
-                            "cache_creation_input_tokens": usage.cache_creation_input_tokens,
-                            "cache_read_input_tokens": usage.cache_read_input_tokens,
-                        },
-                        "cost_usd": cost_tracker.total_cost_usd(),
-                    });
-                    println!("{}", out);
-                }
-                QueryOutcome::Error(e) => {
-                    let out = serde_json::json!({ "type": "error", "error": e.to_string() });
-                    eprintln!("{}", out);
-                    std::process::exit(1);
-                }
-                _ => {}
-            }
-        }
-        CliOutputFormat::StreamJson => {
-            // Already streamed above; emit final result event
-            match outcome {
-                QueryOutcome::EndTurn { usage, .. } => {
-                    let out = serde_json::json!({
-                        "type": "result",
-                        "usage": {
-                            "input_tokens": usage.input_tokens,
-                            "output_tokens": usage.output_tokens,
-                        },
-                        "cost_usd": cost_tracker.total_cost_usd(),
-                    });
-                    println!("{}", out);
-                }
-                QueryOutcome::Error(e) => {
-                    let out = serde_json::json!({ "type": "error", "error": e.to_string() });
-                    eprintln!("{}", out);
-                    std::process::exit(1);
-                }
-                _ => {}
-            }
-        }
-        CliOutputFormat::Text => {
-            // Streaming text was already printed; add newline
-            println!();
-            if cli.verbose {
-                eprintln!(
-                    "\nTokens: {} in / {} out | Cost: ${:.4}",
-                    cost_tracker.input_tokens(),
-                    cost_tracker.output_tokens(),
-                    cost_tracker.total_cost_usd(),
-                );
-            }
-            match outcome {
-                QueryOutcome::Error(e) => {
-                    eprintln!("Error: {}", e);
-                    std::process::exit(1);
-                }
-                QueryOutcome::BudgetExceeded { cost_usd, limit_usd } => {
-                    eprintln!(
-                        "Budget limit ${:.4} reached (spent ${:.4}). Stopping.",
-                        limit_usd, cost_usd
-                    );
-                    std::process::exit(2);
-                }
-                _ => {}
-            }
-        }
-    }
-
-    Ok(())
+    session_end_hooks(&end_ctx, SessionEndReason::Other).await;
+    Ok(result.subtype.exit_code())
 }
 
 // ---------------------------------------------------------------------------
 // Interactive REPL mode
 // ---------------------------------------------------------------------------
+
+/// Persist the live session (issue #449): a full checkpoint (journal plus an
+/// atomic snapshot) when no query is running, otherwise only a metadata
+/// entry, since the running loop owns the history until it finishes. A
+/// failure (for example the session being open in another process) is
+/// logged; the session stays usable in memory.
+fn persist_live_session(
+    journal: &claurst_core::session_journal::SessionJournal,
+    session: &mut claurst_core::history::ConversationSession,
+    query_running: bool,
+) {
+    let result = if query_running {
+        journal.record_meta(session)
+    } else {
+        journal.checkpoint(session)
+    };
+    if let Err(e) = result {
+        tracing::warn!(session = %session.id, error = %e, "Session not saved");
+    }
+}
 
 fn permission_request_from_core(
     pending: &claurst_tools::PendingPermissionRequest,
@@ -1729,18 +1856,23 @@ fn permission_request_from_core(
     let tool_use_id = pending.tool_use_id.clone();
 
     match (tool_name.as_str(), pending.request.path.clone()) {
+        (claurst_tools::sandbox::SANDBOX_ESCALATION_TOOL, Some(command)) => {
+            let prefix = claurst_tools::sandbox::unsandboxed_prefix(&command).map(str::to_owned);
+            claurst_tui::dialogs::PermissionRequest::sandbox_escalation(
+                tool_use_id,
+                reason,
+                command,
+                prefix.as_deref(),
+            )
+        }
         ("Bash", Some(command)) => {
-            let suggested_prefix = command
-                .split_whitespace()
-                .next()
-                .filter(|prefix| !prefix.is_empty())
-                .map(|prefix| format!("{} ", prefix));
+            let suggested_rules = claurst_core::shell_scan::approval_rules(&command);
             claurst_tui::dialogs::PermissionRequest::bash(
                 tool_use_id,
                 tool_name,
                 reason,
                 command,
-                suggested_prefix,
+                suggested_rules,
             )
         },
         ("PowerShell", Some(command)) => claurst_tui::dialogs::PermissionRequest::powershell(
@@ -1768,6 +1900,80 @@ fn permission_request_from_core(
 }
 
 
+/// Cap on captured status-line command output.
+const STATUS_LINE_MAX_OUTPUT_BYTES: u64 = 4096;
+
+/// Run the external status-line command once: write `input` to its stdin and
+/// read at most `STATUS_LINE_MAX_OUTPUT_BYTES` of stdout. Writing stdin, reading
+/// stdout and waiting for exit all run concurrently under `timeout`, so a child
+/// that never reads stdin or floods stdout cannot wedge the poll; stdout is
+/// closed once the cap is reached. On timeout the child is killed and `None`
+/// is returned. stderr is discarded so it cannot corrupt the TUI.
+async fn run_status_line_command(
+    cmd: &str,
+    input: &str,
+    timeout: std::time::Duration,
+) -> Option<String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut command = if cfg!(target_os = "windows") {
+        let mut c = tokio::process::Command::new("cmd");
+        c.args(["/C", cmd]);
+        c
+    } else {
+        let mut c = tokio::process::Command::new("sh");
+        c.args(["-c", cmd]);
+        c
+    };
+    let mut child = command
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .ok()?;
+    let stdin = child.stdin.take();
+    let stdout = child.stdout.take()?;
+
+    let write = async move {
+        if let Some(mut stdin) = stdin {
+            // Ignore EPIPE: the command may exit without reading its input.
+            let _ = stdin.write_all(input.as_bytes()).await;
+        }
+    };
+    let read = async move {
+        let mut buf = Vec::new();
+        let _ = stdout.take(STATUS_LINE_MAX_OUTPUT_BYTES).read_to_end(&mut buf).await;
+        buf
+    };
+    let run = async {
+        let ((), buf) = tokio::join!(write, read);
+        // stdout is dropped by now, so a child still writing gets EPIPE and exits.
+        let _ = child.wait().await;
+        buf
+    };
+    let result = tokio::time::timeout(timeout, run).await;
+    match result {
+        Ok(buf) => Some(String::from_utf8_lossy(&buf).trim().to_string()),
+        Err(_elapsed) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            None
+        }
+    }
+}
+
+/// The session's skill listing, once startup discovery has published it.
+/// Returns at once after the first turn. Empty if discovery never reports.
+async fn session_skill_listings(
+    mut listings: tokio::sync::watch::Receiver<Option<Vec<claurst_core::system_prompt::SkillListing>>>,
+) -> Vec<claurst_core::system_prompt::SkillListing> {
+    match listings.wait_for(Option::is_some).await {
+        Ok(published) => published.clone().unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
 async fn run_interactive(
     config: Config,
     settings: claurst_core::config::Settings,
@@ -1784,6 +1990,7 @@ async fn run_interactive(
     user_question_rx: Option<tokio::sync::mpsc::UnboundedReceiver<claurst_tools::UserQuestionEvent>>,
     pending_project_mcp: Vec<claurst_core::config::McpServerConfig>,
     mcp_project_root: Option<PathBuf>,
+    skill_discovery: Option<tokio::task::JoinHandle<claurst_core::SkillRegistry>>,
 ) -> anyhow::Result<()> {
     use claurst_commands::{execute_command, CommandContext, CommandResult};
     use claurst_bridge::{BridgeOutbound, TuiBridgeEvent};
@@ -1818,10 +2025,23 @@ async fn run_interactive(
         resume_id
     };
 
+    let mut resumed = false;
     let mut session = if let Some(ref id) = resume_id {
-        match claurst_core::history::load_session(id).await {
-            Ok(session) => {
+        match claurst_core::session_journal::load(&claurst_core::history::sessions_dir(), id) {
+            Ok(claurst_core::session_journal::LoadedSession { session, replayed, rebuilt }) => {
                 println!("Resumed session: {}", id);
+                if rebuilt {
+                    println!(
+                        "Session snapshot was missing or unreadable; rebuilt it from {} journal entries.",
+                        replayed
+                    );
+                } else if replayed > 0 {
+                    println!(
+                        "Recovered {} journal entries written after the last snapshot (interrupted turn).",
+                        replayed
+                    );
+                }
+                resumed = true;
                 if let Some(saved_dir) = session.working_dir.as_ref() {
                     let saved_path = std::path::PathBuf::from(saved_dir);
                     if saved_path.exists() {
@@ -1852,7 +2072,18 @@ async fn run_interactive(
         session
     };
     let initial_messages = session.messages.clone();
+    // Crash-safe writer for the live session (issue #449). A resumed session
+    // is locked up front so a second claurst on it is told immediately.
+    let mut session_journal = claurst_core::session_journal::SessionJournal::for_session(&session);
+    if !session.messages.is_empty() {
+        if let Err(e) = session_journal.acquire() {
+            resume_warning = Some(e.to_string());
+        }
+    }
     let mut base_query_config = query_config;
+    base_query_config.session_journal = Some(session_journal.clone());
+    let start_source = if resumed { SessionStartSource::Resume } else { SessionStartSource::Startup };
+    session_start_hooks(&tool_ctx, &mut base_query_config, start_source).await;
     // Goal autonomy is now an in-loop continuation policy (issue #230 / MI-3):
     // run_query_loop itself decides whether to continue toward an active goal
     // after each turn, instead of the REPL re-dispatching a fresh turn. Select
@@ -1861,6 +2092,23 @@ async fn run_interactive(
     if claurst_core::goals_enabled() {
         base_query_config.continuation = claurst_query::ContinuationMode::Goal;
     }
+    // One queue for the whole session (#444): Enter during a turn pushes
+    // steers, background tasks push completion notices, and every turn's loop
+    // drains it at each step boundary. When it is non-empty while idle, the
+    // main loop starts a turn to deliver it.
+    let command_queue = claurst_query::CommandQueue::new();
+    base_query_config.command_queue = Some(command_queue.clone());
+    // Background sub-agents and Bash commands report completion into the same
+    // queue as `<subagent>` / `<shell>` notices (gated by completionWakeups).
+    tool_ctx.completion_notifier = Some({
+        let queue = command_queue.clone();
+        claurst_tools::CompletionNotifier::new(move |notice| {
+            queue.push(
+                claurst_query::QueuedCommand::InjectUserMessage(notice),
+                claurst_query::CommandPriority::Normal,
+            );
+        })
+    });
     let mut live_config = config.clone();
     if !session.model.is_empty() {
         live_config.model = Some(session.model.clone());
@@ -1873,7 +2121,36 @@ async fn run_interactive(
 
     // Set up terminal
     let mut terminal = setup_terminal(live_config.mouse_capture_enabled())?;
+    // Restore the terminal on SIGINT / SIGTERM / SIGHUP / SIGQUIT. Raw mode,
+    // the kitty keyboard stack, bracketed paste and mouse capture are process
+    // state that would otherwise outlive a signalled exit and garble the shell.
+    claurst_tui::spawn_signal_restore_watchers();
     let mut app = App::new(live_config.clone(), cost_tracker.clone());
+    app.command_queue = Some(command_queue.clone());
+    // Startup skill discovery runs on the blocking pool so a cold
+    // `skills.urls` clone never holds the terminal. When it finishes, the
+    // main loop installs the slash commands for autocomplete and every query
+    // task (which waits on `skill_listings` before its first request) gets
+    // the `<available_skills>` listing.
+    let (skill_cmds_tx, mut skill_cmds_rx) = mpsc::channel::<Vec<(String, String)>>(1);
+    let (skill_listings_tx, skill_listings) =
+        tokio::sync::watch::channel::<Option<Vec<claurst_core::system_prompt::SkillListing>>>(None);
+    {
+        let discovery = skill_discovery;
+        tokio::spawn(async move {
+            let registry = match discovery {
+                Some(handle) => handle.await.unwrap_or_else(|e| {
+                    warn!(error = %e, "Skill discovery failed");
+                    claurst_core::SkillRegistry::default()
+                }),
+                None => claurst_core::SkillRegistry::default(),
+            };
+            let _ = skill_cmds_tx
+                .send(claurst_commands::skill_command_entries(&registry))
+                .await;
+            let _ = skill_listings_tx.send(Some(registry.listings()));
+        });
+    }
     if let Some(error) = settings_load_error {
         app.invalid_config_dialog =
             claurst_tui::InvalidConfigDialogState::show_settings_error(&error);
@@ -1899,7 +2176,6 @@ async fn run_interactive(
     }
     app.provider_registry = base_query_config.provider_registry.clone();
     app.refresh_context_window_size();
-    app.auto_compact_enabled = live_config.auto_compact;
 
     // Background: keep the model registry fresh from models.dev for the whole
     // TUI session (opencode-style: refresh now, then every ~60 min, gated by a
@@ -1932,11 +2208,6 @@ async fn run_interactive(
     // Mark whether valid credentials exist so the TUI can show a provider
     // setup dialog instead of failing silently on the first message.
     app.has_credentials = has_credentials;
-
-    // Restore "always allow" bash prefixes persisted from earlier sessions so
-    // previously-approved command prefixes don't prompt again.
-    app.bash_prefix_allowlist
-        .extend(settings.allowed_bash_prefixes.iter().cloned());
 
     // If a non-Anthropic provider is active, prefix model_name with "provider/model"
     // so the status bar can show the provider name.
@@ -1995,32 +2266,42 @@ async fn run_interactive(
         }
     }
 
-    // CLAUDE_STATUS_COMMAND: optional external command whose stdout replaces the
-    // left-side status bar text. Polled every 500ms (debounced) in the main loop.
-    // The command is run in a background task; results flow through a channel.
-    let status_cmd_str = std::env::var("CLAUDE_STATUS_COMMAND").ok();
+    // Status line: optional external command whose stdout is shown in a status
+    // bar row. Configured via settings.json `statusLine`. The command receives
+    // session data as JSON on stdin and is polled at `pollIntervalMs` (default 5s).
+    // Backward compat: CLAUDE_STATUS_COMMAND env var is also checked.
+    let status_cmd_cfg = live_config.status_line.as_ref().map(|s| {
+        (s.command.clone(), s.poll_interval_ms.unwrap_or(5000))
+    }).or_else(|| {
+        std::env::var("CLAUDE_STATUS_COMMAND").ok().map(|c| (c, 500))
+    });
     let (status_cmd_tx, mut status_cmd_rx) = mpsc::channel::<String>(4);
-    if let Some(ref cmd_str) = status_cmd_str {
+    // Shared session payload for the polling task (refreshed from the main
+    // loop). Seeded with an empty object so the first run has valid JSON.
+    let session_data = Arc::new(ParkingMutex::new(String::from("{}")));
+    // Elapsed-seconds value of the last payload build; the payload has 1 s
+    // resolution, so the main loop rebuilds it at most once per second.
+    let mut status_payload_secs: Option<u64> = None;
+    let status_line_cancel = CancellationToken::new();
+    if let Some((ref cmd_str, poll_ms)) = status_cmd_cfg {
         let cmd_str = cmd_str.clone();
         let tx = status_cmd_tx.clone();
+        let sd = session_data.clone();
+        let cancel = status_line_cancel.clone();
         tokio::spawn(async move {
+            // Clamp interval: minimum 1000ms, maximum 300000ms (5 minutes).
+            let interval = Duration::from_millis(poll_ms.clamp(1000, 300000));
+            // Wait briefly before first poll so the main loop has a chance to
+            // populate session_data with real values.
+            tokio::time::sleep(Duration::from_millis(500)).await;
             loop {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                // Run via shell so pipes/redirects in the command string work.
-                let output = if cfg!(target_os = "windows") {
-                    tokio::process::Command::new("cmd")
-                        .args(["/C", &cmd_str])
-                        .output()
-                        .await
-                } else {
-                    tokio::process::Command::new("sh")
-                        .args(["-c", &cmd_str])
-                        .output()
-                        .await
-                };
-                if let Ok(out) = output {
-                    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                let input = sd.lock().clone();
+                if let Some(text) = run_status_line_command(&cmd_str, &input, interval).await {
                     let _ = tx.try_send(text);
+                }
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = tokio::time::sleep(interval) => {}
                 }
             }
         });
@@ -2095,13 +2376,18 @@ async fn run_interactive(
         remote_session_url: session.remote_session_url.clone(),
         mcp_manager: tool_ctx.mcp_manager.clone(),
         mcp_auth_runner: None,
+        permission_manager: tool_ctx.permission_manager.clone(),
     };
 
     // tools is already Arc<Vec<...>> — share it across spawned tasks without copying.
-    // Keep the full unfiltered tool set so agent-mode switching can re-filter.
-    let all_tools_arc: Arc<Vec<Box<dyn claurst_tools::Tool>>> =
-        Arc::new(claurst_tools::all_tools());
+    // Agent-mode switches and MCP catalog changes rebuild it via `tools_for_session`.
     let mut tools_arc = tools;
+    // MCP manager generation the current `tools_arc` was built from; `None`
+    // forces a rebuild on the first idle pass.
+    let mut mcp_seen_generation: Option<u64> = None;
+    // Servers whose startup failure was already reported in the status line.
+    let mut mcp_reported_failures: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
 
     // Current cancel token (replaced each turn)
     let mut cancel: Option<CancellationToken> = None;
@@ -2163,10 +2449,15 @@ async fn run_interactive(
     // setting; read it once at startup. `progress_shown` tracks whether we've
     // told the terminal we're "busy", so the escape is only emitted on an actual
     // streaming-state edge.
-    let progress_bar_enabled = claurst_core::config::Settings::load_sync()
-        .map(|s| s.terminal_progress_bar)
-        .unwrap_or(true);
+    // OSC 7501 program status reporting is likewise opt-out, via the
+    // terminalProgramStatus setting.
+    let (progress_bar_enabled, program_status_enabled) =
+        claurst_core::config::Settings::load_sync()
+            .map(|s| (s.terminal_progress_bar, s.terminal_program_status))
+            .unwrap_or((true, true));
     let mut progress_shown = false;
+    // Set while an interrupted turn's task winds down (#444).
+    let mut discard_turn_events = false;
     'main: loop {
         app.frame_count = app.frame_count.wrapping_add(1);
         app.tick_rustle_pose();
@@ -2200,6 +2491,10 @@ async fn run_interactive(
             last_auto_scroll = app.auto_scroll;
         }
 
+        // Load/drain the session browser and welcome-screen session lists
+        // (this loop does not go through `App::run`; issue #382).
+        app.poll_session_loads();
+
         // Draw the UI
         terminal.draw(|f| render_app(f, &app))?;
 
@@ -2211,6 +2506,21 @@ async fn run_interactive(
             claurst_tui::set_terminal_progress(want_progress);
             progress_shown = want_progress;
         }
+
+        // Report OSC 7501 program status (idle / working / blocked / done /
+        // error) so terminals and multiplexer UIs can show which session needs
+        // attention. Written only on change; cleared in restore_terminal.
+        let program_status = app.program_status(current_query.is_some());
+        if program_status_enabled {
+            claurst_tui::set_program_status(program_status);
+        }
+        // Bell + desktop notification when a turn finishes or waits on the
+        // user while the terminal is in the background (#444).
+        if let Some(attention) = app.attention_alert(program_status) {
+            claurst_tui::attention::emit(attention);
+        }
+
+        app.query_in_flight = current_query.is_some();
 
         // Poll for crossterm events (keyboard/mouse) with short timeout
         // unless an auto-submit (queued message) is pending — in which case
@@ -2256,9 +2566,14 @@ async fn run_interactive(
                     if key.kind != crossterm::event::KeyEventKind::Press {
                         continue;
                     }
+                    // Any key press after a turn ends means the user has seen
+                    // its result: OSC 7501 `done` / `error` falls back to `idle`.
+                    if current_query.is_none() {
+                        app.last_turn_outcome = None;
+                    }
 
                     // Ctrl+C and Ctrl+D: exit confirmation handling
-                    if handle_exit_key(&mut app, key, &cancel) {
+                    if handle_exit_key(&mut app, key) {
                         if app.should_exit {
                             break 'main;
                         }
@@ -2301,29 +2616,31 @@ async fn run_interactive(
                         && !key.modifiers.contains(KeyModifiers::SHIFT)
                         && !key.modifiers.contains(KeyModifiers::ALT)
                         && !key.modifiers.contains(KeyModifiers::CONTROL);
-                    if plain_enter && app.is_streaming && !any_dialog_open {
-                        // Queue the message: it will auto-submit once the
-                        // current turn finishes (issue #149).
+                    // A turn is running until its task ends: `is_streaming`
+                    // drops between model requests and right after Esc.
+                    let turn_running = app.is_streaming || current_query.is_some();
+                    if plain_enter && turn_running && !any_dialog_open {
+                        // Steer (#444): the loop delivers the text before its
+                        // next model request. Slash commands cannot steer the
+                        // model, so they wait for the turn to end (issue #149).
+                        // Both show in the queued-prompt dock until delivered.
                         let input = app.take_input();
-                        if !input.is_empty() {
-                            let preview: String = input.chars().take(40).collect();
+                        if input.starts_with('/') {
                             app.queued_messages.push_back(input);
-                            let total = app.queued_messages.len();
-                            app.notifications.push(
-                                claurst_tui::NotificationKind::Info,
-                                format!("Queued ({}): {}", total, preview),
-                                Some(3),
-                            );
+                        } else if !input.is_empty() {
+                            app.steer(input);
                         }
                         continue;
                     }
-                    if plain_enter && !app.is_streaming && !any_dialog_open {
+                    if plain_enter && !turn_running && !any_dialog_open {
                         // If a file-ref suggestion is active, accept it instead of submitting.
                         if !app.prompt_input.suggestions.is_empty()
-                            && app.prompt_input.suggestion_index.is_some()
-                            && app.prompt_input.suggestions.get(app.prompt_input.suggestion_index.unwrap())
-                                .map(|s| s.source == claurst_tui::prompt_input::TypeaheadSource::FileRef)
-                                .unwrap_or(false)
+                            && app.prompt_input.suggestion_index.is_some_and(|index| {
+                                app.prompt_input
+                                    .suggestions
+                                    .get(index)
+                                    .is_some_and(|s| s.source == claurst_tui::prompt_input::TypeaheadSource::FileRef)
+                            })
                         {
                             app.prompt_input.accept_suggestion();
                             app.prompt_input.insert_char(' ');
@@ -2390,7 +2707,15 @@ async fn run_interactive(
                             // Always runs — some commands need BOTH (e.g. /clear clears
                             // app state via TUI AND the messages vec via CLI).
                             cmd_ctx.messages = messages.clone();
-                            let cli_result = execute_command(&input, &mut cmd_ctx).await;
+                            // A bare `/resume` opened the session browser; the
+                            // user picks a session there (Enter re-submits
+                            // `/resume <id>`), so don't also auto-resume the
+                            // most recent one underneath it (issue #382).
+                            let cli_result = if handled_by_tui && cmd_name == "resume" {
+                                None
+                            } else {
+                                execute_command(&input, &mut cmd_ctx).await
+                            };
                             // Start optimistically true; set false for Silent/None below.
                             let mut handled_by_cli = cli_result.is_some();
 
@@ -2402,6 +2727,7 @@ async fn run_interactive(
                                 Some(CommandResult::ClearConversation) => {
                                     messages.clear();
                                     app.replace_messages(Vec::new());
+                                    app.context_used_tokens = 0;
                                     session.messages.clear();
                                     session.updated_at = chrono::Utc::now();
                                     app.status_message =
@@ -2424,6 +2750,13 @@ async fn run_interactive(
                                     );
                                     messages.clear();
                                     app.replace_messages(Vec::new());
+                                    session_journal =
+                                        claurst_core::session_journal::SessionJournal::for_session(
+                                            &session,
+                                        );
+                                    base_query_config.session_journal =
+                                        Some(session_journal.clone());
+                                    app.context_used_tokens = 0;
                                     tool_ctx.session_id = session.id.clone();
                                     cmd_ctx.session_id = session.id.clone();
                                     cmd_ctx.session_title = None;
@@ -2463,8 +2796,11 @@ async fn run_interactive(
                                     session.working_dir =
                                         Some(destination.display().to_string());
                                     session.updated_at = chrono::Utc::now();
-                                    let _ =
-                                        claurst_core::history::save_session(&session).await;
+                                    persist_live_session(
+                                        &session_journal,
+                                        &mut session,
+                                        current_query.is_some(),
+                                    );
                                     // NOTE: opencode appends a synthetic
                                     // <system-reminder> prompt after a move. claurst
                                     // re-derives working_directory into every turn's
@@ -2497,9 +2833,44 @@ async fn run_interactive(
                                         if removed == 1 { "" } else { "s" }
                                     ));
                                 }
+                                Some(CommandResult::Compacted {
+                                    messages: new_msgs,
+                                    mut record,
+                                    report,
+                                }) => {
+                                    // Keep the replaced head in the record so
+                                    // /rewind can still reach it (issue #449).
+                                    claurst_core::history::apply_compaction(
+                                        &mut messages,
+                                        new_msgs,
+                                        &mut record,
+                                    );
+                                    if current_query.is_none() {
+                                        if let Err(e) =
+                                            session_journal.record_compaction(&record, &messages)
+                                        {
+                                            tracing::warn!(error = %e, "Session journal: /compact not recorded");
+                                        }
+                                    }
+                                    app.replace_messages(messages.clone());
+                                    app.context_used_tokens = record.tokens_after;
+                                    session.messages = messages.clone();
+                                    session.compactions.push(record);
+                                    session.updated_at = chrono::Utc::now();
+                                    persist_live_session(
+                                        &session_journal,
+                                        &mut session,
+                                        current_query.is_some(),
+                                    );
+                                    app.status_message = Some(report);
+                                }
                                 Some(CommandResult::OpenRewindOverlay) => {
                                     app.replace_messages(messages.clone());
-                                    app.open_rewind_flow();
+                                    // Offer the messages earlier compactions
+                                    // replaced too (issue #449).
+                                    app.open_rewind_flow_with_archive(
+                                        session.compactions.iter().flat_map(|c| c.replaced.iter()),
+                                    );
                                     app.status_message =
                                         Some("Select a message to rewind to.".to_string());
                                 }
@@ -2509,7 +2880,7 @@ async fn run_interactive(
                                     // when the user types /hooks in the TUI prompt, so
                                     // this branch only triggers when the command returns
                                     // the variant explicitly (e.g. from a non-prompt context).
-                                    app.hooks_config_menu.open();
+                                    app.hooks_config_menu.open(&app.config.hooks);
                                     app.status_message =
                                         Some("Hooks configuration browser".to_string());
                                 }
@@ -2520,6 +2891,19 @@ async fn run_interactive(
                                 }
                                 Some(CommandResult::ResumeSession(resumed_session)) => {
                                     session = resumed_session;
+                                    session_journal =
+                                        claurst_core::session_journal::SessionJournal::for_session(
+                                            &session,
+                                        );
+                                    base_query_config.session_journal =
+                                        Some(session_journal.clone());
+                                    if let Err(e) = session_journal.acquire() {
+                                        app.notifications.push(
+                                            NotificationKind::Warning,
+                                            e.to_string(),
+                                            None,
+                                        );
+                                    }
                                     messages = session.messages.clone();
                                     app.replace_messages(messages.clone());
                                     cmd_ctx.config.model = Some(session.model.clone());
@@ -2561,8 +2945,11 @@ async fn run_interactive(
                                     session.title = Some(title.clone());
                                     session.updated_at = chrono::Utc::now();
                                     cmd_ctx.session_title = session.title.clone();
-                                    let _ =
-                                        claurst_core::history::save_session(&session).await;
+                                    persist_live_session(
+                                        &session_journal,
+                                        &mut session,
+                                        current_query.is_some(),
+                                    );
                                     claurst_tui::update_terminal_title(Some(&title));
                                     app.status_message = Some(format!(
                                         "Session renamed to \"{}\".",
@@ -2640,6 +3027,13 @@ async fn run_interactive(
                                     normalize_provider_from_model(&mut applied_cfg);
                                     cmd_ctx.config = applied_cfg.clone();
                                     tool_ctx.config = applied_cfg.clone();
+                                    // Mode and tool allow/deny lists may have changed
+                                    // (e.g. /permissions); re-derive their rules.
+                                    if let Some(manager) = tool_ctx.permission_manager.as_ref() {
+                                        if let Ok(mut manager) = manager.lock() {
+                                            manager.sync_config(&applied_cfg);
+                                        }
+                                    }
                                     app.config = applied_cfg.clone();
                                     // Sync model/provider shown in the TUI header.
                                     if let Some(ref model) = applied_cfg.model {
@@ -2667,6 +3061,13 @@ async fn run_interactive(
                                     normalize_provider_from_model(&mut applied_cfg);
                                     cmd_ctx.config = applied_cfg.clone();
                                     tool_ctx.config = applied_cfg.clone();
+                                    // Mode and tool allow/deny lists may have changed
+                                    // (e.g. /permissions); re-derive their rules.
+                                    if let Some(manager) = tool_ctx.permission_manager.as_ref() {
+                                        if let Ok(mut manager) = manager.lock() {
+                                            manager.sync_config(&applied_cfg);
+                                        }
+                                    }
                                     // Sync model/provider + fast_mode visual indicator.
                                     if let Some(ref model) = applied_cfg.model {
                                         app.set_model(model.clone());
@@ -2830,24 +3231,18 @@ async fn run_interactive(
                             }
                         }
 
-                        // Fire UserPromptSubmit hook (non-blocking)
-                        if !cmd_ctx.config.hooks.is_empty() {
-                            let hook_ctx = claurst_core::hooks::HookContext {
-                                event: "UserPromptSubmit".to_string(),
-                                tool_name: None,
-                                tool_input: None,
-                                tool_output: Some(input.clone()),
-                                is_error: None,
-                                session_id: Some(tool_ctx.session_id.clone()),
-                            };
-                            claurst_core::hooks::run_hooks(
-                                &cmd_ctx.config.hooks,
-                                claurst_core::config::HookEvent::UserPromptSubmit,
-                                &hook_ctx,
-                                &tool_ctx.working_dir,
-                            )
-                            .await;
+                        // UserPromptSubmit hooks (#447): a deny keeps the
+                        // prompt out of the conversation; context is sent with it.
+                        let prompt_hooks = user_prompt_submit_hooks(&tool_ctx, &input).await;
+                        if prompt_hooks.is_deny() {
+                            app.status_message = Some(format!(
+                                "Prompt blocked by UserPromptSubmit hook: {}",
+                                prompt_hooks.reason_or_default()
+                            ));
+                            app.set_prompt_text(input);
+                            continue;
                         }
+                        let prompt_context = prompt_hooks.additional_context;
 
                         // Regular user message (with optional image attachments + file injection)
                         let pending_imgs = app.prompt_input.clear_images();
@@ -2899,7 +3294,7 @@ async fn run_interactive(
                             // No oversized files: inject within-limit files and send
                             let file_prefix = claurst_tui::file_injection::build_file_blocks(&within_limit);
 
-                            let user_msg = if !file_prefix.is_empty() || !pending_imgs.is_empty() {
+                            let mut user_msg = if !file_prefix.is_empty() || !pending_imgs.is_empty() {
                                 let mut blocks: Vec<claurst_core::types::ContentBlock> = Vec::new();
 
                                 // Add file blocks if there's any file content
@@ -2928,6 +3323,7 @@ async fn run_interactive(
                             } else {
                                 claurst_core::types::Message::user(input.clone())
                             };
+                            append_prompt_context(&mut user_msg, prompt_context);
 
                             messages.push(user_msg.clone());
                             app.push_message(user_msg);
@@ -2935,7 +3331,7 @@ async fn run_interactive(
                             session.updated_at = chrono::Utc::now();
                         } else {
                             // File injection disabled: send as-is
-                            let user_msg = if pending_imgs.is_empty() {
+                            let mut user_msg = if pending_imgs.is_empty() {
                                 claurst_core::types::Message::user(input.clone())
                             } else {
                                 let mut blocks: Vec<claurst_core::types::ContentBlock> = pending_imgs
@@ -2955,6 +3351,7 @@ async fn run_interactive(
                                 blocks.push(claurst_core::types::ContentBlock::Text { text: input.clone() });
                                 claurst_core::types::Message::user_blocks(blocks)
                             };
+                            append_prompt_context(&mut user_msg, prompt_context);
 
                             messages.push(user_msg.clone());
                             app.push_message(user_msg);
@@ -2984,11 +3381,12 @@ async fn run_interactive(
 
                         // Share the Arc so the spawned task can access all tools (incl. MCP).
                         let tools_arc_clone = tools_arc.clone();
-                        let mut ctx_clone = tool_ctx.clone();
+                        let ctx_clone = tool_ctx.clone();
                         let mut qcfg = base_query_config.clone();
                         qcfg.model = claurst_api::effective_model_for_config(&cmd_ctx.config, &model_registry);
                         qcfg.max_tokens = cmd_ctx.config.effective_max_tokens();
-                        qcfg.append_system_prompt = cmd_ctx.config.append_system_prompt.clone();
+                        // Session-local /turns override wins over agent and config caps.
+                        qcfg.max_turns_override = app.max_turns_override;
                         qcfg.system_prompt = base_query_config.system_prompt.clone();
                         qcfg.output_style = cmd_ctx.config.effective_output_style();
                         qcfg.output_style_prompt = cmd_ctx.config.resolve_output_style_prompt();
@@ -3000,21 +3398,13 @@ async fn run_interactive(
                         if let Some(level) = current_effort {
                             qcfg.effort_level = Some(level);
                         }
-                        // Wire completion_notifier if a command queue is available.
-                        if let Some(ref cq) = qcfg.command_queue {
-                            let cq = cq.clone();
-                            ctx_clone.completion_notifier = Some(claurst_tools::CompletionNotifier::new(move |msg| {
-                                cq.push(
-                                    claurst_query::QueuedCommand::InjectSystemMessage(msg),
-                                    claurst_query::CommandPriority::Normal,
-                                );
-                            }));
-                        }
                         let tracker = cost_tracker.clone();
                         let tx = event_tx.clone();
                         let client_clone = client.clone();
 
+                        let skill_listings = skill_listings.clone();
                         let handle = tokio::spawn(async move {
+                            qcfg.available_skills = session_skill_listings(skill_listings).await;
                             let mut msgs = msgs_arc_clone.lock().await.clone();
                             let outcome = claurst_query::run_query_loop(
                                 client_clone.as_ref(),
@@ -3039,64 +3429,91 @@ async fn run_interactive(
                     }
                     if let Some(pr) = app.permission_request.as_mut() {
                         if claurst_tui::dialogs::handle_permission_key(pr, key) {
-                            let tool_use_id = pr.tool_use_id.clone();
-                            let selected_option = pr.selected_option;
-                            let selected_key = pr.options.get(selected_option).map(|o| o.key);
-                            let should_record_bash_prefix = selected_key == Some('P');
-                            let selected_path = pending_permissions
-                                .lock()
-                                .waiting
-                                .get(&tool_use_id)
-                                .and_then(|p| p.request.path.clone());
-                            let bash_prefix = if should_record_bash_prefix {
-                                match &pr.kind {
-                                    claurst_tui::dialogs::PermissionDialogKind::Bash { command, .. } => {
-                                        let first_word = command.split_whitespace().next().unwrap_or("").to_string();
-                                        if first_word.is_empty() { None } else { Some(first_word) }
-                                    }
+                            // "Retry outside the sandbox?" (#470): record the chosen
+                            // scope and answer the waiting Bash call; it never touches
+                            // the permission rules or the Bash prefix allowlist.
+                            if let claurst_tui::dialogs::PermissionDialogKind::SandboxEscalation { command } = &pr.kind {
+                                use claurst_tools::sandbox::{record_escalation, EscalationScope};
+                                let scope = match pr.options.get(pr.selected_option).map(|o| o.key) {
+                                    Some('y') => Some(EscalationScope::Once),
+                                    Some('Y') => Some(EscalationScope::Session),
+                                    Some('P') => Some(EscalationScope::Prefix),
                                     _ => None,
+                                };
+                                if let Some(scope) = scope {
+                                    record_escalation(scope, command);
                                 }
-                            } else {
-                                None
+                                let tool_use_id = pr.tool_use_id.clone();
+                                app.permission_request = None;
+                                if let Some(mut pending) = pending_permissions.lock().waiting.remove(&tool_use_id) {
+                                    let decision = if scope.is_some() {
+                                        claurst_core::permissions::PermissionDecision::Allow
+                                    } else {
+                                        claurst_core::permissions::PermissionDecision::Deny
+                                    };
+                                    if let Some(tx) = pending.decision_tx.take() {
+                                        let _ = tx.send(decision);
+                                    }
+                                }
+                                continue;
+                            }
+                            let tool_use_id = pr.tool_use_id.clone();
+                            let selected_key = pr.options.get(pr.selected_option).map(|o| o.key);
+                            // The reason typed after choosing deny, if any,
+                            // goes back to the model with the denial.
+                            let feedback = pr
+                                .feedback
+                                .take()
+                                .map(|reason| reason.trim().to_string())
+                                .filter(|reason| !reason.is_empty());
+                            let suggested_rules = match &mut pr.kind {
+                                claurst_tui::dialogs::PermissionDialogKind::Bash { suggested_rules, .. } => {
+                                    std::mem::take(suggested_rules)
+                                }
+                                _ => Vec::new(),
                             };
                             app.permission_request = None;
 
-                            if let Some(prefix) = bash_prefix {
-                                app.bash_prefix_allowlist.insert(prefix.clone());
-                                // "Always allow" must survive restarts: persist
-                                // the prefix to settings.json so it is reloaded
-                                // into the allowlist on the next launch.
-                                if let Ok(mut settings) = claurst_core::config::Settings::load_sync() {
-                                    if !settings.allowed_bash_prefixes.contains(&prefix) {
-                                        settings.allowed_bash_prefixes.push(prefix);
-                                        let _ = settings.save_sync();
-                                    }
-                                }
-                            }
-
                             if let Some(mut pending) = pending_permissions.lock().waiting.remove(&tool_use_id) {
-                                let decision = match selected_key {
-                                    Some('n') => claurst_core::permissions::PermissionDecision::Deny,
+                                let decision = match (selected_key, feedback) {
+                                    (Some('n'), Some(reason)) => {
+                                        claurst_core::permissions::PermissionDecision::DenyWithFeedback(reason)
+                                    }
+                                    (Some('n'), None) => claurst_core::permissions::PermissionDecision::Deny,
                                     _ => claurst_core::permissions::PermissionDecision::Allow,
                                 };
 
                                 if let Some(manager) = tool_ctx.permission_manager.as_ref() {
                                     if let Ok(mut manager) = manager.lock() {
+                                        let tool_name = pending.request.tool_name.as_str();
+                                        let target = pending.request.path.as_deref();
+                                        let is_shell = claurst_core::permissions::is_shell_tool(tool_name);
                                         match selected_key {
-                                            Some('Y') => {
-                                                if let Some(path) = selected_path.as_deref() {
-                                                    manager.add_session_allow_path(&pending.request.tool_name, path);
-                                                } else {
-                                                    manager.add_session_allow(&pending.request.tool_name);
+                                            Some('Y') => match target {
+                                                Some(command) if is_shell => {
+                                                    manager.add_session_allow_command(tool_name, command);
                                                 }
-                                            }
-                                            Some('p') => {
-                                                let mut settings = claurst_core::config::Settings::load_sync().unwrap_or_default();
-                                                if let Some(path) = selected_path.as_deref() {
-                                                    let pattern = format!("{}*", path);
-                                                    let _ = manager.add_persistent_allow_path(&pending.request.tool_name, &pattern, &mut settings);
+                                                Some(path) => manager.add_session_allow_path(tool_name, path),
+                                                None => manager.add_session_allow(tool_name),
+                                            },
+                                            Some(key @ ('p' | 'a')) => {
+                                                let scope = if key == 'p' {
+                                                    claurst_core::permissions::ApprovalScope::Project
                                                 } else {
-                                                    let _ = manager.add_persistent_allow(&pending.request.tool_name, &mut settings);
+                                                    claurst_core::permissions::ApprovalScope::Global
+                                                };
+                                                // Shell approvals save the arity prefixes shown in
+                                                // the dialog; path approvals cover the path as a
+                                                // prefix glob; anything else allows the tool.
+                                                let patterns: Vec<Option<String>> = match target {
+                                                    Some(_) if is_shell => suggested_rules.into_iter().map(Some).collect(),
+                                                    Some(path) => vec![Some(format!("{}*", path))],
+                                                    None => vec![None],
+                                                };
+                                                for pattern in patterns {
+                                                    if let Err(e) = manager.save_allow(scope, tool_name, pattern.as_deref()) {
+                                                        app.status_message = Some(format!("Could not save approval: {}", e));
+                                                    }
                                                 }
                                             }
                                             _ => {}
@@ -3136,18 +3553,37 @@ async fn run_interactive(
                             if let Some(turns) = def.max_turns {
                                 base_query_config.max_turns = turns;
                             }
-                            tools_arc = filter_tools_for_agent(all_tools_arc.clone(), &def.access);
                         } else {
                             // "build" with no explicit definition = full access, no agent
                             base_query_config.agent_name = None;
                             base_query_config.agent_definition = None;
-                            tools_arc = all_tools_arc.clone();
                         }
+                        tools_arc = tools_for_session(tool_ctx.mcp_manager.clone(), &base_query_config);
                     }
-                    if !app.is_streaming && app.messages.len() < messages.len() {
-                        messages = app.messages.clone();
-                        session.messages = messages.clone();
-                        session.updated_at = chrono::Utc::now();
+                    // Apply a confirmed /rewind. The model history is never
+                    // derived from the display list: that list omits tool
+                    // steps and harness notes (#484). A position inside a
+                    // compaction's replaced head restores the pre-compaction
+                    // history first (issue #449). The rewind is checkpointed
+                    // right away (no query is running here).
+                    if !app.is_streaming {
+                        if let Some(position) = app.pending_rewind.take() {
+                            session.messages = std::mem::take(&mut messages);
+                            let cut = match position.checked_sub(app.rewind_archive_len) {
+                                Some(idx) => claurst_tui::app::rewind_cut_index(&session.messages, idx),
+                                None => {
+                                    session.rewind_to(position);
+                                    // Past the last message: only snaps back
+                                    // over a trailing unanswered tool_use.
+                                    claurst_tui::app::rewind_cut_index(&session.messages, usize::MAX)
+                                }
+                            };
+                            session.messages.truncate(cut);
+                            session.updated_at = chrono::Utc::now();
+                            persist_live_session(&session_journal, &mut session, false);
+                            messages = session.messages.clone();
+                            app.replace_messages(messages.clone());
+                        }
                     }
                 }
                 Event::Paste(data) => {
@@ -3180,8 +3616,19 @@ async fn run_interactive(
                 Event::Resize(_, _) => {
                     // Terminal resize - will be handled on next draw
                 }
-                _ => {}
+                Event::FocusGained => app.terminal_focused = true,
+                Event::FocusLost => app.terminal_focused = false,
             }
+        }
+
+        // Esc / Ctrl+C interrupted the turn (#444): cancel its token, which
+        // stops the model request and running tools. Events the task already
+        // queued are dropped so they cannot restart the spinner.
+        if std::mem::take(&mut app.cancel_requested) {
+            if let Some(ref ct) = cancel {
+                ct.cancel();
+            }
+            discard_turn_events = current_query.is_some();
         }
 
         if app.permission_request.is_none() {
@@ -3191,31 +3638,30 @@ async fn run_interactive(
                     break;
                 };
 
-                let prefix_allowed = pending.request.tool_name == "Bash"
-                    && pending
-                        .request
-                        .path
-                        .as_deref()
-                        .map(|command| app.bash_command_allowed_by_prefix(command))
-                        .unwrap_or(false);
+                // A sandbox escalation is always shown: no permission rule may
+                // answer "run outside the sandbox" (#470).
+                if pending.request.tool_name == claurst_tools::sandbox::SANDBOX_ESCALATION_TOOL {
+                    let tool_use_id = pending.tool_use_id.clone();
+                    app.permission_request = Some(permission_request_from_core(&pending));
+                    pending_permissions.lock().waiting.insert(tool_use_id, pending);
+                    break;
+                }
 
-                let reevaluated = if prefix_allowed {
-                    Some(claurst_core::permissions::PermissionDecision::Allow)
-                } else {
-                    tool_ctx
-                        .permission_manager
-                        .as_ref()
-                        .and_then(|manager| manager.lock().ok())
-                        .map(|manager| {
-                            manager.evaluate(
-                                &pending.request.tool_name,
-                                &pending.request.description,
-                                pending.request.path.as_deref(),
-                                pending.request.working_dir.as_deref(),
-                                &pending.request.allowed_roots,
-                            )
-                        })
-                };
+                // Re-evaluate: an approval saved while this request waited
+                // in the queue may cover it now.
+                let reevaluated = tool_ctx
+                    .permission_manager
+                    .as_ref()
+                    .and_then(|manager| manager.lock().ok())
+                    .map(|manager| {
+                        manager.evaluate(
+                            &pending.request.tool_name,
+                            &pending.request.description,
+                            pending.request.path.as_deref(),
+                            pending.request.working_dir.as_deref(),
+                            &pending.request.allowed_roots,
+                        )
+                    });
 
                 match reevaluated {
                     Some(claurst_core::permissions::PermissionDecision::Ask { .. }) | None => {
@@ -3235,6 +3681,20 @@ async fn run_interactive(
 
         // Drain query events — also forward relevant ones to the bridge as outbound.
         while let Ok(evt) = event_rx.try_recv() {
+            // Record loop compactions in the session (issue #441), moving the
+            // replaced head into it rather than copying it (issue #449).
+            let evt = match evt {
+                QueryEvent::Compacted(mut record) => {
+                    let mut kept = record.without_replaced();
+                    kept.replaced = std::mem::take(&mut record.replaced);
+                    session.compactions.push(kept);
+                    QueryEvent::Compacted(record)
+                }
+                other => other,
+            };
+            if discard_turn_events {
+                continue;
+            }
             // Forward to bridge before consuming (clone only what we need).
             if let Some(ref runtime) = bridge_runtime {
                 let outbound: Option<BridgeOutbound> = match &evt {
@@ -3312,70 +3772,6 @@ async fn run_interactive(
             app.handle_query_event(evt);
         }
 
-        // Auto-compact: when context usage hits 99% and no query is running,
-        // automatically submit a compact request.
-        if app.context_window_size > 0
-            && !app.is_streaming
-            && current_query.is_none()
-            && !app.auto_compact_running
-        {
-            let used_pct = (app.context_used_tokens as f64 / app.context_window_size as f64 * 100.0) as u64;
-            if used_pct >= 99 {
-                app.auto_compact_running = true;
-                let msg_count = messages.len();
-                let compact_msg = format!(
-                    "[Auto-compact triggered ({} messages, {}% context used). \
-                     Provide a detailed summary of our conversation so far, \
-                     preserving all key technical details, decisions made, \
-                     file paths mentioned, and current task status.]",
-                    msg_count, used_pct
-                );
-                app.status_message = Some("Context 99% full — auto-compacting…".to_string());
-                let user_msg = claurst_core::types::Message::user(compact_msg);
-                messages.push(user_msg.clone());
-                app.push_message(user_msg);
-                session.messages = messages.clone();
-                session.updated_at = chrono::Utc::now();
-
-                // Dispatch the compact query immediately.
-                let ct = CancellationToken::new();
-                cancel = Some(ct.clone());
-                let msgs_arc = Arc::new(tokio::sync::Mutex::new(messages.clone()));
-                let msgs_arc_clone = msgs_arc.clone();
-                let tools_arc_clone = tools_arc.clone();
-                let ctx_clone = tool_ctx.clone();
-                let mut qcfg = base_query_config.clone();
-                qcfg.model = claurst_api::effective_model_for_config(&cmd_ctx.config, &model_registry);
-                qcfg.max_tokens = cmd_ctx.config.effective_max_tokens();
-                // Auto-compact is a maintenance turn, not a goal turn: never let
-                // it trigger in-loop goal continuation.
-                qcfg.continuation = claurst_query::ContinuationMode::Default;
-                let tracker = cost_tracker.clone();
-                let tx = event_tx.clone();
-                let client_clone = client.clone();
-                app.is_streaming = true;
-
-                let handle = tokio::spawn(async move {
-                    let mut msgs = msgs_arc_clone.lock().await.clone();
-                    let outcome = claurst_query::run_query_loop(
-                        client_clone.as_ref(),
-                        &mut msgs,
-                        tools_arc_clone.as_slice(),
-                        &ctx_clone,
-                        &qcfg,
-                        tracker,
-                        Some(tx),
-                        ct,
-                        None,
-                    )
-                    .await;
-                    *msgs_arc_clone.lock().await = msgs;
-                    outcome
-                });
-                current_query = Some((handle, msgs_arc));
-            }
-        }
-
         // Drain TUI-facing bridge events.
         let mut disconnect_bridge = false;
         if let Some(runtime) = bridge_runtime.as_mut() {
@@ -3401,7 +3797,11 @@ async fn run_interactive(
                         // Persist the session URL into the saved session record.
                         session.remote_session_url = Some(session_url.clone());
                         session.updated_at = chrono::Utc::now();
-                        let _ = claurst_core::history::save_session(&session).await;
+                        persist_live_session(
+                            &session_journal,
+                            &mut session,
+                            current_query.is_some(),
+                        );
 
                         // Wire the BridgeSessionInfo relay so live tool/text events reach
                         // the web UI via /api/bridge/sessions. This runs alongside
@@ -3503,10 +3903,14 @@ async fn run_interactive(
                         let mut qcfg = base_query_config.clone();
                         qcfg.model = claurst_api::effective_model_for_config(&cmd_ctx.config, &model_registry);
                         qcfg.max_tokens = cmd_ctx.config.effective_max_tokens();
+                        // Session-local /turns override wins over agent and config caps.
+                        qcfg.max_turns_override = app.max_turns_override;
                         let tracker = cost_tracker.clone();
                         let tx = event_tx.clone();
                         let client_clone = client.clone();
+                        let skill_listings = skill_listings.clone();
                         let handle = tokio::spawn(async move {
+                            qcfg.available_skills = session_skill_listings(skill_listings).await;
                             let mut msgs = msgs_arc_clone.lock().await.clone();
                             let outcome = claurst_query::run_query_loop(
                                 client_clone.as_ref(),
@@ -3553,7 +3957,11 @@ async fn run_interactive(
                         session.updated_at = chrono::Utc::now();
                         cmd_ctx.session_title = Some(title.clone());
                         app.session_title = Some(title);
-                        let _ = claurst_core::history::save_session(&session).await;
+                        persist_live_session(
+                            &session_journal,
+                            &mut session,
+                            current_query.is_some(),
+                        );
                     }
                     Ok(TuiBridgeEvent::Error(msg)) => {
                         app.bridge_state = BridgeConnectionState::Failed {
@@ -3611,10 +4019,14 @@ async fn run_interactive(
                 let mut qcfg = base_query_config.clone();
                 qcfg.model = claurst_api::effective_model_for_config(&cmd_ctx.config, &model_registry);
                 qcfg.max_tokens = cmd_ctx.config.effective_max_tokens();
+                // Session-local /turns override wins over agent and config caps.
+                qcfg.max_turns_override = app.max_turns_override;
                 let tracker = cost_tracker.clone();
                 let tx = event_tx.clone();
                 let client_clone = client.clone();
+                let skill_listings = skill_listings.clone();
                 let handle = tokio::spawn(async move {
+                    qcfg.available_skills = session_skill_listings(skill_listings).await;
                     let mut msgs = msgs_arc_clone.lock().await.clone();
                     let outcome = claurst_query::run_query_loop(
                         client_clone.as_ref(),
@@ -3636,10 +4048,54 @@ async fn run_interactive(
             }
         }
 
-        // Drain CLAUDE_STATUS_COMMAND results (most recent wins)
-        if status_cmd_str.is_some() {
+        // Update shared session data for status line polling task.
+        if status_cmd_cfg.is_some() {
+            let elapsed = app.session_start.elapsed().as_secs();
+            if status_payload_secs != Some(elapsed) {
+                status_payload_secs = Some(elapsed);
+                let ctx_size = app.context_window_size;
+                let used_pct = if ctx_size > 0 {
+                    Some(app.context_used_tokens as f64 / ctx_size as f64 * 100.0)
+                } else {
+                    None
+                };
+                let total_output = cost_tracker.output_tokens();
+                let json = serde_json::json!({
+                    "session_id": tool_ctx.session_id,
+                    "cwd": app.current_dir,
+                    "model": {
+                        "display_name": app.model_name,
+                        "id": app.model_name,
+                    },
+                    "workspace": {
+                        "current_dir": app.current_dir,
+                    },
+                    "context_window": {
+                        // Tokens in the current context window (the same figure as
+                        // used_percentage), not a session total, so scripts dividing
+                        // by context_window_size stay within 100%.
+                        "total_input_tokens": app.context_used_tokens,
+                        "total_output_tokens": total_output,
+                        "context_window_size": ctx_size,
+                        "current_usage": {
+                            "input_tokens": cost_tracker.input_tokens(),
+                            "output_tokens": total_output,
+                            "cache_creation_input_tokens": cost_tracker.cache_creation_tokens(),
+                            "cache_read_input_tokens": cost_tracker.cache_read_tokens(),
+                        },
+                        "used_percentage": used_pct,
+                        "remaining_percentage": used_pct.map(|p| 100.0 - p),
+                    },
+                    "cost": {
+                        "total_cost_usd": app.cost_usd,
+                    },
+                    "elapsed_seconds": elapsed,
+                });
+                *session_data.lock() = json.to_string();
+            }
+            // Drain status line results (most recent wins)
             while let Ok(text) = status_cmd_rx.try_recv() {
-                app.status_line_override = if text.is_empty() { None } else { Some(text) };
+                app.set_status_line_output(&text);
             }
         }
 
@@ -3834,6 +4290,11 @@ async fn run_interactive(
             app.tasks_overlay.refresh_tasks(&claurst_tools::TASK_STORE);
         }
 
+        // Install skill slash commands once startup discovery finishes.
+        if let Ok(commands) = skill_cmds_rx.try_recv() {
+            app.set_discovered_slash_commands(commands);
+        }
+
         // Check if the background update task has reported a result.
         if app.update_available.is_none() {
             if let Ok(Some(version)) = update_rx.try_recv() {
@@ -4003,16 +4464,29 @@ async fn run_interactive(
                 }
             }
         }
-        // Check if query task is done; sync messages from the task
+        // Check if query task is done; sync messages from the task. Wait until
+        // its events are drained too, so a late Compacted entry reaches the
+        // session before the turn-end checkpoint (issue #449).
         let task_finished = current_query
             .as_ref()
             .map(|(h, _)| h.is_finished())
-            .unwrap_or(false);
+            .unwrap_or(false)
+            && event_rx.is_empty();
 
         if task_finished {
             if let Some((handle, msgs_arc)) = current_query.take() {
                 // Get the outcome and handle errors
-                if let Ok(QueryOutcome::Error(err)) = handle.await {
+                let result = handle.await;
+                if std::mem::take(&mut discard_turn_events) {
+                    while let Ok(evt) = event_rx.try_recv() {
+                        if let QueryEvent::Compacted(record) = evt {
+                            session.compactions.push(record);
+                        }
+                    }
+                }
+                let aborted = matches!(result, Ok(QueryOutcome::Cancelled));
+                app.last_turn_outcome = claurst_tui::TurnOutcome::from_query_result(&result);
+                if let Ok(QueryOutcome::Error(err)) = result {
                     while app.notifications.current_is_error() {
                         app.notifications.dismiss_current();
                     }
@@ -4024,6 +4498,12 @@ async fn run_interactive(
                 }
                 // Sync the updated conversation back to our local vector
                 messages = msgs_arc.lock().await.clone();
+                // Tell the next turn that this one was interrupted on purpose.
+                if aborted {
+                    messages.push(claurst_core::types::Message::user(
+                        claurst_core::system_prompt::TURN_ABORTED_MESSAGE,
+                    ));
+                }
                 session.messages = messages.clone();
                 session.updated_at = chrono::Utc::now();
                 session.model = claurst_api::effective_model_for_config(&cmd_ctx.config, &model_registry);
@@ -4031,21 +4511,20 @@ async fn run_interactive(
                 app.is_streaming = false;
                 app.status_message = None;
                 // Drain one queued message into the prompt and request an
-                // auto-submit on the next loop iteration (issue #149).
-                if let Some(next) = app.queued_messages.pop_front() {
-                    app.prompt_input.text = next;
-                    app.prompt_input.cursor = app.prompt_input.text.len();
-                    app.pending_auto_submit = true;
-                }
-                if app.auto_compact_running {
-                    app.auto_compact_running = false;
-                    // After auto-compact the context was summarised — reset usage.
-                    app.context_used_tokens = 0;
-                    app.status_message = Some("Auto-compact complete.".to_string());
+                // auto-submit on the next loop iteration (issue #149). Steers
+                // still undelivered go first: the idle wake-up below sends
+                // them, and the queued message follows that turn (#444).
+                if command_queue.is_empty() {
+                    if let Some(next) = app.queued_messages.pop_front() {
+                        app.prompt_input.text = next;
+                        app.prompt_input.cursor = app.prompt_input.text.len();
+                        app.pending_auto_submit = true;
+                    }
                 }
 
-                // Save session to JSONL (primary storage)
-                let _ = claurst_core::history::save_session(&session).await;
+                // Checkpoint: the journal already holds every step of the turn;
+                // this rewrites the snapshot atomically (issue #449).
+                persist_live_session(&session_journal, &mut session, false);
 
                 // Also index into SQLite for /search support
                 {
@@ -4095,6 +4574,59 @@ async fn run_interactive(
                         });
                 }
             }
+        }
+
+        // Idle wake-up (#444): queued input — a steer typed during the final
+        // request of the last turn, or a background task's completion notice —
+        // starts a turn that delivers it. The loop drains the queue before its
+        // first request and reports it through `QueryEvent::InputInjected`.
+        if current_query.is_none()
+            && !app.is_streaming
+            && !app.pending_auto_submit
+            && !app.any_modal_open()
+            && !command_queue.is_empty()
+        {
+            app.is_streaming = true;
+            app.streaming_text.clear();
+            let ct = CancellationToken::new();
+            cancel = Some(ct.clone());
+            let msgs_arc = Arc::new(tokio::sync::Mutex::new(messages.clone()));
+            let msgs_arc_clone = msgs_arc.clone();
+            let tools_arc_clone = tools_arc.clone();
+            let ctx_clone = tool_ctx.clone();
+            let mut qcfg = base_query_config.clone();
+            qcfg.model = claurst_api::effective_model_for_config(&cmd_ctx.config, &model_registry);
+            qcfg.max_tokens = cmd_ctx.config.effective_max_tokens();
+            qcfg.max_turns_override = app.max_turns_override;
+            qcfg.output_style = cmd_ctx.config.effective_output_style();
+            qcfg.output_style_prompt = cmd_ctx.config.resolve_output_style_prompt();
+            qcfg.working_directory = Some(tool_ctx.working_dir.display().to_string());
+            if let Some(level) = current_effort {
+                qcfg.effort_level = Some(level);
+            }
+            let tracker = cost_tracker.clone();
+            let tx = event_tx.clone();
+            let client_clone = client.clone();
+            let skill_listings = skill_listings.clone();
+            let handle = tokio::spawn(async move {
+                qcfg.available_skills = session_skill_listings(skill_listings).await;
+                let mut msgs = msgs_arc_clone.lock().await.clone();
+                let outcome = claurst_query::run_query_loop(
+                    client_clone.as_ref(),
+                    &mut msgs,
+                    tools_arc_clone.as_slice(),
+                    &ctx_clone,
+                    &qcfg,
+                    tracker,
+                    Some(tx),
+                    ct,
+                    None,
+                )
+                .await;
+                *msgs_arc_clone.lock().await = msgs;
+                outcome
+            });
+            current_query = Some((handle, msgs_arc));
         }
 
         if !app.is_streaming && current_query.is_none() {
@@ -4189,27 +4721,53 @@ async fn run_interactive(
                 &app.mcp_session_trusted,
                 &store,
             );
-            let new_mcp_manager = connect_mcp_manager_arc(&decision.allowed).await;
+            let new_mcp_manager = start_mcp_manager(&decision.allowed);
             tool_ctx.mcp_manager = new_mcp_manager.clone();
             app.mcp_manager = new_mcp_manager.clone();
-            tools_arc = build_tools_with_mcp(new_mcp_manager.clone());
+            // Read the generation before building: a connect task that bumps
+            // it in between then still triggers a rebuild in the idle block.
+            mcp_seen_generation = new_mcp_manager.as_ref().map(|manager| manager.generation());
+            tools_arc = tools_for_session(new_mcp_manager.clone(), &base_query_config);
+            mcp_reported_failures.clear();
             if app.mcp_view.visible {
                 app.refresh_mcp_view();
             }
 
-            let connected = new_mcp_manager
-                .as_ref()
-                .map(|manager| manager.server_count())
-                .unwrap_or(0);
             app.status_message = Some(if cmd_ctx.config.mcp_servers.is_empty() {
                 "No MCP servers configured.".to_string()
             } else {
+                let starting = decision.allowed.len();
                 format!(
-                    "Reconnected MCP runtime ({} connected server{}).",
-                    connected,
-                    if connected == 1 { "" } else { "s" }
+                    "Reconnecting MCP runtime ({} server{})...",
+                    starting,
+                    if starting == 1 { "" } else { "s" }
                 )
             });
+        }
+
+        // MCP servers connect in the background and may change their tool
+        // lists at runtime (`tools/list_changed`). Rebuild the tool list
+        // between turns whenever the manager reports a change, and surface
+        // servers that failed to start.
+        if !app.is_streaming && current_query.is_none() {
+            if let Some(manager) = tool_ctx.mcp_manager.clone() {
+                let generation = manager.generation();
+                if mcp_seen_generation != Some(generation) {
+                    mcp_seen_generation = Some(generation);
+                    tools_arc = tools_for_session(Some(manager.clone()), &base_query_config);
+                    if app.mcp_view.visible {
+                        app.refresh_mcp_view();
+                    }
+                    for (server, error) in manager.failed_servers() {
+                        if mcp_reported_failures.insert(server.clone()) {
+                            app.status_message = Some(format!(
+                                "MCP server '{}' failed to start: {} (see /mcp)",
+                                server, error
+                            ));
+                        }
+                    }
+                }
+            }
         }
 
         // Prompt for any project-defined MCP servers awaiting approval (#123).
@@ -4230,8 +4788,73 @@ async fn run_interactive(
     if let Some(runtime) = bridge_runtime.take() {
         runtime.cancel.cancel();
     }
+    status_line_cancel.cancel();
     restore_terminal(&mut terminal)?;
+    session_end_hooks(&tool_ctx, SessionEndReason::PromptInputExit).await;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Session and prompt hooks (#447)
+// ---------------------------------------------------------------------------
+
+fn session_hook_payload<'a>(
+    tool_ctx: &'a ToolContext,
+    data: HookEventData<'a>,
+) -> claurst_core::hooks::HookPayload<'a> {
+    claurst_core::hooks::HookPayload::new(&tool_ctx.session_id, &tool_ctx.working_dir, data)
+}
+
+/// Fire SessionStart hooks. Their context joins the session context sent
+/// with every request.
+async fn session_start_hooks(
+    tool_ctx: &ToolContext,
+    query_config: &mut claurst_query::QueryConfig,
+    source: SessionStartSource,
+) {
+    let result = claurst_core::hooks::run_hooks(
+        &tool_ctx.config.hooks,
+        &session_hook_payload(tool_ctx, HookEventData::SessionStart { source }),
+    )
+    .await;
+    if let Some(context) = result.additional_context {
+        query_config.session_context = Some(match query_config.session_context.take() {
+            Some(existing) => format!("{existing}\n\n# SessionStart hook context\n{context}"),
+            None => format!("# SessionStart hook context\n{context}"),
+        });
+    }
+}
+
+/// Fire SessionEnd hooks and wait for them.
+async fn session_end_hooks(tool_ctx: &ToolContext, reason: SessionEndReason) {
+    claurst_core::hooks::run_hooks(
+        &tool_ctx.config.hooks,
+        &session_hook_payload(tool_ctx, HookEventData::SessionEnd { reason }),
+    )
+    .await;
+}
+
+/// Fire UserPromptSubmit hooks for `prompt`.
+async fn user_prompt_submit_hooks(tool_ctx: &ToolContext, prompt: &str) -> claurst_core::hooks::HookResult {
+    claurst_core::hooks::run_hooks(
+        &tool_ctx.config.hooks,
+        &session_hook_payload(tool_ctx, HookEventData::UserPromptSubmit { prompt }),
+    )
+    .await
+}
+
+/// Send UserPromptSubmit hook context with the prompt, as its own text block.
+fn append_prompt_context(message: &mut claurst_core::types::Message, context: Option<String>) {
+    use claurst_core::types::{ContentBlock, MessageContent};
+    let Some(context) = context else { return };
+    let block = ContentBlock::Text { text: format!("UserPromptSubmit hook context:\n{context}") };
+    match &mut message.content {
+        MessageContent::Blocks(blocks) => blocks.push(block),
+        MessageContent::Text(text) => {
+            let text = std::mem::take(text);
+            message.content = MessageContent::Blocks(vec![ContentBlock::Text { text }, block]);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4863,6 +5486,57 @@ mod bare_mode_tests {
     }
 
     #[test]
+    fn project_plugin_mcp_servers_are_queued_for_approval() {
+        use claurst_core::config::{McpServerConfig, McpServerOrigin};
+        use claurst_core::mcp_trust::McpTrustStore;
+        let server = |name: &str, origin| McpServerConfig {
+            name: name.to_string(),
+            command: Some("server-bin".to_string()),
+            args: vec![],
+            env: Default::default(),
+            url: None,
+            server_type: "stdio".to_string(),
+            headers: Default::default(),
+            connect_timeout_ms: None,
+            catalog_timeout_ms: None,
+            origin,
+        };
+        let servers = vec![
+            server("user-srv", McpServerOrigin::User),
+            server("repo-srv", McpServerOrigin::Project),
+        ];
+        let cwd = std::env::temp_dir().join("claurst-493-project");
+        let mut store = McpTrustStore::default();
+
+        // (a) unapproved project-plugin server is pending; (b) with no
+        // settings-derived project root, approvals are keyed by cwd.
+        let mut root = None;
+        let pending = pending_project_plugin_mcp(&servers, &mut root, &cwd, false, &store);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].name, "repo-srv");
+        assert_eq!(root.as_deref(), Some(cwd.as_path()));
+
+        // An existing project root is kept.
+        let other = std::env::temp_dir().join("claurst-493-settings-root");
+        let mut root = Some(other.clone());
+        pending_project_plugin_mcp(&servers, &mut root, &cwd, false, &store);
+        assert_eq!(root, Some(other));
+
+        // (c) nothing pending once approved for cwd, or with global trust.
+        store.approve(&cwd, &servers[1]);
+        let mut root = None;
+        assert!(pending_project_plugin_mcp(&servers, &mut root, &cwd, false, &store).is_empty());
+        let mut root = None;
+        let empty = McpTrustStore::default();
+        assert!(pending_project_plugin_mcp(&servers, &mut root, &cwd, true, &empty).is_empty());
+
+        // User-only plugin servers leave the root untouched.
+        let mut root = None;
+        assert!(pending_project_plugin_mcp(&servers[..1], &mut root, &cwd, false, &empty).is_empty());
+        assert!(root.is_none());
+    }
+
+    #[test]
     fn bare_mode_uses_empty_plugin_registry() {
         // In bare mode main() substitutes `PluginRegistry::new()` for
         // `load_plugins()`. Assert it contributes no plugins, commands, hooks,
@@ -4870,28 +5544,27 @@ mod bare_mode_tests {
         let registry = claurst_plugins::PluginRegistry::new();
         assert_eq!(registry.enabled_count(), 0, "no plugins enabled");
         assert!(registry.all_command_defs().is_empty(), "no plugin commands");
-        let hook_count: usize = registry
-            .build_hook_registry()
-            .values()
-            .map(|v| v.len())
-            .sum();
-        assert_eq!(hook_count, 0, "no plugin hooks");
+        assert!(registry.hook_map().is_empty(), "no plugin hooks");
         assert!(registry.all_mcp_servers().is_empty(), "no plugin MCP servers");
     }
 
     #[test]
     fn bare_mode_clears_hooks() {
-        use claurst_core::config::{HookEntry, HookEvent};
+        use claurst_core::config::{HookCommand, HookEvent, HookMap, HookMatcher, HookType};
         // Simulate settings-derived hooks, then apply the bare-mode clear that
-        // main() performs. Every `run_hooks` call site guards on
-        // `config.hooks.is_empty()`, so an empty map means nothing executes.
-        let mut hooks: std::collections::HashMap<HookEvent, Vec<HookEntry>> =
-            std::collections::HashMap::new();
+        // main() performs. Bare mode also registers no plugin hooks, so an
+        // empty map means `run_hooks` has nothing to execute.
+        let mut hooks = HookMap::new();
         hooks.insert(
             HookEvent::PreToolUse,
-            vec![HookEntry {
-                command: "echo untrusted".to_string(),
-                ..Default::default()
+            vec![HookMatcher {
+                matcher: None,
+                hooks: vec![HookCommand {
+                    kind: HookType::Command,
+                    command: "echo untrusted".to_string(),
+                    timeout: None,
+                    plugin: None,
+                }],
             }],
         );
         assert!(!hooks.is_empty(), "precondition: hooks are present");
@@ -4899,5 +5572,49 @@ mod bare_mode_tests {
         hooks.clear(); // mirrors `config.hooks.clear()` in bare mode
 
         assert!(hooks.is_empty(), "bare mode leaves no hooks to run");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod status_line_command_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn status_line_command_receives_stdin_payload() {
+        let out = run_status_line_command("cat", r#"{"a":1}"#, Duration::from_secs(5)).await;
+        assert_eq!(out.as_deref(), Some(r#"{"a":1}"#));
+    }
+
+    #[tokio::test]
+    async fn status_line_command_large_output_is_capped_not_wedged() {
+        // 1 MiB on stdout, far beyond the pipe buffer: the old wait-then-read
+        // path blocked the child on a full pipe until the timeout killed it.
+        let started = std::time::Instant::now();
+        let out = run_status_line_command(
+            "head -c 1048576 /dev/zero | tr '\\0' a",
+            "{}",
+            Duration::from_secs(5),
+        )
+        .await;
+        let text = out.expect("large output must still produce a status line");
+        assert_eq!(text.len(), STATUS_LINE_MAX_OUTPUT_BYTES as usize);
+        assert!(text.chars().all(|c| c == 'a'));
+        assert!(started.elapsed() < Duration::from_secs(5), "must not wait for the timeout");
+    }
+
+    #[tokio::test]
+    async fn status_line_command_ignoring_large_stdin_does_not_hang() {
+        let input = "x".repeat(1 << 20);
+        let out = run_status_line_command("echo ok", &input, Duration::from_secs(5)).await;
+        assert_eq!(out.as_deref(), Some("ok"));
+    }
+
+    #[tokio::test]
+    async fn status_line_command_times_out() {
+        let started = std::time::Instant::now();
+        let out = run_status_line_command("sleep 10", "{}", Duration::from_millis(200)).await;
+        assert!(out.is_none());
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 }

@@ -14,10 +14,10 @@ pub mod plugin;
 pub mod registry;
 
 // Re-export the most commonly used items at the crate root.
-pub use hooks::{HookOutcome, HookRegistry, RegisteredHook, register_plugin_hooks};
+pub use hooks::parse_hooks_value;
 pub use loader::{default_user_plugins_dir, discover_plugins, project_plugins_dir};
 pub use manifest::{
-    HookEventKind, PluginAuthor, PluginHookEntry, PluginHookMatcher, PluginHooksConfig,
+    PluginAuthor, PluginHooksConfig,
     PluginLspServer, PluginManifest, PluginMcpServer, UserConfigValueType,
 };
 pub use plugin::{
@@ -70,12 +70,6 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 // ---------------------------------------------------------------------------
-// Global hook registry (set once at startup, read during tool execution)
-// ---------------------------------------------------------------------------
-
-static GLOBAL_HOOK_REGISTRY: OnceLock<HookRegistry> = OnceLock::new();
-
-// ---------------------------------------------------------------------------
 // Global plugin registry (set once at startup, read by commands / tools)
 // ---------------------------------------------------------------------------
 
@@ -94,92 +88,22 @@ pub fn global_plugin_registry() -> Option<&'static PluginRegistry> {
     GLOBAL_PLUGIN_REGISTRY.get()
 }
 
-/// Store the hook registry built from loaded plugins into a process-global
-/// static so that `run_global_pre_tool_hook` / `run_global_post_tool_hook`
-/// can access it from anywhere without passing the registry around.
-pub fn set_global_hooks(registry: HookRegistry) {
-    // OnceLock::set fails silently if already initialised (e.g. during tests).
-    let _ = GLOBAL_HOOK_REGISTRY.set(registry);
-}
-
-/// Run all `PreToolUse` hooks registered by plugins for the given tool.
-///
-/// Returns `HookOutcome::Deny` if any blocking hook returns a non-zero exit
-/// code, otherwise `HookOutcome::Allow`.
-pub fn run_global_pre_tool_hook(
-    tool_name: &str,
-    tool_input: &serde_json::Value,
-) -> hooks::HookOutcome {
-    let registry = match GLOBAL_HOOK_REGISTRY.get() {
-        Some(r) => r,
-        None => return hooks::HookOutcome::Allow,
-    };
-
-    let event_key = HookEventKind::PreToolUse.to_string();
-    let hooks_for_event = match registry.get(&event_key) {
-        Some(h) => h,
-        None => return hooks::HookOutcome::Allow,
-    };
-
-    let event_json = serde_json::json!({
-        "event": "PreToolUse",
-        "tool_name": tool_name,
-        "tool_input": tool_input,
-    })
-    .to_string();
-
-    for hook in hooks_for_event {
-        // Apply matcher filter if present
-        if let Some(ref matcher) = hook.matcher {
-            if !matcher.is_empty() && matcher != tool_name && matcher != "*" {
-                continue;
-            }
-        }
-        match hooks::run_hook_sync(hook, &event_json) {
-            hooks::HookOutcome::Deny(reason) => return hooks::HookOutcome::Deny(reason),
-            hooks::HookOutcome::Allow | hooks::HookOutcome::Error(_) => {}
+/// Register the hooks of `registry`'s enabled plugins with the core hook
+/// engine, replacing any registered before. They then run for every event,
+/// after settings hooks. Plugins loaded from a project's `.claurst/plugins/`
+/// contribute no hooks: like project settings hooks (#430), they come from
+/// the repository, not the user.
+pub fn set_global_hooks(registry: &PluginRegistry) {
+    for plugin in registry.enabled() {
+        let has_hooks = plugin.hooks_config.as_ref().is_some_and(|c| !c.events.is_empty());
+        if has_hooks && plugin.source == PluginSource::Project {
+            tracing::warn!(
+                plugin = %plugin.name,
+                "Ignoring hooks from project plugin; install it as a user plugin to run its hooks"
+            );
         }
     }
-
-    hooks::HookOutcome::Allow
-}
-
-/// Run all `PostToolUse` hooks registered by plugins for the given tool.
-/// Post-tool hooks are informational; the return value is not used to block.
-pub fn run_global_post_tool_hook(
-    tool_name: &str,
-    tool_input: &serde_json::Value,
-    tool_output: &str,
-    is_error: bool,
-) {
-    let registry = match GLOBAL_HOOK_REGISTRY.get() {
-        Some(r) => r,
-        None => return,
-    };
-
-    let event_key = HookEventKind::PostToolUse.to_string();
-    let hooks_for_event = match registry.get(&event_key) {
-        Some(h) => h,
-        None => return,
-    };
-
-    let event_json = serde_json::json!({
-        "event": "PostToolUse",
-        "tool_name": tool_name,
-        "tool_input": tool_input,
-        "tool_output": tool_output,
-        "is_error": is_error,
-    })
-    .to_string();
-
-    for hook in hooks_for_event {
-        if let Some(ref matcher) = hook.matcher {
-            if !matcher.is_empty() && matcher != tool_name && matcher != "*" {
-                continue;
-            }
-        }
-        hooks::run_hook_sync(hook, &event_json);
-    }
+    claurst_core::hooks::set_plugin_hooks(registry.hook_map());
 }
 
 // ---------------------------------------------------------------------------
@@ -201,29 +125,23 @@ pub async fn load_plugins(
     extra_paths: &[std::path::PathBuf],
 ) -> PluginRegistry {
     let mut registry = PluginRegistry::new();
-    let mut search_dirs: Vec<std::path::PathBuf> = Vec::new();
-
-    // 1. User-global plugins directory.
-    if let Some(user_dir) = default_user_plugins_dir() {
-        search_dirs.push(user_dir);
-    }
-
-    // 2. Project-local plugins directory.
-    search_dirs.push(project_plugins_dir(project_dir));
-
-    // 3. Extra paths (from --plugin-dir or settings).
-    search_dirs.extend_from_slice(extra_paths);
 
     // User plugins.
-    if let Some(user_dir) = default_user_plugins_dir() {
-        let (plugins, errors) = discover_plugins(&[user_dir], PluginSource::User).await;
+    let user_dir = default_user_plugins_dir();
+    if let Some(user_dir) = &user_dir {
+        let (plugins, errors) =
+            discover_plugins(std::slice::from_ref(user_dir), PluginSource::User).await;
         registry.extend(plugins, errors);
     }
 
-    // Project plugins.
+    // Project plugins. With the legacy `~/.claurst` layout and cwd == $HOME
+    // the project dir *is* the user dir; scanning it again would re-register
+    // every user plugin as a project plugin (and gate its MCP servers).
     let proj_dir = project_plugins_dir(project_dir);
-    let (plugins, errors) = discover_plugins(&[proj_dir], PluginSource::Project).await;
-    registry.extend(plugins, errors);
+    if !user_dir.as_deref().is_some_and(|user_dir| same_dir(user_dir, &proj_dir)) {
+        let (plugins, errors) = discover_plugins(&[proj_dir], PluginSource::Project).await;
+        registry.extend(plugins, errors);
+    }
 
     // Extra paths.
     for path in extra_paths {
@@ -233,6 +151,16 @@ pub async fn load_plugins(
     }
 
     registry
+}
+
+/// Whether two paths name the same directory, resolving symlinks when both
+/// exist (e.g. a symlinked `$HOME`).
+fn same_dir(a: &Path, b: &Path) -> bool {
+    a == b
+        || matches!(
+            (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+            (Ok(a), Ok(b)) if a == b
+        )
 }
 
 /// Reload plugins: produce a new registry, compute the diff, and replace the old one.
@@ -326,11 +254,7 @@ pub fn format_plugin_list(registry: &PluginRegistry) -> String {
 
         // Count commands and hooks for this plugin.
         let cmd_count = loader::collect_command_defs(p).len();
-        let hook_count = p
-            .hooks_config
-            .as_ref()
-            .map(|hc| hc.events.values().map(|v| v.len()).sum::<usize>())
-            .unwrap_or(0);
+        let hook_count = p.hooks_config.as_ref().map_or(0, hooks::hook_count);
 
         out.push_str(&format!("  {} [{}] v{}", p.name, status, version));
         if !desc.is_empty() {
@@ -394,14 +318,17 @@ pub fn format_plugin_info(registry: &PluginRegistry, name: &str) -> String {
 
             // Hooks.
             if let Some(ref hooks_config) = p.hooks_config {
-                let hook_count: usize = hooks_config.events.values().map(|v| v.len()).sum();
+                let hook_count = hooks::hook_count(hooks_config);
                 if hook_count > 0 {
                     out.push_str(&format!("\nHooks ({}):\n", hook_count));
-                    for (event, matchers) in &hooks_config.events {
-                        for matcher in matchers {
-                            for hook in &matcher.hooks {
-                                let blocking = if hook.blocking { " [blocking]" } else { "" };
-                                out.push_str(&format!("  {} {}{}\n", event, hook.command, blocking));
+                    if p.source == PluginSource::Project {
+                        out.push_str("  (not run: hooks from project plugins are ignored)\n");
+                    }
+                    for event in claurst_core::config::HookEvent::ALL {
+                        for group in hooks_config.events.get(&event).into_iter().flatten() {
+                            let matcher = group.matcher.as_deref().unwrap_or("*");
+                            for hook in &group.hooks {
+                                out.push_str(&format!("  {} [{}] {}\n", event.as_str(), matcher, hook.command));
                             }
                         }
                     }
@@ -411,6 +338,9 @@ pub fn format_plugin_info(registry: &PluginRegistry, name: &str) -> String {
             // MCP servers.
             if !p.manifest.mcp_servers.is_empty() {
                 out.push_str(&format!("\nMCP servers ({}):\n", p.manifest.mcp_servers.len()));
+                if p.source == PluginSource::Project {
+                    out.push_str("  (project plugin: each server needs your approval before it starts)\n");
+                }
                 for srv in &p.manifest.mcp_servers {
                     out.push_str(&format!("  {}\n", srv.name));
                 }
@@ -542,7 +472,12 @@ pub fn format_reload_summary(
         if cmd_count == 1 { "" } else { "s" }
     ));
 
-    let hook_count: usize = registry.build_hook_registry().values().map(|v| v.len()).sum();
+    let hook_count: usize = registry
+        .hook_map()
+        .values()
+        .flatten()
+        .map(|group| group.hooks.len())
+        .sum();
     parts.push(format!(
         "{} hook{}",
         hook_count,
@@ -621,8 +556,13 @@ mod tests {
         );
     }
 
+    /// Serializes the `load_plugins` tests: one of them points the
+    /// process-global `CLAURST_HOME` (the user plugins dir) at a tempdir.
+    static PLUGIN_HOME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[tokio::test]
     async fn load_plugins_empty_dirs() {
+        let _lock = PLUGIN_HOME_LOCK.lock().await;
         let tmp = TempDir::new().unwrap();
         let reg = load_plugins(tmp.path(), &[]).await;
         assert_eq!(reg.plugin_count(), 0);
@@ -631,6 +571,7 @@ mod tests {
 
     #[tokio::test]
     async fn load_plugins_finds_project_plugin() {
+        let _lock = PLUGIN_HOME_LOCK.lock().await;
         let tmp = TempDir::new().unwrap();
         let plugin_dir = tmp.path().join(".claurst").join("plugins").join("test-plugin");
         std::fs::create_dir_all(&plugin_dir).unwrap();
@@ -643,6 +584,29 @@ mod tests {
         assert_eq!(reg.plugin_count(), 1);
         assert!(reg.get("test-plugin").is_some());
         assert!(reg.is_enabled("test-plugin"));
+    }
+
+    /// Legacy `~/.claurst` layout with cwd == $HOME: the project plugins dir
+    /// is the user plugins dir, so its plugins must stay user plugins.
+    #[tokio::test]
+    async fn load_plugins_project_dir_equal_to_user_dir_stays_user() {
+        let _lock = PLUGIN_HOME_LOCK.lock().await;
+        let home = TempDir::new().unwrap();
+        let claurst_home = home.path().join(".claurst");
+        let plugin_dir = claurst_home.join("plugins").join("mine");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        write_manifest(&plugin_dir, &serde_json::json!({ "name": "mine" }));
+
+        let saved = std::env::var_os("CLAURST_HOME");
+        std::env::set_var("CLAURST_HOME", &claurst_home);
+        let reg = load_plugins(home.path(), &[]).await;
+        match saved {
+            Some(v) => std::env::set_var("CLAURST_HOME", v),
+            None => std::env::remove_var("CLAURST_HOME"),
+        }
+
+        assert_eq!(reg.plugin_count(), 1);
+        assert_eq!(reg.get("mine").unwrap().source, PluginSource::User);
     }
 
     #[test]
@@ -675,5 +639,63 @@ mod tests {
         let diff = ReloadDiff::default();
         let out = format_reload_summary(&reg, &diff);
         assert!(out.contains("Reloaded"));
+    }
+
+    fn write_hooks_plugin(parent: &Path, name: &str, marker: &Path) {
+        let dir = parent.join(name);
+        std::fs::create_dir_all(dir.join("hooks")).unwrap();
+        write_manifest(&dir, &serde_json::json!({ "name": name, "version": "1.0.0" }));
+        let command = format!(
+            "echo \"$CLAUDE_PLUGIN_NAME $CLAUDE_PLUGIN_ROOT\" >> '{}'",
+            marker.display()
+        );
+        std::fs::write(
+            dir.join("hooks").join("hooks.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "hooks": { "PreCompact": [{ "hooks": [{ "type": "command", "command": command }] }] }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// #447: plugin hooks register with the core engine and fire through it;
+    /// hooks from project plugins never register. PreCompact is used only by
+    /// this test in this crate, so the process-global registry cannot leak
+    /// into other tests.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn plugin_hooks_register_and_run_through_core_engine() {
+        use claurst_core::config::{HookEvent, HookMap};
+        use claurst_core::hooks::{run_hooks, CompactTrigger, HookEventData, HookPayload};
+
+        let tmp = TempDir::new().unwrap();
+        let marker = tmp.path().join("fired.log");
+        let user_dir = tmp.path().join("user-plugins");
+        let project_dir = tmp.path().join("project-plugins");
+        write_hooks_plugin(&user_dir, "user-hooks", &marker);
+        write_hooks_plugin(&project_dir, "project-hooks", &marker);
+
+        let mut registry = PluginRegistry::new();
+        let (plugins, errors) = discover_plugins(std::slice::from_ref(&user_dir), PluginSource::User).await;
+        registry.extend(plugins, errors);
+        let (plugins, errors) = discover_plugins(&[project_dir], PluginSource::Project).await;
+        registry.extend(plugins, errors);
+        assert_eq!(registry.plugin_count(), 2);
+
+        let map = registry.hook_map();
+        let groups = &map[&HookEvent::PreCompact];
+        assert_eq!(groups.len(), 1, "only the user plugin contributes hooks");
+        let source = groups[0].hooks[0].plugin.as_ref().unwrap();
+        assert_eq!(source.name, "user-hooks");
+        assert_eq!(source.root, user_dir.join("user-hooks"));
+
+        set_global_hooks(&registry);
+        let data = HookEventData::PreCompact { trigger: CompactTrigger::Auto, custom_instructions: "" };
+        run_hooks(&HookMap::new(), &HookPayload::new("s", tmp.path(), data)).await;
+        claurst_core::hooks::set_plugin_hooks(HookMap::new());
+
+        let fired = std::fs::read_to_string(&marker).unwrap();
+        assert_eq!(fired, format!("user-hooks {}\n", user_dir.join("user-hooks").display()));
     }
 }

@@ -590,22 +590,37 @@ pub fn render_app(frame: &mut Frame, app: &App) {
         input_height(&app.prompt_input, prompt_text_width) + 1 // +1 for model/mode status line
     };
 
+    // Already stripped and capped to `maxLines` by `App::set_status_line_output`.
+    let status_line_height: u16 = app
+        .status_line_override
+        .as_deref()
+        .map_or(0, |text| u16::try_from(text.lines().count().max(1)).unwrap_or(u16::MAX));
+    let dock_lines = queued_dock_lines(app);
+    let dock_height = u16::try_from(dock_lines.len()).unwrap_or(u16::MAX);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),
             Constraint::Length(separator_height),
             Constraint::Length(status_height),
+            Constraint::Length(dock_height),
             Constraint::Length(prompt_height),
             Constraint::Length(suggestions_height),
+            Constraint::Length(status_line_height),
             Constraint::Length(1),
         ])
         .split(size);
+    // Take the dock slot out so the indices below keep naming the same rows.
+    let dock_area = chunks[3];
+    let chunks = [chunks[0], chunks[1], chunks[2], chunks[4], chunks[5], chunks[6], chunks[7]];
 
     render_messages(frame, app, chunks[0]);
     // chunks[1] is the blank separator — intentionally left empty
     if status_height > 0 {
         render_status_row(frame, app, chunks[2]);
+    }
+    if dock_height > 0 {
+        frame.render_widget(Paragraph::new(dock_lines), dock_area);
     }
     // The `/effort` selector replaces the prompt box while open: render it into
     // the input area (full width) and SKIP the prompt input. The prompt returns
@@ -624,7 +639,10 @@ pub fn render_app(frame: &mut Frame, app: &App) {
     if suggestions_height > 0 {
         render_prompt_suggestions(frame, app, chunks[4]);
     }
-    render_footer(frame, app, chunks[5]);
+    if status_line_height > 0 {
+        render_status_line_override(frame, app, chunks[5]);
+    }
+    render_footer(frame, app, chunks[6]);
 
     // Overlays (rendered on top in Z-order)
 
@@ -2172,6 +2190,51 @@ fn render_todo_block(
 }
 
 // -----------------------------------------------------------------------
+// Queued-prompt dock (#444)
+// -----------------------------------------------------------------------
+
+/// Rows of the dock above the prompt: undelivered steers and Tab-queued
+/// prompts (first line of each), then the key hint. Empty when nothing waits.
+fn queued_dock_lines(app: &App) -> Vec<Line<'static>> {
+    const MAX_ITEMS: usize = 4;
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut lines = Vec::new();
+    let mut total = 0usize;
+    for (kind, text) in app.pending_prompts() {
+        total += 1;
+        if total > MAX_ITEMS {
+            continue;
+        }
+        let (label, color) = match kind {
+            crate::app::PendingKind::Steer => ("steer ", Color::Cyan),
+            crate::app::PendingKind::Queued => ("queued", Color::Yellow),
+        };
+        let mut shown = text.lines().next().unwrap_or_default().to_string();
+        if text.lines().nth(1).is_some() {
+            shown.push_str(" \u{2026}");
+        }
+        lines.push(Line::from(vec![
+            Span::styled(format!("  \u{21b3} {label} "), Style::default().fg(color)),
+            Span::raw(shown),
+        ]));
+    }
+    if total == 0 {
+        return lines;
+    }
+    if total > MAX_ITEMS {
+        lines.push(Line::from(Span::styled(
+            format!("    +{} more", total - MAX_ITEMS),
+            dim,
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        "    enter steers \u{00b7} tab queues \u{00b7} alt+up edits \u{00b7} alt+x removes",
+        dim,
+    )));
+    lines
+}
+
+// -----------------------------------------------------------------------
 // Input pane
 // -----------------------------------------------------------------------
 
@@ -2450,8 +2513,30 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         let mut spans: Vec<Span> = Vec::new();
 
+        // Retry pill (#439): a model request is being retried.
+        if let Some((attempt, max)) = app.retry_status {
+            spans.push(Span::styled(
+                format!("\u{27f3} Reconnecting {}/{}", attempt, max),
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ));
+        }
+
+        // Output rate of the streaming request (#444).
+        if let Some(rate) = app.stream_tokens_per_sec() {
+            if !spans.is_empty() {
+                spans.push(Span::raw("  "));
+            }
+            spans.push(Span::styled(
+                format!("~{rate:.0} tok/s"),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+
         // Agent type badge (shown when running as subagent / coordinator)
         if let Some(ref badge) = app.agent_type_badge {
+            if !spans.is_empty() {
+                spans.push(Span::raw("  "));
+            }
             spans.push(Span::styled(
                 format!("\u{2699} {}", badge),
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
@@ -2580,6 +2665,14 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             ));
         }
 
+        // OS sandbox badge (#470): shown while Bash commands run sandboxed.
+        if let Some(label) = claurst_core::sandbox::status_label(&app.config.sandbox) {
+            if !spans.is_empty() {
+                spans.push(Span::raw("  "));
+            }
+            spans.push(Span::styled(label, Style::default().fg(Color::DarkGray)));
+        }
+
         spans
     };
 
@@ -2632,6 +2725,25 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
                     Style::default().fg(Color::DarkGray),
                 ));
             }
+        }
+
+        // 2. Prompt-cache tokens for the session (Anthropic reports these as
+        //    `cache_read_input_tokens` / `cache_creation_input_tokens`; reads
+        //    are already priced at the discounted rate by the cost tracker).
+        let cache_read = app.cost_tracker.cache_read_tokens();
+        let cache_write = app.cost_tracker.cache_creation_tokens();
+        if cache_read > 0 || cache_write > 0 {
+            if !parts.is_empty() {
+                parts.push(Span::raw("  "));
+            }
+            parts.push(Span::styled(
+                format!(
+                    "cache {} read \u{00b7} {} write",
+                    claurst_core::format_utils::format_tokens(cache_read),
+                    claurst_core::format_utils::format_tokens(cache_write),
+                ),
+                Style::default().fg(Color::DarkGray),
+            ));
         }
 
         // 3. Cost — mirrors TS formatCost: 4 decimal places for costs < $0.50, else 2.
@@ -2787,19 +2899,6 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             ));
         }
 
-        // External status line override
-        if let Some(ref override_text) = app.status_line_override {
-            if !parts.is_empty() {
-                parts.push(Span::raw("  "));
-            }
-            // Strip any ANSI escapes for terminal rendering (plain text)
-            let clean: String = override_text
-                .chars()
-                .filter(|c| c.is_ascii_graphic() || *c == ' ')
-                .collect();
-            parts.push(Span::styled(clean, Style::default().fg(Color::DarkGray)));
-        }
-
         // 8. Bridge badge
         if let Some(badge) = app.bridge_state.status_badge(app.frame_count) {
             if !parts.is_empty() {
@@ -2814,6 +2913,26 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
                 "MCP reconnecting",
                 Style::default().fg(Color::Yellow),
             ));
+        } else if let Some(manager) = app.mcp_manager.as_ref() {
+            // Servers connect in the background: show progress, then failures.
+            let summary = manager.status_summary();
+            if summary.connecting > 0 {
+                if !parts.is_empty() {
+                    parts.push(Span::raw("  "));
+                }
+                parts.push(Span::styled(
+                    format!("MCP connecting ({})", summary.connecting),
+                    Style::default().fg(Color::Yellow),
+                ));
+            } else if summary.failed > 0 {
+                if !parts.is_empty() {
+                    parts.push(Span::raw("  "));
+                }
+                parts.push(Span::styled(
+                    format!("MCP {} failed", summary.failed),
+                    Style::default().fg(Color::Red),
+                ));
+            }
         }
 
         parts
@@ -2842,6 +2961,115 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         height: footer_area.height,
     };
     frame.render_widget(Paragraph::new(vec![Line::from(spans)]), padded_area);
+}
+
+/// Strip ANSI escape sequences, C0 controls (except \n) and C1 controls from
+/// text, turning tabs into spaces, returning clean plain text.
+pub(crate) fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    while i < len {
+        let c = bytes[i];
+        if c == 0x1b {
+            // Escape sequence
+            i += 1;
+            if i >= len {
+                break;
+            }
+            match bytes[i] {
+                b'[' => {
+                    // CSI: consume until final byte (0x40-0x7E)
+                    i += 1;
+                    while i < len {
+                        let b = bytes[i];
+                        i += 1;
+                        if b.is_ascii_uppercase() || b.is_ascii_lowercase() || b == b'~' {
+                            break;
+                        }
+                    }
+                }
+                b']' => {
+                    // OSC: consume until BEL (0x07) or ST (\x1b\\)
+                    i += 1;
+                    while i < len {
+                        let b = bytes[i];
+                        i += 1;
+                        if b == 0x07 {
+                            break;
+                        }
+                        if b == 0x1b && i < len && bytes[i] == b'\\' {
+                            i += 1;
+                            break;
+                        }
+                    }
+                }
+                _ => {
+                    // Unknown escape: consume until a letter
+                    while i < len {
+                        let b = bytes[i];
+                        i += 1;
+                        if b.is_ascii_uppercase() || b.is_ascii_lowercase() {
+                            break;
+                        }
+                    }
+                }
+            }
+        } else if c.is_ascii_control() && c != b'\n' && c != b'\t' {
+            i += 1;
+        } else if c == b'\t' {
+            // A raw tab would make the terminal jump to the next tab stop.
+            out.push(' ');
+            i += 1;
+        } else {
+            // Multi-byte UTF-8: copy the full character, dropping C1 controls
+            // (U+0080..U+009F), which terminals may interpret.
+            let char_len = utf8_char_len(c);
+            let ch = core::str::from_utf8(&bytes[i..i + char_len]).unwrap_or("�");
+            out.extend(ch.chars().filter(|ch| !('\u{80}'..='\u{9f}').contains(ch)));
+            i += char_len;
+        }
+    }
+    out
+}
+
+/// Length of a UTF-8 character in bytes given its leading byte.
+fn utf8_char_len(lead: u8) -> usize {
+    if lead & 0x80 == 0 {
+        1
+    } else if lead & 0xE0 == 0xC0 {
+        2
+    } else if lead & 0xF0 == 0xE0 {
+        3
+    } else {
+        4
+    }
+}
+
+fn render_status_line_override(frame: &mut Frame, app: &App, area: Rect) {
+    if area.height == 0 {
+        return;
+    }
+    let text = app.status_line_override.as_deref().unwrap_or("");
+    let padding = app.config.status_line.as_ref().and_then(|s| s.padding).unwrap_or(0);
+    let pad = padding.min(area.width.saturating_div(2));
+    let content_width = area.width.saturating_sub(pad.saturating_mul(2));
+    if content_width == 0 {
+        return;
+    }
+    let padded = Rect {
+        x: area.x.saturating_add(pad),
+        y: area.y,
+        width: content_width,
+        height: area.height,
+    };
+    let style = Style::default().fg(Color::DarkGray);
+    let lines: Vec<Line> = text
+        .lines()
+        .map(|l| Line::from(Span::styled(truncate_end(l, usize::from(content_width)), style)))
+        .collect();
+    frame.render_widget(Paragraph::new(lines), padded);
 }
 
 fn render_prompt_suggestions(frame: &mut Frame, app: &App, area: Rect) {
@@ -3909,5 +4137,196 @@ mod recent_activity_tests {
             .collect();
         assert!(screen.contains("Recent activity"), "header rendered: present");
         assert!(screen.contains("Sortable label"), "session label rendered");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// External status line (`statusLine` setting)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod status_line_tests {
+    use super::*;
+    use crate::app::App;
+    use claurst_core::config::{Config, StatusLineConfig};
+    use claurst_core::cost::CostTracker;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    fn app_with_status_line(padding: Option<u16>, max_lines: Option<u16>) -> App {
+        let config = Config {
+            status_line: Some(StatusLineConfig {
+                command: "true".into(),
+                poll_interval_ms: None,
+                padding,
+                max_lines,
+            }),
+            ..Config::default()
+        };
+        App::new(config, CostTracker::new())
+    }
+
+    fn rows(terminal: &Terminal<TestBackend>) -> Vec<String> {
+        let buf = terminal.backend().buffer();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol().to_string()))
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn status_line_truncation_is_display_width_aware() {
+        assert_eq!(truncate_end("abc", 3), "abc");
+        assert_eq!(truncate_end("abcdefghij", 8), "abcdefg\u{2026}");
+        // Wide (2-cell) CJK chars: the result never exceeds the width.
+        let out = truncate_end("\u{65e5}\u{672c}\u{8a9e}\u{30c6}\u{30ad}", 7);
+        assert_eq!(out, "\u{65e5}\u{672c}\u{8a9e}\u{2026}");
+        assert!(UnicodeWidthStr::width(out.as_str()) <= 7);
+    }
+
+    #[test]
+    fn strip_ansi_removes_escapes_and_controls() {
+        let raw = "\x1b[1;32mgreen\x1b[0m \x1b]8;;https://x\x07link\x1b]8;;\x1b\\\x08\nnext\ttab";
+        assert_eq!(strip_ansi(raw), "green link\nnext tab");
+    }
+
+    #[test]
+    fn strip_ansi_drops_c1_controls() {
+        assert_eq!(strip_ansi("a\u{85}b\u{9b}31mc\u{e9}"), "ab31mc\u{e9}");
+    }
+
+    #[test]
+    fn set_status_line_output_strips_and_caps_lines() {
+        let mut app = app_with_status_line(None, Some(2));
+        app.set_status_line_output("\x1b[31mone\x1b[0m\ntwo\nthree");
+        assert_eq!(app.status_line_override.as_deref(), Some("one\ntwo"));
+        app.set_status_line_output("\x1b[0m");
+        assert!(app.status_line_override.is_none());
+    }
+
+    #[test]
+    fn status_line_padding_and_truncation_render() {
+        let mut app = app_with_status_line(Some(3), None);
+        app.set_status_line_output("abcdefghijklmnopqrstuvwxyz");
+        let mut terminal = Terminal::new(TestBackend::new(20, 1)).unwrap();
+        terminal
+            .draw(|f| render_status_line_override(f, &app, f.area()))
+            .unwrap();
+        assert_eq!(rows(&terminal)[0], "   abcdefghijklm\u{2026}   ");
+    }
+
+    #[test]
+    fn status_line_padding_larger_than_terminal_does_not_panic() {
+        let mut app = app_with_status_line(Some(u16::MAX), None);
+        app.set_status_line_output("status");
+        for width in [1, 2, 7] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+            terminal
+                .draw(|f| render_status_line_override(f, &app, f.area()))
+                .unwrap();
+            // Padding is clamped to half the width: at most one cell remains.
+            assert!(rows(&terminal)[0].trim().chars().count() <= 1);
+        }
+    }
+
+    #[test]
+    fn footer_shows_prompt_cache_tokens() {
+        let app = App::new(Config::default(), CostTracker::new());
+        let mut terminal = Terminal::new(TestBackend::new(160, 1)).unwrap();
+        terminal.draw(|f| render_footer(f, &app, f.area())).unwrap();
+        assert!(!rows(&terminal)[0].contains("cache "));
+
+        app.cost_tracker.add_usage(12, 40, 3_400, 51_000);
+        terminal.draw(|f| render_footer(f, &app, f.area())).unwrap();
+        assert!(
+            rows(&terminal)[0].contains("cache 51K read \u{00b7} 3.4K write"),
+            "footer: {:?}",
+            rows(&terminal)[0]
+        );
+    }
+
+    #[test]
+    fn footer_shows_tokens_per_second_while_streaming() {
+        let mut app = App::new(Config::default(), CostTracker::new());
+        let mut terminal = Terminal::new(TestBackend::new(120, 1)).unwrap();
+        app.is_streaming = true;
+        app.request_output_bytes = 800;
+        // Under half a second the rate is noise and stays hidden.
+        app.request_output_started = Some(std::time::Instant::now());
+        terminal.draw(|f| render_footer(f, &app, f.area())).unwrap();
+        assert!(!rows(&terminal)[0].contains("tok/s"));
+
+        // 800 bytes ~ 200 tokens over ~2 s.
+        app.request_output_started =
+            std::time::Instant::now().checked_sub(std::time::Duration::from_secs(2));
+        let rate = app.stream_tokens_per_sec().expect("rate while streaming");
+        assert!((95.0..=100.0).contains(&rate), "{rate}");
+        terminal.draw(|f| render_footer(f, &app, f.area())).unwrap();
+        assert!(rows(&terminal)[0].contains(" tok/s"), "{:?}", rows(&terminal)[0]);
+
+        // The request ends: the window closes and the rate disappears.
+        app.handle_query_event(claurst_query::QueryEvent::TurnComplete {
+            turn: 1,
+            stop_reason: "end_turn".to_string(),
+            usage: None,
+        });
+        assert_eq!(app.request_output_bytes, 0);
+        assert!(app.stream_tokens_per_sec().is_none());
+        terminal.draw(|f| render_footer(f, &app, f.area())).unwrap();
+        assert!(!rows(&terminal)[0].contains("tok/s"));
+    }
+
+    #[test]
+    fn queued_dock_lists_steers_and_queued_prompts_above_the_input() {
+        let mut app = App::new(Config::default(), CostTracker::new());
+        app.command_queue = Some(claurst_query::CommandQueue::new());
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| render_app(f, &app)).unwrap();
+        assert!(!rows(&terminal).iter().any(|r| r.contains("alt+x removes")));
+
+        app.steer("check the error path".to_string());
+        app.queued_messages.push_back("then write the docs\nsecond line".to_string());
+        terminal.draw(|f| render_app(f, &app)).unwrap();
+        let rows = rows(&terminal);
+        let steer = rows.iter().position(|r| r.contains("steer  check the error path"));
+        let queued = rows.iter().position(|r| r.contains("queued then write the docs \u{2026}"));
+        let hint = rows.iter().position(|r| r.contains("alt+x removes"));
+        assert!(steer.is_some() && queued.is_some() && hint.is_some(), "{rows:#?}");
+        assert!(steer < queued && queued < hint, "{rows:#?}");
+    }
+
+    #[test]
+    fn status_line_renders_above_footer_in_full_layout() {
+        let mut app = app_with_status_line(None, None);
+        app.set_status_line_output("ext-status-ok");
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| render_app(f, &app)).unwrap();
+        assert!(rows(&terminal).iter().any(|r| r.contains("ext-status-ok")));
+    }
+
+    #[test]
+    fn footer_shows_reconnecting_pill_during_retry() {
+        let mut app = app_with_status_line(None, None);
+        app.streaming_text = "partial output".to_string();
+        app.handle_query_event(claurst_query::QueryEvent::Retry {
+            attempt: 2,
+            max_attempts: 5,
+            delay_ms: 1500,
+            reason: "Server error 503".to_string(),
+        });
+        assert_eq!(app.retry_status, Some((2, 5)));
+        assert!(app.streaming_text.is_empty(), "failed attempt output is dropped");
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| render_app(f, &app)).unwrap();
+        assert!(rows(&terminal).iter().any(|r| r.contains("Reconnecting 2/5")));
+
+        app.handle_query_event(claurst_query::QueryEvent::TurnComplete {
+            turn: 1,
+            stop_reason: "end_turn".to_string(),
+            usage: None,
+        });
+        assert!(app.retry_status.is_none(), "a completed turn clears the pill");
     }
 }

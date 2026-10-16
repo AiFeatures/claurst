@@ -1,0 +1,1330 @@
+//! Tests for the app module.
+
+use super::*;
+
+use claurst_core::config::Config;
+use claurst_core::types::Role;
+use claurst_core::PermissionMode;
+use super::keys::{
+    key_event_to_keystroke, layout_to_latin, normalize_char_with_shift,
+    normalize_layout_shortcut_key,
+};
+use super::types::{ContextMenuItem, ContextMenuState};
+
+    
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+
+    fn make_app() -> App {
+        let config = Config::default();
+        let cost_tracker = claurst_core::cost::CostTracker::new();
+        App::new(config, cost_tracker)
+    }
+
+    fn press_key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
+
+    // ---- recent-activity label (issue #277) ----
+
+    #[test]
+    fn recent_session_label_prefers_title() {
+        let label = recent_session_label(
+            Some("My Title".to_string()),
+            Some("some prompt".to_string()),
+        );
+        assert_eq!(label, "My Title");
+    }
+
+    #[test]
+    fn recent_session_label_falls_back_to_first_prompt_line() {
+        let label = recent_session_label(
+            None,
+            Some("  fix the bug\nand more details".to_string()),
+        );
+        assert_eq!(label, "fix the bug");
+    }
+
+    #[test]
+    fn recent_session_label_skips_blank_title_and_untitled_default() {
+        // Blank/whitespace title is ignored in favour of the prompt.
+        assert_eq!(
+            recent_session_label(Some("   ".to_string()), Some("do it".to_string())),
+            "do it"
+        );
+        // Nothing usable → untitled.
+        assert_eq!(recent_session_label(None, None), "(untitled)");
+        assert_eq!(
+            recent_session_label(Some(String::new()), Some("\n\n".to_string())),
+            "(untitled)"
+        );
+    }
+
+    #[test]
+    fn recent_session_label_truncates_long_prompt() {
+        let long = "x".repeat(200);
+        let label = recent_session_label(None, Some(long));
+        assert_eq!(label.chars().count(), 80);
+    }
+
+    // ---- mouse capture gate (issue #104) ----
+
+    fn scroll_up_event() -> crossterm::event::MouseEvent {
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::ScrollUp,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn mouse_events_processed_when_capture_enabled() {
+        // Default config leaves mouse capture on, so a scroll wheel event
+        // should move the scroll offset — provided there is content to scroll
+        // over (a render must have established a non-zero max_scroll).
+        let mut app = make_app();
+        assert!(app.config.mouse_capture_enabled());
+        assert_eq!(app.scroll_offset, 0);
+        app.last_max_scroll.set(50);
+        app.handle_mouse_event(scroll_up_event());
+        assert!(app.scroll_offset > 0, "scroll should advance when capture is on");
+        assert!(app.scroll_offset <= 50, "scroll stays within max_scroll");
+    }
+
+    // ---- click-to-view paste placeholders ----
+
+    #[test]
+    fn prompt_click_on_placeholder_opens_viewer() {
+        let mut app = make_app();
+        // Bottom pane as rendered: 1 status row (height > 2), then the top
+        // separator at y=21, text rows from y=22. Prefix "❯ " is 2 cells.
+        app.last_input_area.set(ratatui::layout::Rect { x: 0, y: 20, width: 80, height: 8 });
+        for c in "hi ".chars() {
+            app.prompt_input.insert_char(c);
+        }
+        app.prompt_input.paste("l1\nl2\nl3");
+        assert!(app.prompt_input.text.contains("[Pasted text #1"));
+
+        // Click on the separator row: nothing opens.
+        app.handle_prompt_click(10, 21);
+        assert!(!app.paste_viewer.visible);
+
+        // Click inside the placeholder on the first text row: the viewer
+        // opens read-only — the placeholder stays in the buffer and the body
+        // stays stored so submit-time expansion is unaffected.
+        app.handle_prompt_click(2 + 5, 22);
+        assert!(app.paste_viewer.visible);
+        assert_eq!(app.paste_viewer.paste_id, 1);
+        assert_eq!(app.paste_viewer.line_count(), 3);
+        assert!(app.prompt_input.text.contains("[Pasted text #1"));
+        assert!(!app.prompt_input.paste_contents.is_empty());
+    }
+
+    #[test]
+    fn paste_viewer_alt_e_expands_into_prompt() {
+        let mut app = make_app();
+        app.last_input_area.set(ratatui::layout::Rect { x: 0, y: 20, width: 80, height: 8 });
+        for c in "hi ".chars() {
+            app.prompt_input.insert_char(c);
+        }
+        app.prompt_input.paste("l1\nl2\nl3");
+        app.handle_prompt_click(2 + 5, 22);
+        assert!(app.paste_viewer.visible);
+
+        let alt_e = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('e'),
+            KeyModifiers::ALT,
+        );
+        app.handle_paste_viewer_key(alt_e);
+        assert!(!app.paste_viewer.visible);
+        assert_eq!(app.prompt_input.text, "hi l1\nl2\nl3");
+        assert!(app.prompt_input.paste_contents.is_empty());
+    }
+
+    #[test]
+    fn prompt_click_off_placeholder_moves_cursor_only() {
+        let mut app = make_app();
+        app.last_input_area.set(ratatui::layout::Rect { x: 0, y: 20, width: 80, height: 8 });
+        for c in "hello ".chars() {
+            app.prompt_input.insert_char(c);
+        }
+        app.prompt_input.paste("l1\nl2\nl3");
+        let text_before = app.prompt_input.text.clone();
+
+        // Click on "hello " before the placeholder: cursor moves, no viewer.
+        app.handle_prompt_click(2 + 1, 22);
+        assert_eq!(app.prompt_input.text, text_before);
+        assert_eq!(app.prompt_input.cursor, 1);
+        assert!(!app.paste_viewer.visible);
+    }
+
+    // ---- scroll_offset clamping (issue #223) ----
+
+    #[test]
+    fn scroll_up_offset_clamped_to_max_scroll() {
+        let mut app = make_app();
+        // A render established that the transcript is 5 lines taller than the
+        // viewport, so scroll_offset can meaningfully range over 0..=5.
+        app.last_max_scroll.set(5);
+
+        // Scroll up far past the top, many times.
+        for _ in 0..50 {
+            app.scroll_up_by(10);
+        }
+
+        // Without the clamp scroll_offset would be 500; it must stay at
+        // max_scroll so the offset can't inflate unboundedly (#223).
+        assert_eq!(
+            app.scroll_offset, 5,
+            "scroll_offset must not inflate past max_scroll"
+        );
+        assert!(!app.auto_scroll, "scrolling up disables auto-follow");
+
+        // Because it was clamped, a single Down step moves the view
+        // immediately instead of burning through hundreds of wasted presses.
+        let before = app.scroll_offset;
+        app.scroll_offset = app.scroll_offset.saturating_sub(1);
+        assert!(
+            app.scroll_offset < before,
+            "a single Down moves the view once scroll_offset is clamped"
+        );
+    }
+
+    #[test]
+    fn scroll_up_no_op_when_nothing_to_scroll() {
+        // When content fits the viewport (max_scroll == 0) scrolling up is a
+        // no-op rather than silently inflating scroll_offset.
+        let mut app = make_app();
+        app.last_max_scroll.set(0);
+        for _ in 0..20 {
+            app.scroll_up_by(10);
+        }
+        assert_eq!(app.scroll_offset, 0, "no scroll room means no offset growth");
+    }
+
+    #[test]
+    fn mouse_events_ignored_when_capture_disabled() {
+        // With mouseCapture: false the app must not act on mouse events that
+        // still slip through, so the scroll offset stays put.
+        let mut app = make_app();
+        app.config.mouse_capture = Some(false);
+        assert!(!app.config.mouse_capture_enabled());
+        app.handle_mouse_event(scroll_up_event());
+        assert_eq!(app.scroll_offset, 0, "scroll must not move when capture is off");
+    }
+
+    // ---- normalize_char_with_shift tests ----
+
+    #[test]
+    fn test_normalize_char_no_shift_returns_unchanged() {
+        assert_eq!(normalize_char_with_shift('a', KeyModifiers::NONE), 'a');
+        assert_eq!(normalize_char_with_shift('1', KeyModifiers::NONE), '1');
+        assert_eq!(normalize_char_with_shift('!', KeyModifiers::NONE), '!');
+    }
+
+    #[test]
+    fn test_normalize_char_shift_uppercase_letters() {
+        assert_eq!(normalize_char_with_shift('a', KeyModifiers::SHIFT), 'A');
+        assert_eq!(normalize_char_with_shift('z', KeyModifiers::SHIFT), 'Z');
+        assert_eq!(normalize_char_with_shift('m', KeyModifiers::SHIFT), 'M');
+    }
+
+    #[test]
+    fn test_normalize_char_shift_numbers() {
+        assert_eq!(normalize_char_with_shift('1', KeyModifiers::SHIFT), '!');
+        assert_eq!(normalize_char_with_shift('2', KeyModifiers::SHIFT), '@');
+        assert_eq!(normalize_char_with_shift('3', KeyModifiers::SHIFT), '#');
+        assert_eq!(normalize_char_with_shift('4', KeyModifiers::SHIFT), '$');
+        assert_eq!(normalize_char_with_shift('5', KeyModifiers::SHIFT), '%');
+        assert_eq!(normalize_char_with_shift('6', KeyModifiers::SHIFT), '^');
+        assert_eq!(normalize_char_with_shift('7', KeyModifiers::SHIFT), '&');
+        assert_eq!(normalize_char_with_shift('8', KeyModifiers::SHIFT), '*');
+        assert_eq!(normalize_char_with_shift('9', KeyModifiers::SHIFT), '(');
+        assert_eq!(normalize_char_with_shift('0', KeyModifiers::SHIFT), ')');
+    }
+
+    #[test]
+    fn test_normalize_char_shift_symbols() {
+        assert_eq!(normalize_char_with_shift('-', KeyModifiers::SHIFT), '_');
+        assert_eq!(normalize_char_with_shift('=', KeyModifiers::SHIFT), '+');
+        assert_eq!(normalize_char_with_shift('[', KeyModifiers::SHIFT), '{');
+        assert_eq!(normalize_char_with_shift(']', KeyModifiers::SHIFT), '}');
+        assert_eq!(normalize_char_with_shift(';', KeyModifiers::SHIFT), ':');
+        assert_eq!(normalize_char_with_shift('\'', KeyModifiers::SHIFT), '"');
+        assert_eq!(normalize_char_with_shift(',', KeyModifiers::SHIFT), '<');
+        assert_eq!(normalize_char_with_shift('.', KeyModifiers::SHIFT), '>');
+        assert_eq!(normalize_char_with_shift('/', KeyModifiers::SHIFT), '?');
+        assert_eq!(normalize_char_with_shift('\\', KeyModifiers::SHIFT), '|');
+        assert_eq!(normalize_char_with_shift('`', KeyModifiers::SHIFT), '~');
+    }
+
+    #[test]
+    fn test_normalize_char_shift_already_shifted_chars_unchanged() {
+        // Characters that don't have shift equivalents remain unchanged
+        assert_eq!(normalize_char_with_shift('!', KeyModifiers::SHIFT), '!');
+        assert_eq!(normalize_char_with_shift('@', KeyModifiers::SHIFT), '@');
+        assert_eq!(normalize_char_with_shift('A', KeyModifiers::SHIFT), 'A');
+    }
+
+    #[test]
+    fn test_normalize_char_other_modifiers_ignored() {
+        // CTRL or ALT without SHIFT should not shift the character
+        assert_eq!(normalize_char_with_shift('a', KeyModifiers::CONTROL), 'a');
+        assert_eq!(normalize_char_with_shift('1', KeyModifiers::ALT), '1');
+        assert_eq!(normalize_char_with_shift('a', KeyModifiers::CONTROL | KeyModifiers::ALT), 'a');
+    }
+
+    #[test]
+    fn test_normalize_char_shift_with_other_modifiers() {
+        // SHIFT + CTRL should still apply shift transformation
+        assert_eq!(
+            normalize_char_with_shift('a', KeyModifiers::SHIFT | KeyModifiers::CONTROL),
+            'A'
+        );
+        assert_eq!(
+            normalize_char_with_shift('1', KeyModifiers::SHIFT | KeyModifiers::ALT),
+            '!'
+        );
+    }
+
+    // ---- issue #183: slash command input & execution on Windows / non-kitty terminals ----
+
+    #[test]
+    fn test_slash_inserts_literal_slash_when_shift_flagged_on_non_kitty_terminal() {
+        // On terminals that don't speak the kitty protocol (Windows conhost / CMD
+        // / legacy PowerShell, and non-US layouts where `/` is a shifted key) the
+        // slash key can arrive as Char('/') carrying a SHIFT flag, with the
+        // character already final. We must insert a literal `/`, not re-shift it
+        // into `?` (issue #183).
+        let mut app = make_app();
+        app.kitty_keyboard_active = false;
+        // Pre-fill so the empty-prompt `?`/`/` help shortcut is out of the picture.
+        app.prompt_input.text = "x".to_string();
+        app.prompt_input.cursor = app.prompt_input.text.len();
+        app.refresh_prompt_input();
+
+        app.handle_key_event(press_key(KeyCode::Char('/'), KeyModifiers::SHIFT));
+
+        assert_eq!(app.prompt_input.text, "x/");
+    }
+
+    #[test]
+    fn test_slash_with_shift_flag_starts_command_not_help_on_non_kitty_terminal() {
+        // Empty prompt: pressing `/` (reported as Char('/') + SHIFT on a non-kitty
+        // terminal) must insert a literal slash so the user can start a command,
+        // NOT toggle the help overlay (issue #183 — "Cannot run any slash commands").
+        let mut app = make_app();
+        app.kitty_keyboard_active = false;
+
+        app.handle_key_event(press_key(KeyCode::Char('/'), KeyModifiers::SHIFT));
+
+        assert!(
+            !app.help_overlay.visible,
+            "a literal slash must not open the help overlay"
+        );
+        assert!(!app.show_help);
+        assert_eq!(app.prompt_input.text, "/");
+    }
+
+    #[test]
+    fn test_shift_slash_still_normalizes_to_question_under_kitty_protocol() {
+        // With the kitty protocol active, Shift+/ arrives as the unshifted base
+        // key Char('/') + SHIFT, so we DO apply the US-QWERTY shift map → `?`.
+        let mut app = make_app();
+        app.kitty_keyboard_active = true;
+        app.prompt_input.text = "x".to_string();
+        app.prompt_input.cursor = app.prompt_input.text.len();
+        app.refresh_prompt_input();
+
+        app.handle_key_event(press_key(KeyCode::Char('/'), KeyModifiers::SHIFT));
+
+        assert_eq!(app.prompt_input.text, "x?");
+    }
+
+    #[test]
+    fn test_enter_runs_highlighted_slash_command_in_one_press() {
+        // Typing a slash command and pressing Enter should run it immediately
+        // rather than merely completing the text and waiting for a second Enter
+        // (issue #183 — "enter will not run the command").
+        let mut app = make_app();
+        for c in "/help".chars() {
+            app.handle_key_event(press_key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert!(
+            !app.prompt_input.suggestions.is_empty(),
+            "the slash-command popup should be open"
+        );
+
+        let should_submit = app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(should_submit, "Enter should submit/run the highlighted command");
+        assert_eq!(app.prompt_input.text, "/help");
+        assert!(
+            app.prompt_input.suggestions.is_empty(),
+            "the popup should be dismissed after running"
+        );
+    }
+
+    #[test]
+    fn test_enter_completes_slash_prefix_then_runs() {
+        // Even from a unique prefix, Enter completes to the highlighted command
+        // and runs it in a single press.
+        let mut app = make_app();
+        for c in "/the".chars() {
+            app.handle_key_event(press_key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+
+        let should_submit = app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(should_submit);
+        assert_eq!(app.prompt_input.text, "/theme");
+    }
+
+    // ---- Shift+Enter newline vs Enter submit (issue #224) ----
+
+    /// Feed some text then a modified Enter and return (submitted?, buffer).
+    fn type_then_modified_enter(mods: KeyModifiers) -> (bool, String) {
+        let mut app = make_app();
+        for c in "hi".chars() {
+            app.handle_key_event(press_key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let submitted = app.handle_key_event(press_key(KeyCode::Enter, mods));
+        (submitted, app.prompt_input.text.clone())
+    }
+
+    #[test]
+    fn shift_enter_inserts_newline_not_submit() {
+        // On kitty-capable terminals Shift+Enter arrives as Enter+SHIFT and must
+        // insert a literal newline, leaving the prompt multi-line and unsent.
+        let (submitted, text) = type_then_modified_enter(KeyModifiers::SHIFT);
+        assert!(!submitted, "Shift+Enter must not submit");
+        assert_eq!(text, "hi\n", "Shift+Enter should append a newline");
+        assert!(text.contains('\n'), "buffer should now be multi-line");
+    }
+
+    #[test]
+    fn alt_enter_inserts_newline_fallback() {
+        // Alt+Enter is a fallback for terminals that can't report Shift+Enter.
+        let (submitted, text) = type_then_modified_enter(KeyModifiers::ALT);
+        assert!(!submitted, "Alt+Enter must not submit");
+        assert_eq!(text, "hi\n");
+    }
+
+    #[test]
+    fn ctrl_enter_inserts_newline_fallback() {
+        // Ctrl+Enter is the Windows-Terminal-style fallback for newline.
+        let (submitted, text) = type_then_modified_enter(KeyModifiers::CONTROL);
+        assert!(!submitted, "Ctrl+Enter must not submit");
+        assert_eq!(text, "hi\n");
+    }
+
+    #[test]
+    fn ctrl_j_inserts_newline_fallback() {
+        // Ctrl+J (Char('j') + CONTROL) is the conventional legacy newline escape
+        // (pi binds insert-newline to shift+enter + ctrl+j). It must insert a
+        // newline, not the literal character 'j'.
+        let mut app = make_app();
+        for c in "hi".chars() {
+            app.handle_key_event(press_key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let submitted = app.handle_key_event(press_key(KeyCode::Char('j'), KeyModifiers::CONTROL));
+        assert!(!submitted, "Ctrl+J must not submit");
+        assert_eq!(app.prompt_input.text, "hi\n", "Ctrl+J should insert a newline, not 'j'");
+    }
+
+    #[test]
+    fn bare_enter_submits_without_newline() {
+        // A plain Enter (no modifiers) submits and leaves the buffer untouched.
+        let mut app = make_app();
+        for c in "hi".chars() {
+            app.handle_key_event(press_key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let submitted = app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(submitted, "bare Enter should submit");
+        assert_eq!(app.prompt_input.text, "hi", "bare Enter must not insert a newline");
+        assert!(!app.prompt_input.text.contains('\n'));
+    }
+
+    #[test]
+    fn shift_enter_newline_composes_multiline_prompt() {
+        // Compose two lines with Shift+Enter between them, then submit with a
+        // bare Enter; the buffer keeps both lines and only the bare Enter sends.
+        let mut app = make_app();
+        for c in "line1".chars() {
+            app.handle_key_event(press_key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert!(!app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::SHIFT)));
+        for c in "line2".chars() {
+            app.handle_key_event(press_key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert_eq!(app.prompt_input.text, "line1\nline2");
+        assert!(app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn test_cc_statusline_slash_command() {
+        let mut app = make_app();
+        assert!(app.intercept_slash_command("cc-statusline"));
+        assert!(app.status_message.as_deref().is_some_and(|m| m.contains("No external statusLine configured")));
+    }
+
+    #[test]
+    fn test_yolo_on_shows_dialog_and_accept_activates() {
+        let mut app = make_app();
+        assert!(app.intercept_slash_command_with_args("yolo", "on"));
+        // Dialog visible, mode not yet switched.
+        assert!(app.bypass_permissions_dialog.visible);
+        assert!(app.yolo_pending);
+        assert_eq!(app.config.permission_mode, PermissionMode::Default);
+
+        // Accept via '2'.
+        app.handle_key_event(press_key(KeyCode::Char('2'), KeyModifiers::NONE));
+        assert!(!app.bypass_permissions_dialog.visible);
+        assert!(!app.yolo_pending);
+        assert_eq!(app.config.permission_mode, PermissionMode::BypassPermissions);
+    }
+
+    #[test]
+    fn test_yolo_on_decline_cancels_without_exit() {
+        let mut app = make_app();
+        assert!(app.intercept_slash_command_with_args("yolo", "on"));
+        // Decline via '1'.
+        app.handle_key_event(press_key(KeyCode::Char('1'), KeyModifiers::NONE));
+        assert!(!app.bypass_permissions_dialog.visible);
+        assert!(!app.yolo_pending);
+        // No exit: decline only cancels the runtime toggle.
+        assert!(!app.should_exit);
+        assert_eq!(app.config.permission_mode, PermissionMode::Default);
+    }
+
+    #[test]
+    fn test_yolo_off_restores_previous_mode_not_default() {
+        // /yolo off must not kick the user out of plan/acceptEdits.
+        let mut app = make_app();
+        app.config.permission_mode = PermissionMode::Plan;
+        assert!(app.intercept_slash_command_with_args("yolo", "on"));
+        app.handle_key_event(press_key(KeyCode::Char('2'), KeyModifiers::NONE));
+        assert_eq!(app.config.permission_mode, PermissionMode::BypassPermissions);
+
+        assert!(app.intercept_slash_command_with_args("yolo", "off"));
+        // Plan mode restored, not Default.
+        assert_eq!(app.config.permission_mode, PermissionMode::Plan);
+    }
+
+    #[test]
+    fn test_yolo_off_restores_default_mode() {
+        let mut app = make_app();
+        app.config.permission_mode = PermissionMode::BypassPermissions;
+        assert!(app.intercept_slash_command_with_args("yolo", "off"));
+        assert_eq!(app.config.permission_mode, PermissionMode::Default);
+        assert!(!app.bypass_permissions_dialog.visible);
+    }
+
+    #[test]
+    fn test_yolo_on_when_already_bypassed_is_noop() {
+        // `/yolo on` while already bypassed must not record BypassPermissions
+        // as the "previous" mode, or `/yolo off` would leave bypass on.
+        let mut app = make_app();
+        app.config.permission_mode = PermissionMode::BypassPermissions;
+        assert!(app.intercept_slash_command_with_args("yolo", "on"));
+        assert!(!app.bypass_permissions_dialog.visible);
+        assert!(!app.yolo_pending);
+        assert!(app.yolo_previous_mode.is_none());
+        assert!(app.intercept_slash_command_with_args("yolo", "off"));
+        assert_eq!(app.config.permission_mode, PermissionMode::Default);
+    }
+
+    #[test]
+    fn test_yolo_toggle_when_not_bypass_shows_dialog() {
+        let mut app = make_app();
+        // Bare /yolo with Default mode: toggle on → dialog.
+        assert!(app.intercept_slash_command_with_args("yolo", ""));
+        assert!(app.bypass_permissions_dialog.visible);
+        assert!(app.yolo_pending);
+    }
+
+    #[test]
+    fn test_mcp_subcommand_is_not_intercepted() {
+        let mut app = make_app();
+        assert!(!app.intercept_slash_command_with_args("mcp", "auth mcphub"));
+        assert!(!app.mcp_view.visible);
+    }
+
+    #[test]
+    fn test_clear_slash_command_clears_messages() {
+        let mut app = make_app();
+        app.add_message(Role::User, "hello".to_string());
+        app.add_message(Role::Assistant, "world".to_string());
+        assert_eq!(app.messages.len(), 2);
+        assert!(app.intercept_slash_command("clear"));
+        assert_eq!(app.messages.len(), 0);
+    }
+
+    #[test]
+    fn test_exit_slash_command_sets_quit_flag() {
+        let mut app = make_app();
+        assert!(!app.should_exit);
+        assert!(app.intercept_slash_command("exit"));
+        assert!(app.should_exit);
+    }
+
+    #[test]
+    fn test_vim_slash_command_toggles_vim() {
+        let mut app = make_app();
+        assert!(!app.prompt_input.vim_enabled);
+        assert!(app.intercept_slash_command("vim"));
+        assert!(app.prompt_input.vim_enabled);
+        assert!(app.intercept_slash_command("vim"));
+        assert!(!app.prompt_input.vim_enabled);
+    }
+
+    #[test]
+    fn test_model_slash_command_opens_picker() {
+        let mut app = make_app();
+        assert!(!app.model_picker.visible);
+        assert!(app.intercept_slash_command("model"));
+        assert!(app.model_picker.visible);
+    }
+
+    #[test]
+    fn test_fast_slash_command_toggles_fast_mode() {
+        let mut app = make_app();
+        assert!(!app.fast_mode);
+        assert!(app.intercept_slash_command("fast"));
+        assert!(app.fast_mode);
+        assert!(app.intercept_slash_command("fast"));
+        assert!(!app.fast_mode);
+    }
+
+    #[test]
+    fn test_output_style_cycles() {
+        let mut app = make_app();
+        assert_eq!(app.output_style, "auto");
+        assert!(app.intercept_slash_command("output-style"));
+        assert_eq!(app.output_style, "stream");
+        assert!(app.intercept_slash_command("output-style"));
+        assert_eq!(app.output_style, "verbose");
+        assert!(app.intercept_slash_command("output-style"));
+        assert_eq!(app.output_style, "auto");
+    }
+
+    #[test]
+    fn test_context_menu_fork_targets_clicked_message() {
+        let mut app = make_app();
+        app.add_message(Role::User, "one".to_string());
+        app.add_message(Role::Assistant, "two".to_string());
+        app.add_message(Role::User, "three".to_string());
+
+        app.handle_context_menu_action(
+            ContextMenuItem::Fork,
+            ContextMenuKind::Message { message_index: 1 },
+        );
+
+        assert_eq!(app.prompt_input.text, "/fork 2");
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Fork at message 2 - press Enter to confirm")
+        );
+    }
+
+    #[test]
+    fn test_right_click_targets_row_message_instead_of_last_message() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        let mut app = make_app();
+        app.last_msg_area.set(ratatui::layout::Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 10,
+        });
+        app.message_row_map.borrow_mut().insert(3, 1);
+
+        app.handle_mouse_event(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: 12,
+            row: 3,
+            modifiers: KeyModifiers::empty(),
+        });
+
+        assert!(matches!(
+            app.context_menu_state,
+            Some(ContextMenuState {
+                kind: ContextMenuKind::Message { message_index: 1 },
+                ..
+            })
+        ));
+    }
+
+    // ---- Help overlay -------------------------------------------------------
+
+    #[test]
+    fn test_help_slash_command_opens_overlay() {
+        let mut app = make_app();
+        assert!(!app.help_overlay.visible);
+        assert!(!app.show_help);
+        assert!(!app.help_overlay.commands.is_empty());
+        assert!(app.intercept_slash_command("help"));
+        assert!(app.help_overlay.visible);
+        assert!(app.show_help);
+    }
+
+    #[test]
+    fn test_help_slash_command_is_idempotent_when_already_open() {
+        let mut app = make_app();
+        // First call opens it.
+        assert!(app.intercept_slash_command("help"));
+        assert!(app.help_overlay.visible);
+        // Second call while already open should leave it open (not toggle it off).
+        assert!(app.intercept_slash_command("help"));
+        assert!(app.help_overlay.visible);
+    }
+
+    #[test]
+    fn test_question_mark_shortcut_opens_help_with_shift_modifier() {
+        let mut app = make_app();
+
+        app.handle_key_event(press_key(KeyCode::Char('?'), KeyModifiers::SHIFT));
+
+        assert!(app.help_overlay.visible);
+        assert!(app.show_help);
+    }
+
+    #[test]
+    fn test_question_mark_shortcut_closes_help_with_shift_modifier() {
+        let mut app = make_app();
+        app.help_overlay.toggle();
+        app.show_help = true;
+
+        app.handle_key_event(press_key(KeyCode::Char('?'), KeyModifiers::SHIFT));
+
+        assert!(!app.help_overlay.visible);
+        assert!(!app.show_help);
+    }
+
+    #[test]
+    fn test_question_mark_shortcut_types_into_non_empty_prompt() {
+        let mut app = make_app();
+        app.prompt_input.text = "why".to_string();
+        app.prompt_input.cursor = app.prompt_input.text.len();
+        app.refresh_prompt_input();
+
+        app.handle_key_event(press_key(KeyCode::Char('?'), KeyModifiers::SHIFT));
+
+        assert!(!app.help_overlay.visible);
+        assert_eq!(app.prompt_input.text, "why?");
+    }
+
+    #[test]
+    fn test_ctrl_shift_a_shortcut_opens_model_picker() {
+        let mut app = make_app();
+        app.has_credentials = true;
+        app.config.provider = Some("anthropic".to_string());
+
+        // The model-picker shortcut moved from Ctrl+A to Ctrl+Shift+A in
+        // commit 8da4a29 to resolve the Ctrl+A conflict (goLineStart in the
+        // prompt). The default bindings map ctrl+shift+a -> openModelPicker.
+        app.handle_key_event(press_key(
+            KeyCode::Char('a'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+
+        assert!(app.model_picker.visible);
+    }
+
+    #[test]
+    fn test_ctrl_k_shortcut_opens_command_palette_even_with_input() {
+        let mut app = make_app();
+        app.prompt_input.text = "hello".to_string();
+        app.prompt_input.cursor = app.prompt_input.text.len();
+        app.refresh_prompt_input();
+
+        app.handle_key_event(press_key(KeyCode::Char('k'), KeyModifiers::CONTROL));
+
+        assert!(app.command_palette.visible);
+        assert_eq!(app.prompt_input.text, "hello");
+    }
+
+    // ---- issue #47: shortcuts on non-English (Cyrillic) keyboard layouts ----
+
+    #[test]
+    fn test_layout_to_latin_maps_cyrillic_shortcut_positions() {
+        // Letters used by core Ctrl/Alt shortcuts must resolve to the Latin key
+        // at the same physical QWERTY position on the Russian/Ukrainian JCUKEN
+        // layout. (left = Cyrillic glyph reported by the terminal, right = Latin)
+        assert_eq!(layout_to_latin('с'), "c"); // Ctrl+C  (interrupt / exit)
+        assert_eq!(layout_to_latin('в'), "d"); // Ctrl+D  (exit)
+        assert_eq!(layout_to_latin('к'), "r"); // Ctrl+R  (history search)
+        assert_eq!(layout_to_latin('и'), "b"); // Ctrl+B  (create branch)
+        assert_eq!(layout_to_latin('з'), "p"); // Ctrl+P  (global search)
+        assert_eq!(layout_to_latin('е'), "t"); // Ctrl+T  (tasks overlay)
+        assert_eq!(layout_to_latin('т'), "n"); // n
+        assert_eq!(layout_to_latin('о'), "j"); // Ctrl+J  (newline fallback)
+        assert_eq!(layout_to_latin('г'), "u"); // Ctrl+U  (kill to start)
+        assert_eq!(layout_to_latin('ц'), "w"); // Ctrl+W  (kill word)
+        assert_eq!(layout_to_latin('л'), "k"); // Ctrl+K  (command palette)
+        assert_eq!(layout_to_latin('а'), "f"); // Alt+F   (word forward)
+        assert_eq!(layout_to_latin('н'), "y"); // Ctrl+Y  (yank)
+    }
+
+    #[test]
+    fn test_layout_to_latin_covers_full_qwerty_letter_row() {
+        // Every Latin letter position should be reachable from some Cyrillic key,
+        // so every Ctrl/Alt+<letter> binding works regardless of layout.
+        let cyrillic = "йцукенгшщзфывапролдячсмить";
+        let mut latin: Vec<char> = cyrillic
+            .chars()
+            .filter_map(|c| layout_to_latin(c).chars().next())
+            .filter(|c| c.is_ascii_alphabetic())
+            .collect();
+        latin.sort_unstable();
+        latin.dedup();
+        assert_eq!(latin.len(), 26, "all 26 Latin letters must be covered");
+    }
+
+    #[test]
+    fn test_layout_to_latin_uppercase_cyrillic_folds_to_lowercase_latin() {
+        // Shift+Ctrl on a Cyrillic layout reports the uppercase glyph.
+        assert_eq!(layout_to_latin('С'), "c");
+        assert_eq!(layout_to_latin('В'), "d");
+    }
+
+    #[test]
+    fn test_layout_to_latin_passes_through_unknown_chars() {
+        // Plain ASCII and unmapped characters are returned unchanged (lowercased).
+        assert_eq!(layout_to_latin('c'), "c");
+        assert_eq!(layout_to_latin('A'), "a");
+    }
+
+    #[test]
+    fn test_key_event_to_keystroke_maps_ctrl_cyrillic_to_latin() {
+        // Ctrl+С (Cyrillic) on a non-Latin layout must resolve to the Latin "c".
+        let ks = key_event_to_keystroke(&press_key(
+            KeyCode::Char('с'),
+            KeyModifiers::CONTROL,
+        ))
+        .expect("keystroke");
+        assert_eq!(ks.key, "c");
+        assert!(ks.ctrl);
+
+        // Ctrl+О (Cyrillic, the physical J key) → "j" so Ctrl+J newline works.
+        let ks = key_event_to_keystroke(&press_key(
+            KeyCode::Char('о'),
+            KeyModifiers::CONTROL,
+        ))
+        .expect("keystroke");
+        assert_eq!(ks.key, "j");
+    }
+
+    #[test]
+    fn test_key_event_to_keystroke_keeps_plain_cyrillic_for_text_entry() {
+        // Without a modifier the character must NOT be Latinized — it is literal
+        // text the user is typing.
+        let ks = key_event_to_keystroke(&press_key(KeyCode::Char('с'), KeyModifiers::NONE))
+            .expect("keystroke");
+        assert_eq!(ks.key, "с");
+        assert!(!ks.ctrl && !ks.alt);
+    }
+
+    #[test]
+    fn test_normalize_layout_shortcut_key_rewrites_pure_ctrl() {
+        // Pure Ctrl + Cyrillic → Latin letter at the same physical position.
+        let out = normalize_layout_shortcut_key(press_key(
+            KeyCode::Char('с'),
+            KeyModifiers::CONTROL,
+        ));
+        assert_eq!(out.code, KeyCode::Char('c'));
+        assert!(out.modifiers.contains(KeyModifiers::CONTROL));
+    }
+
+    #[test]
+    fn test_normalize_layout_shortcut_key_leaves_plain_and_altgr_untouched() {
+        // No modifier: literal text entry — must stay Cyrillic.
+        let out = normalize_layout_shortcut_key(press_key(KeyCode::Char('с'), KeyModifiers::NONE));
+        assert_eq!(out.code, KeyCode::Char('с'));
+
+        // Ctrl+Alt (AltGr) can compose characters on some layouts — leave it.
+        let out = normalize_layout_shortcut_key(press_key(
+            KeyCode::Char('с'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ));
+        assert_eq!(out.code, KeyCode::Char('с'));
+
+        // Plain Alt is also left alone (avoid disturbing Option/meta composition).
+        let out = normalize_layout_shortcut_key(press_key(KeyCode::Char('с'), KeyModifiers::ALT));
+        assert_eq!(out.code, KeyCode::Char('с'));
+    }
+
+    #[test]
+    fn test_normalize_layout_shortcut_key_passes_ascii_through() {
+        // ASCII Ctrl combos (English layout) are unchanged — no regression.
+        let out = normalize_layout_shortcut_key(press_key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert_eq!(out.code, KeyCode::Char('c'));
+    }
+
+    #[test]
+    fn test_ctrl_cyrillic_o_inserts_newline_like_ctrl_j() {
+        // On a Cyrillic layout the physical Ctrl+J key reports Ctrl+О; it must
+        // still insert a newline so multi-line composing works (issue #47).
+        let mut app = make_app();
+        app.prompt_input.text = "ab".to_string();
+        app.prompt_input.cursor = app.prompt_input.text.len();
+        app.refresh_prompt_input();
+
+        app.handle_key_event(press_key(KeyCode::Char('о'), KeyModifiers::CONTROL));
+
+        assert_eq!(app.prompt_input.text, "ab\n");
+    }
+
+    #[test]
+    fn test_ctrl_j_inserts_newline_on_english_layout() {
+        // Regression guard: the English Ctrl+J path still inserts a newline.
+        let mut app = make_app();
+        app.prompt_input.text = "ab".to_string();
+        app.prompt_input.cursor = app.prompt_input.text.len();
+        app.refresh_prompt_input();
+
+        app.handle_key_event(press_key(KeyCode::Char('j'), KeyModifiers::CONTROL));
+
+        assert_eq!(app.prompt_input.text, "ab\n");
+    }
+
+    #[test]
+    fn test_raw_newline_char_inserts_newline() {
+        // A bare LF (0x0A) arriving as Char('\n') — e.g. Shift+Enter on a
+        // terminal without the kitty protocol — must add a newline, not be
+        // dropped.
+        let mut app = make_app();
+        app.prompt_input.text = "ab".to_string();
+        app.prompt_input.cursor = app.prompt_input.text.len();
+        app.refresh_prompt_input();
+
+        app.handle_key_event(press_key(KeyCode::Char('\n'), KeyModifiers::NONE));
+
+        assert_eq!(app.prompt_input.text, "ab\n");
+    }
+
+    #[test]
+    fn test_ctrl_cyrillic_c_triggers_exit_confirmation_on_cyrillic_layout() {
+        // Ctrl+С (Cyrillic) on an empty prompt must arm the two-press exit
+        // confirmation exactly like the English Ctrl+C (issue #47 — "Ctrl combos
+        // don't work").
+        let mut app = make_app();
+        assert!(app.prompt_input.is_empty());
+
+        app.handle_key_event(press_key(KeyCode::Char('с'), KeyModifiers::CONTROL));
+        assert!(
+            app.last_exit_key_warning.is_some(),
+            "first Ctrl+С should arm the exit confirmation"
+        );
+        assert!(!app.should_exit);
+
+        // Second press within the timeout exits.
+        app.handle_key_event(press_key(KeyCode::Char('с'), KeyModifiers::CONTROL));
+        assert!(app.should_exit, "second Ctrl+С should exit");
+    }
+
+    #[test]
+    fn test_ctrl_c_still_triggers_exit_confirmation_on_english_layout() {
+        // Regression guard: the English Ctrl+C exit confirmation is unchanged.
+        let mut app = make_app();
+        app.handle_key_event(press_key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.last_exit_key_warning.is_some());
+        assert!(!app.should_exit);
+        app.handle_key_event(press_key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.should_exit);
+    }
+
+    // ---- discovered skill slash commands ----
+
+    #[test]
+    fn discovered_skills_do_not_duplicate_builtin_suggestions() {
+        let mut app = make_app();
+        app.set_discovered_slash_commands(vec![
+            ("clear".to_string(), "skill shadowing a built-in".to_string()),
+            ("clean-room".to_string(), "a real skill".to_string()),
+        ]);
+        app.set_prompt_text("/cle".to_string());
+        let texts: Vec<&str> = app
+            .prompt_input
+            .suggestions
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect();
+        assert_eq!(texts.iter().filter(|t| **t == "/clear").count(), 1);
+        assert!(texts.contains(&"/clean-room"));
+    }
+
+    // ---- Session listing reads the store sessions are written to (#382) ----
+
+    /// Serializes the tests below: they point the process-global
+    /// `CLAURST_HOME` at a tempdir.
+    static SESSION_HOME_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Points `CLAURST_HOME` at a tempdir for its lifetime, restoring the
+    /// previous value on drop.
+    struct SessionHome {
+        dir: tempfile::TempDir,
+        saved: Option<std::ffi::OsString>,
+    }
+
+    impl SessionHome {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let saved = std::env::var_os("CLAURST_HOME");
+            std::env::set_var("CLAURST_HOME", dir.path());
+            Self { dir, saved }
+        }
+    }
+
+    impl Drop for SessionHome {
+        fn drop(&mut self) {
+            match self.saved.take() {
+                Some(v) => std::env::set_var("CLAURST_HOME", v),
+                None => std::env::remove_var("CLAURST_HOME"),
+            }
+        }
+    }
+
+    async fn save_test_session(title: &str, working_dir: &std::path::Path) -> String {
+        let mut session =
+            claurst_core::history::ConversationSession::new("test-model".to_string());
+        session.title = Some(title.to_string());
+        session.working_dir = Some(working_dir.to_string_lossy().into_owned());
+        session.add_message(Message::user("hello"));
+        claurst_core::history::save_session(&mut session).await.unwrap();
+        session.id
+    }
+
+    #[tokio::test]
+    async fn session_browser_lists_sessions_written_by_history_save_session() {
+        let _lock = SESSION_HOME_LOCK.lock().await;
+        let home = SessionHome::new();
+        let id = save_test_session("issue 382", home.dir.path()).await;
+
+        let entries = super::run::load_session_entries().await;
+        let entry = entries.iter().find(|e| e.id == id).expect("saved session listed");
+        assert_eq!(entry.title, "issue 382");
+        assert_eq!(entry.message_count, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn poll_session_loads_populates_the_session_browser() {
+        let _lock = SESSION_HOME_LOCK.lock().await;
+        let home = SessionHome::new();
+        let id = save_test_session("browser", home.dir.path()).await;
+
+        let mut app = make_app();
+        app.recent_sessions_pending = false;
+        assert!(app.intercept_slash_command_with_args("session", ""));
+        assert!(app.session_browser.visible);
+        for _ in 0..200 {
+            app.poll_session_loads();
+            if !app.session_browser.sessions.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            app.session_browser.sessions.iter().any(|e| e.id == id),
+            "the /session browser must list the session saved to <config_dir>/sessions"
+        );
+    }
+
+    #[tokio::test]
+    async fn recent_sessions_are_scoped_to_the_project_root() {
+        let _lock = SESSION_HOME_LOCK.lock().await;
+        let home = SessionHome::new();
+        let project = home.dir.path().join("project");
+        let other = home.dir.path().join("other");
+        save_test_session("in project", &project.join("sub")).await;
+        save_test_session("elsewhere", &other).await;
+
+        let recent = super::run::load_recent_sessions(&project).await;
+        let labels: Vec<&str> = recent.iter().map(|r| r.label.as_str()).collect();
+        assert_eq!(labels, vec!["in project"]);
+    }
+
+    #[test]
+    fn session_browser_enter_resubmits_resume_for_the_selected_session() {
+        let mut app = make_app();
+        app.session_browser.open(vec![crate::session_browser::SessionEntry {
+            id: "abc-123".to_string(),
+            title: "t".to_string(),
+            last_updated: "just now".to_string(),
+            message_count: 1,
+            cost_usd: 0.0,
+        }]);
+        app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!app.session_browser.visible);
+        assert_eq!(app.prompt_input.text, "/resume abc-123");
+        assert!(app.pending_auto_submit);
+    }
+
+    // ---- free-mode context window (issues #393, #394) ----
+
+    #[tokio::test]
+    async fn free_mode_zen_pin_window_agrees_across_consumers() {
+        use claurst_api::LlmProvider;
+
+        let model = "opencode-zen/minimax-m2.5-free";
+        let mut app = make_app();
+        // Pin to the bundled snapshot so a local models.dev cache can't skew it.
+        app.model_registry = claurst_api::ModelRegistry::new();
+        app.set_model(model.to_string());
+        assert_eq!(app.config.provider.as_deref(), Some("free"));
+
+        // Footer / token warnings.
+        assert_eq!(app.context_window_size, 204_800);
+        // Auto-compact sizing.
+        assert_eq!(
+            claurst_query::compact::resolve_context_window(
+                Some(&app.model_registry),
+                "free",
+                model
+            ),
+            app.context_window_size
+        );
+        // `/model` picker catalog served by the Free provider.
+        let upstream = *claurst_api::FREE_CATALOG
+            .iter()
+            .find(|u| u.id == "opencode-zen")
+            .unwrap();
+        let provider = claurst_api::FreeProvider::new(vec![claurst_api::FreeEntry {
+            upstream,
+            provider: Arc::new(claurst_api::GoogleProvider::new(String::new())),
+        }]);
+        let models = provider.discover_models().await.unwrap();
+        let pin = models.iter().find(|m| &*m.id == model).unwrap();
+        assert_eq!(u64::from(pin.context_window), app.context_window_size);
+        assert_eq!(pin.max_output_tokens, 131_072);
+    }
+
+    // ---- /rewind into the compaction archive (issue #449) ----
+
+    #[test]
+    fn rewind_flow_lists_archived_messages_and_defers_rewinds_into_them() {
+        let mut app = make_app();
+        app.replace_messages(vec![Message::user("summary"), Message::assistant("a2")]);
+        let archived = [Message::user("u1"), Message::assistant("a1")];
+        app.open_rewind_flow_with_archive(archived.iter());
+        assert_eq!(app.rewind_archive_len, 2);
+
+        // The selection starts on the newest message (position 3); move up
+        // to "a1" (position 1, inside the archive) and confirm.
+        app.handle_rewind_flow_key(press_key(KeyCode::Up, KeyModifiers::NONE));
+        app.handle_rewind_flow_key(press_key(KeyCode::Up, KeyModifiers::NONE));
+        app.handle_rewind_flow_key(press_key(KeyCode::Enter, KeyModifiers::NONE));
+        app.handle_rewind_flow_key(press_key(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert_eq!(app.pending_rewind, Some(1));
+        assert_eq!(app.messages.len(), 2, "the caller applies archive rewinds");
+
+        // A live position ("a2", position 3) truncates the display in place
+        // and is handed to the host as archive length + display index.
+        app.pending_rewind = None;
+        app.open_rewind_flow_with_archive(archived.iter());
+        app.handle_rewind_flow_key(press_key(KeyCode::Enter, KeyModifiers::NONE));
+        app.handle_rewind_flow_key(press_key(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert_eq!(app.pending_rewind, Some(3));
+        assert_eq!(app.messages.len(), 1);
+    }
+
+    // ---- context meter (#444) ----
+
+    fn request_done(input: u64, output: u64, cache_write: u64, cache_read: u64) -> claurst_query::QueryEvent {
+        claurst_query::QueryEvent::TurnComplete {
+            turn: 1,
+            stop_reason: "tool_use".to_string(),
+            usage: Some(claurst_core::types::UsageInfo {
+                input_tokens: input,
+                output_tokens: output,
+                cache_creation_input_tokens: cache_write,
+                cache_read_input_tokens: cache_read,
+            }),
+        }
+    }
+
+    #[test]
+    fn context_meter_shows_the_last_request_prompt_not_a_running_sum() {
+        let mut app = make_app();
+        // A ten-request tool turn at ~50k context: each request resends the
+        // whole history, so the meter must stay near 50k, not reach 500k.
+        for step in 0..10u64 {
+            app.handle_query_event(request_done(1_000 + step, 300, 2_000, 47_000 + step * 100));
+        }
+        assert_eq!(app.context_used_tokens, 1_009 + 2_000 + 47_900);
+
+        // Output tokens are not part of the prompt that was sent.
+        app.handle_query_event(request_done(10, 9_999, 0, 0));
+        assert_eq!(app.context_used_tokens, 10);
+
+        // A provider that reports no input usage keeps the last reading.
+        app.handle_query_event(request_done(0, 50, 0, 0));
+        assert_eq!(app.context_used_tokens, 10);
+        app.handle_query_event(claurst_query::QueryEvent::TurnComplete {
+            turn: 2,
+            stop_reason: "end_turn".to_string(),
+            usage: None,
+        });
+        assert_eq!(app.context_used_tokens, 10);
+    }
+
+    #[test]
+    fn compaction_resets_the_meter_baseline() {
+        use claurst_core::history::{CompactionRecord, CompactionTrigger};
+        let mut app = make_app();
+        app.handle_query_event(request_done(500, 100, 10_000, 170_000));
+        assert_eq!(app.context_used_tokens, 180_500);
+        app.token_warning_threshold_shown = 95;
+
+        app.handle_query_event(claurst_query::QueryEvent::Compacted(CompactionRecord {
+            at: chrono::Utc::now(),
+            trigger: CompactionTrigger::Threshold,
+            summary_uuid: "s".to_string(),
+            messages_before: 40,
+            messages_after: 3,
+            tokens_before: 180_500,
+            tokens_after: 12_000,
+            summarised: true,
+            replaced: Vec::new(),
+        }));
+        assert_eq!(app.context_used_tokens, 12_000);
+        assert_eq!(app.token_warning_threshold_shown, 0);
+
+        // The next request's real prompt size replaces the estimate.
+        app.handle_query_event(request_done(800, 40, 11_000, 0));
+        assert_eq!(app.context_used_tokens, 11_800);
+    }
+
+    // ---- explicit rewind instead of display-list history sync (issue #484) ----
+
+    fn tool_use_msg(id: &str) -> Message {
+        Message::assistant_blocks(vec![claurst_core::types::ContentBlock::ToolUse {
+            id: id.to_string(),
+            name: "Bash".to_string(),
+            input: serde_json::json!({"command": "ls"}),
+            thought_signature: None,
+        }])
+    }
+
+    fn tool_result_msg(id: &str) -> Message {
+        Message::user_blocks(vec![claurst_core::types::ContentBlock::ToolResult {
+            tool_use_id: id.to_string(),
+            content: claurst_core::types::ToolResultContent::Text("out".to_string()),
+            is_error: None,
+        }])
+    }
+
+    #[test]
+    fn idle_key_after_tool_step_requests_no_rewind() {
+        let mut app = make_app();
+        // Model history after one tool step. The display never receives the
+        // tool_use / tool_result messages, so it ends up shorter than this.
+        let history = [
+            Message::user("list files"),
+            tool_use_msg("t1"),
+            tool_result_msg("t1"),
+            Message::assistant("done"),
+        ];
+        app.push_message(Message::user("list files"));
+        app.is_streaming = true;
+        app.handle_query_event(claurst_query::QueryEvent::ToolStart {
+            tool_name: "Bash".to_string(),
+            tool_id: "t1".to_string(),
+            input_json: r#"{"command":"ls"}"#.to_string(),
+        });
+        app.handle_query_event(claurst_query::QueryEvent::ToolEnd {
+            tool_name: "Bash".to_string(),
+            tool_id: "t1".to_string(),
+            result: "out".to_string(),
+            is_error: false,
+        });
+        app.streaming_text = "done".to_string();
+        app.handle_query_event(claurst_query::QueryEvent::TurnComplete {
+            turn: 1,
+            stop_reason: "end_turn".to_string(),
+            usage: None,
+        });
+        assert!(!app.is_streaming);
+        assert!(app.messages.len() < history.len());
+
+        app.handle_key_event(press_key(KeyCode::Char('a'), KeyModifiers::NONE));
+        // The host loop touches the model history only on an explicit rewind.
+        assert_eq!(app.pending_rewind, None);
+    }
+
+    #[test]
+    fn confirmed_rewind_sets_pending_rewind() {
+        let mut app = make_app();
+        app.replace_messages(vec![
+            Message::user("one"),
+            Message::assistant("a1"),
+            Message::user("two"),
+            Message::assistant("a2"),
+        ]);
+        app.open_rewind_flow();
+        app.handle_key_event(press_key(KeyCode::Up, KeyModifiers::NONE));
+        app.handle_key_event(press_key(KeyCode::Enter, KeyModifiers::NONE));
+        app.handle_key_event(press_key(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert_eq!(app.pending_rewind, Some(2));
+        assert_eq!(app.messages.len(), 2);
+    }
+
+    #[test]
+    fn rewind_cut_index_plain_turns() {
+        let history = [
+            Message::user("one"),
+            Message::assistant("a1"),
+            Message::user("two"),
+            Message::assistant("a2"),
+        ];
+        assert_eq!(rewind_cut_index(&history, 0), 0);
+        assert_eq!(rewind_cut_index(&history, 2), 2);
+        assert_eq!(rewind_cut_index(&history, 4), 4);
+        assert_eq!(rewind_cut_index(&history, 9), 4);
+    }
+
+    #[test]
+    fn rewind_cut_index_keeps_tool_step_before_cut() {
+        let history = [
+            Message::user("one"),
+            tool_use_msg("t1"),
+            tool_result_msg("t1"),
+            Message::assistant("a1"),
+            Message::user("two"),
+            Message::assistant("a2"),
+        ];
+        // Rewinding to "two" keeps the whole first turn, tool pair included.
+        assert_eq!(rewind_cut_index(&history, 4), 4);
+    }
+
+    #[test]
+    fn rewind_cut_index_skips_aborted_marker() {
+        let history = [
+            Message::user("one"),
+            Message::assistant("partial"),
+            Message::user(claurst_core::system_prompt::TURN_ABORTED_MESSAGE),
+            Message::user("two"),
+            Message::assistant("a2"),
+        ];
+        // The display hides the marker: display index 2 is "two" (history 3).
+        assert_eq!(rewind_cut_index(&history, 2), 3);
+        assert_eq!(rewind_cut_index(&history, 3), 4);
+    }
+
+    #[test]
+    fn rewind_cut_index_snaps_off_unpaired_tool_use() {
+        let history = [
+            Message::user("one"),
+            tool_use_msg("t1"),
+            tool_result_msg("t1"),
+            Message::assistant("a1"),
+        ];
+        // Selecting the tool_result would orphan the tool_use: cut before it.
+        assert_eq!(rewind_cut_index(&history, 2), 1);
+    }

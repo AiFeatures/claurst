@@ -361,7 +361,8 @@ impl CopilotProvider {
                                     }));
                                 }
                             };
-                        for block in blocks {
+                        let mut blocks = blocks.iter().peekable();
+                        while let Some(block) = blocks.next() {
                             match block {
                                 ContentBlock::Text { text } => message_parts.push(json!({
                                     "type": "output_text",
@@ -384,13 +385,23 @@ impl CopilotProvider {
                                 }
                                 ContentBlock::Thinking { thinking, .. } if !thinking.is_empty() => {
                                     flush_assistant_content(&mut input, &mut message_parts);
-                                    input.push(json!({
+                                    let mut item = json!({
                                         "type": "reasoning",
                                         "summary": [{
                                             "type": "summary_text",
                                             "text": thinking,
                                         }],
-                                    }));
+                                    });
+                                    // A summary followed by its encrypted state
+                                    // (Codex stores them as Thinking +
+                                    // RedactedThinking) is one reasoning item.
+                                    if let Some(ContentBlock::RedactedThinking { data }) = blocks.peek() {
+                                        if !data.is_empty() {
+                                            item["encrypted_content"] = json!(data);
+                                            blocks.next();
+                                        }
+                                    }
+                                    input.push(item);
                                 }
                                 ContentBlock::RedactedThinking { data } if !data.is_empty() => {
                                     flush_assistant_content(&mut input, &mut message_parts);
@@ -849,8 +860,9 @@ impl CopilotProvider {
 
         let status = resp.status().as_u16();
         if !(200..300).contains(&(status as usize)) {
+            let retry_after = crate::retry::retry_after(resp.headers());
             let text = resp.text().await.unwrap_or_default();
-            return Err(self.map_http_error(status, &text));
+            return Err(self.map_http_error(status, &text).with_retry_after(retry_after));
         }
 
         Ok(resp)
@@ -921,6 +933,7 @@ impl LlmProvider for CopilotProvider {
             let mut decoder = crate::SseByteDecoder::new();
 
             let mut message_started = false;
+            let mut saw_finish = false;
             let mut message_id = String::from("unknown");
             let mut model_name = String::new();
             let mut tool_call_buffers: std::collections::HashMap<
@@ -1087,6 +1100,7 @@ impl LlmProvider for CopilotProvider {
                         choice.get("finish_reason").and_then(|v| v.as_str())
                     {
                         if !finish_reason.is_empty() && finish_reason != "null" {
+                            saw_finish = true;
                             yield Ok(StreamEvent::ContentBlockStop { index: 0 });
                             let mut tc_indices: Vec<usize> =
                                 tool_call_buffers.keys().cloned().collect();
@@ -1110,8 +1124,18 @@ impl LlmProvider for CopilotProvider {
                 }
             }
 
-            if message_started {
+            // Stream integrity (#439): without `[DONE]` (which returns above)
+            // only a `finish_reason` marks a complete response. A stream that
+            // just stops is truncated; surface it so the turn is retried
+            // instead of being accepted as finished.
+            if saw_finish {
                 yield Ok(StreamEvent::MessageStop);
+            } else {
+                yield Err(ProviderError::StreamError {
+                    provider: provider_id.clone(),
+                    message: "stream ended before a finish_reason or [DONE]".to_string(),
+                    partial_response: None,
+                });
             }
         };
 

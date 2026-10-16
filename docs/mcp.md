@@ -12,7 +12,7 @@ MCP defines three primitives a server can offer:
 - **Resources** — URI-addressable data sources the model can read
 - **Prompts** — reusable prompt templates the server exposes
 
-Claurst discovers tools, resources, and prompts from connected MCP servers during the handshake phase and wraps them as native `Tool` instances (via `McpToolWrapper`), making them transparent to the query loop.
+Claurst lists tools, resources, and prompts from each server after the handshake. Each tool is wrapped as a native `Tool` (`McpToolWrapper`), so the query loop treats it like a built-in. Resources are reached through the `ListMcpResources` and `ReadMcpResource` tools. Prompts are available only to the user, through `/mcp prompts` and `/mcp get-prompt`.
 
 ---
 
@@ -51,7 +51,7 @@ The `type` field defaults to `"stdio"` when omitted.
 
 ## McpServerConfig Fields
 
-Each entry in the `mcpServers` / `mcp_servers` array (or the `config.mcp_servers` list) is an `McpServerConfig` object:
+Each entry in the `config.mcp_servers` array is an `McpServerConfig` object. A top-level `mcpServers` key is not read; `/import-config` converts one from a Claude Code config.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
@@ -60,13 +60,16 @@ Each entry in the `mcpServers` / `mcp_servers` array (or the `config.mcp_servers
 | `args` | array of strings | No | Arguments passed to `command` |
 | `env` | object | No | Extra environment variables set for the child process |
 | `url` | string | HTTP only | Full URL of the SSE endpoint |
-| `type` | string | No | Transport type: `"stdio"` (default) or `"http"` |
+| `type` | string | No | Transport type: `"stdio"` (default), `"http"` (streamable HTTP) or `"sse"` (legacy SSE) |
+| `headers` | object | No | HTTP/SSE only: extra headers sent with every request, e.g. `{"X-Api-Key": "${MY_KEY}"}`. Values support variable expansion. An `Authorization` header replaces the stored OAuth token |
+| `connect_timeout_ms` | integer | No | Bound on starting the transport and the `initialize` handshake. Default `10000` |
+| `catalog_timeout_ms` | integer | No | Bound on each `tools/list`, `resources/list` and `prompts/list` request. Default `30000` |
 
 ---
 
 ## Environment Variable Expansion
 
-All string fields in `McpServerConfig` (`command`, `args`, `env` values, `url`) support shell-style variable expansion before the server is launched.
+All string fields in `McpServerConfig` (`command`, `args`, `env` values, `url`, `headers` values) support shell-style variable expansion before the server is launched.
 
 **Supported syntax:**
 
@@ -125,35 +128,34 @@ Add servers to the `config.mcp_servers` array in `~/.claurst/settings.json`:
 }
 ```
 
-Project-level MCP servers can be added to a `.claurst/settings.json` in your project root. Project settings take precedence over global settings.
+Project-level MCP servers can be added to `config.mcp_servers` in a `.claurst/settings.json` in your project root. They are added to the global list (not substituted for it), and they do not launch until you approve them for that project, unless `trustProjectMcpServers` is `true` in the global settings.
 
 ---
 
 ## The /mcp Command
 
-Use `/mcp` inside an interactive session to inspect and manage MCP servers at runtime.
+Use `/mcp` inside an interactive session to inspect MCP servers at runtime.
 
 ```
-/mcp                     — show status of all configured servers
-/mcp status              — same as above
-/mcp connect <name>      — connect to a server by name
-/mcp disconnect <name>   — disconnect a server
-/mcp restart <name>      — disconnect then reconnect a server
+/mcp                              — open the MCP server panel (TUI)
+/mcp list                         — list configured servers with live status
+/mcp status                       — detailed status table for all servers
+/mcp tools [server]               — list exposed tool names (mcp__<server>__<tool>)
+/mcp auth <server>                — start OAuth for an HTTP/SSE server; stdio servers get env-var instructions
+/mcp connect <server>             — report the server's status and how to recover; it does not reconnect
+/mcp logs <server>                — show the server's status and last connection error
+/mcp resources [server]           — list resources from connected servers
+/mcp prompts [server]             — list prompt templates from connected servers
+/mcp get-prompt <server> <prompt> [key=value ...]  — expand a prompt template
 ```
 
-The status display shows the connection state and discovered tool count for each server:
-
-```
-filesystem     connected (12 tools)
-github         connected (8 tools)
-remote-api     failed – connection refused (retry in 30s)
-```
+There is no `/mcp disconnect` or `/mcp restart`. A failed server stays failed until the MCP runtime is rebuilt or Claurst restarts (see [Startup, Timeouts and Retries](#startup-timeouts-and-retries)).
 
 ---
 
 ## MCP Tools Available to the Model
 
-Two built-in tools let the model interact with MCP resources directly:
+Two built-in tools let the model interact with MCP resources directly (parameters below; see also [MCP Integration Tools](tools.md#mcp-integration-tools)):
 
 ### ListMcpResources
 
@@ -163,7 +165,7 @@ Lists all resources available across connected MCP servers. Optionally filters b
 
 ```json
 {
-  "server_name": "filesystem"   // optional — omit to list resources from all servers
+  "server": "filesystem"   // optional — omit to list resources from all servers
 }
 ```
 
@@ -175,35 +177,60 @@ Reads a specific resource by server name and URI.
 
 ```json
 {
-  "server_name": "filesystem",
+  "server": "filesystem",
   "uri": "file:///home/user/projects/README.md"
 }
 ```
 
-Use `ListMcpResources` to discover available URIs before calling `ReadMcpResource`.
+Use `ListMcpResources` to discover available URIs before calling `ReadMcpResource`. Both tools ask for permission in the `default` permission mode.
 
-In addition to these, every tool that an MCP server exposes is automatically available to the model under its declared name (wrapped transparently by `McpToolWrapper`).
+A third tool, `mcp__auth` (`{"server_name": "..."}`), runs the OAuth flow for a server; see [McpAuthTool](tools.md#mcpauthtool).
+
+In addition to these, every tool that an MCP server exposes is available to the model (wrapped transparently by `McpToolWrapper`) under a namespaced name, described below.
+
+### MCP tool names
+
+Each MCP tool is exposed as `mcp__<server>__<tool>`, for example `mcp__github__create_issue`. Both parts are sanitized: every character outside `A-Z a-z 0-9 _ -` becomes `_`, so server `my.server` with tool `do it` becomes `mcp__my_server__do_it`. When a name would exceed 64 characters, or two tools sanitize to the same name, the name is truncated and suffixed with `_` and 8 hex characters derived from the original server and tool names. Calls are routed through an explicit map from the exposed name to the server and tool, so servers whose names share a prefix (`git` and `git_lab`) never collide. `/mcp tools` lists each tool's exposed name.
+
+Permission rules match the exposed name. A rule for `mcp__<server>` or `mcp__<server>__*` (with the sanitized server name) matches every tool of that server.
+
+The previous `<server>_<tool>` names are not accepted; permission rules written for them must be renamed.
+
+### Tool list changes
+
+When a server sends `notifications/tools/list_changed`, Claurst re-lists that server's tools (bounded by the catalog timeout) and the new list is used from the next turn on. Calls to a tool the server removed fail with an "Unknown MCP tool" error.
+
+### Server instructions
+
+Instructions a server returns from `initialize` are added to the system prompt under `# MCP Server Instructions`, one `## <server>` section per server, for servers with at least one tool in the current tool set. They are placed after the dynamic boundary (with the environment and memory sections), so connecting or refreshing a server does not invalidate the cached part of the prompt.
+
+### Tool results
+
+- `structuredContent`, when a result has it, is passed to the model as compact JSON in place of the text blocks (the MCP spec makes those a serialization of the same value).
+- Images (and image resource blobs) of type PNG, JPEG, GIF or WebP up to 5 MB are passed as image blocks inside the tool result. Anthropic and Bedrock send them to the model; providers whose tool-result format is text-only (OpenAI-compatible, Gemini, Copilot) drop them. Every image also produces a text line such as `[Image: image/png, 48.2 KB]`, and the line says when an image was not attached because of its type or size.
+- Other binary resources are described as `[Binary resource: <mime>, <size>]`.
 
 ---
 
-## Reconnection with Exponential Backoff
+## Startup, Timeouts and Retries
 
-When an MCP server disconnects or fails to connect, Claurst starts a background reconnection loop automatically:
+Claurst connects to all configured servers concurrently in the background. The TUI starts immediately; the footer shows `MCP connecting (N)` while servers start and `MCP N failed` if any could not start, and the `/mcp` panel shows each server's state and error. A server's tools become available to the model on the first turn after it connects. Headless runs (`--print`) wait for every server to connect or fail before sending the prompt.
 
-- Initial retry delay: **1 second**
-- Backoff factor: **2x** after each failed attempt
-- Maximum delay: **60 seconds**
+Each server's startup is bounded:
 
-The loop exits as soon as the server connects successfully. A new loop can be started again if the server disconnects again later. The `/mcp restart <name>` command cancels any running loop and starts a fresh connection attempt immediately.
+- **Connect timeout** (`connect_timeout_ms`, default 10 s): spawning the process or opening the HTTP/SSE stream plus the `initialize` handshake. A hung stdio server is killed when it expires.
+- **Catalog timeout** (`catalog_timeout_ms`, default 30 s): each `tools/list`, `resources/list` and `prompts/list` request. A failing `tools/list` fails the server; a failing `resources/list` or `prompts/list` is logged and the server stays usable.
 
-Server statuses during reconnection:
+Remote (`http`/`sse`) servers get up to three connect attempts, 0.5 s and 1 s apart, unless an attempt timed out. Stdio servers get one attempt. After that the server stays failed until the MCP runtime is rebuilt (for example after approving a project server or completing `/mcp auth`) or Claurst restarts.
+
+Server statuses:
 
 | Status | Meaning |
 |---|---|
 | `Connected` | Active connection; reports tool count |
 | `Connecting` | Connection attempt in progress |
-| `Disconnected` | Cleanly disconnected or not yet attempted |
-| `Failed` | Last attempt failed; retry scheduled |
+| `Failed` | A remote attempt failed; another attempt is scheduled |
+| `Disconnected` | Startup failed for good (the error is shown), or not connected |
 
 ---
 

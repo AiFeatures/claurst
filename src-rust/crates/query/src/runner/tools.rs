@@ -4,21 +4,13 @@
 
 use crate::*;
 
-/// Parse the accumulated JSON arguments of a streamed tool call.
-///
-/// Providers stream a tool call's arguments as a sequence of partial-JSON
-/// deltas which we concatenate into a single buffer. A well-behaved
-/// no-argument call yields an empty (or whitespace-only) buffer, which we
-/// map to an empty object. Any *non-empty* buffer that fails to parse is
-/// returned as an error rather than being silently replaced with `{}` — a
-/// truncated stream must never cause a tool (e.g. Edit/Write) to run with
-/// empty arguments (issue #215).
-pub(crate) fn parse_tool_args(json_str: &str) -> Result<Value, serde_json::Error> {
-    let trimmed = json_str.trim();
-    if trimmed.is_empty() {
-        return Ok(serde_json::json!({}));
-    }
-    serde_json::from_str(trimmed)
+/// Tool result returned instead of running a tool whose arguments were not
+/// valid JSON (and could not be repaired) (#215, #439).
+pub(crate) fn invalid_tool_input_result(tool_name: &str, error: &str) -> ToolResult {
+    ToolResult::error(format!(
+        "invalid JSON input for tool {}: {}. The tool was not run; retry the call with complete, valid JSON arguments.",
+        tool_name, error
+    ))
 }
 
 /// Whether a `PermissionLevel` must be gated by the central backstop.
@@ -52,6 +44,16 @@ pub(crate) async fn execute_tool(
 ) -> ToolResult {
     let tool = tools.iter().find(|t| t.name() == name);
 
+    // A tool-wide deny rule refuses the call whatever the tool's own
+    // permission level, read-only tools included.
+    if tool.is_some() && ctx.tool_is_disallowed(name) {
+        warn!(tool = name, "Tool call refused: tool is disallowed by permission rules");
+        return ToolResult::error(format!(
+            "Tool '{}' is disallowed by the permission rules (disallowed_tools).",
+            name
+        ));
+    }
+
     match tool {
         Some(tool) => {
             debug!(tool = name, "Executing tool");
@@ -76,6 +78,21 @@ pub(crate) async fn execute_tool(
             ToolResult::error(format!("Unknown tool: {}", name))
         }
     }
+}
+
+/// Execute one call of a tool batch, unless the user already denied another
+/// call in it: then the call is rejected without running (reject cascade,
+/// #445). `ctx.batch_rejection` must be the batch's own.
+pub(crate) async fn execute_batch_call(
+    name: &str,
+    input: &Value,
+    tools: &[Box<dyn Tool>],
+    ctx: &ToolContext,
+) -> ToolResult {
+    if ctx.batch_rejection.is_rejected() {
+        return ToolResult::error(claurst_tools::BATCH_REJECTED_MSG);
+    }
+    execute_tool(name, input, tools, ctx).await
 }
 
 /// Run a batch of tool-execution futures concurrently, abandoning them promptly
