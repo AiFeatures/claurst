@@ -6,7 +6,7 @@
 // - SSE event parsing (message_start, content_block_start, content_block_delta,
 //   content_block_stop, message_delta, message_stop, error)
 // - Delta types: text_delta, input_json_delta, thinking_delta, signature_delta
-// - Rate-limit (429) and overloaded (529) retry with exponential back-off
+// - Transient-failure retry (429/529/5xx/connection) via the shared `retry` policy
 // - Authentication via API key from env or config
 
 use claurst_core::constants::{ANTHROPIC_API_VERSION, ANTHROPIC_BETA_HEADER};
@@ -58,6 +58,12 @@ pub mod variants;
 // Provider-aware error handling (Phase 6).
 pub mod error_handling;
 
+// Unified retry policy: classification, back-off, Retry-After (#439).
+pub mod retry;
+
+// Repair-then-reject parsing of streamed tool-call arguments (#439).
+pub mod tool_json;
+
 // Message transform layer — concrete transformers (Phase 4).
 pub mod transformers;
 
@@ -96,13 +102,16 @@ pub use model_registry::{
     ModelEntry, ModelRegistry, ModelStatus, ProviderEntry, ProviderOverride,
     effective_model_for_config,
 };
-pub use effort_support::{model_is_reasoning, supported_efforts, variant_ladder};
+pub use effort_support::{
+    anthropic_reasoning, model_is_reasoning, supported_efforts, variant_ladder, AnthropicReasoning,
+};
 pub use variants::{
     variant_efforts, OPENAI_NONE_EFFORT_RELEASE_DATE, OPENAI_XHIGH_EFFORT_RELEASE_DATE,
 };
 
 // Phase 6 re-exports — provider-aware error handling.
-pub use error_handling::{is_context_overflow, parse_error_response, RetryConfig};
+pub use error_handling::{is_context_overflow, parse_error_response};
+pub use retry::{RetryConfig, RetryDecision};
 
 // Phase 2E re-exports — Azure, Bedrock, and GitHub Copilot providers.
 pub use providers::AzureProvider;
@@ -203,14 +212,28 @@ pub mod types {
         pub stream: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub thinking: Option<ThinkingConfig>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub output_config: Option<OutputConfig>,
     }
 
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    /// `output_config` on a Messages API request. `effort` is one of `low`,
+    /// `medium`, `high`, `xhigh`, `max` (model-dependent; see
+    /// [`crate::effort_support::anthropic_reasoning`]).
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct OutputConfig {
+        pub effort: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     pub struct ThinkingConfig {
         #[serde(rename = "type")]
         pub thinking_type: String,
         #[serde(default, skip_serializing_if = "is_zero")]
         pub budget_tokens: u32,
+        /// Adaptive thinking only: `summarized` returns readable thinking
+        /// (newer models default to `omitted`, an empty thinking string).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub display: Option<String>,
     }
 
     fn is_zero(value: &u32) -> bool {
@@ -222,6 +245,7 @@ pub mod types {
             Self {
                 thinking_type: "enabled".to_string(),
                 budget_tokens: budget,
+                display: None,
             }
         }
 
@@ -229,6 +253,16 @@ pub mod types {
             Self {
                 thinking_type: "adaptive".to_string(),
                 budget_tokens: 0,
+                display: None,
+            }
+        }
+
+        /// Adaptive thinking with `display: "summarized"`, so the thinking
+        /// text is shown instead of arriving empty.
+        pub fn adaptive_summarized() -> Self {
+            Self {
+                display: Some("summarized".to_string()),
+                ..Self::adaptive()
             }
         }
     }
@@ -504,9 +538,9 @@ pub mod client {
         pub api_base: String,
         pub api_version: String,
         pub beta_features: String,
-        pub max_retries: u32,
-        pub initial_retry_delay: Duration,
-        pub max_retry_delay: Duration,
+        /// Retry policy for `create_message` / `create_message_stream`.
+        /// `create_message_stream_once` ignores it (its caller retries).
+        pub retry: crate::retry::RetryConfig,
         pub request_timeout: Duration,
         /// When true, send `Authorization: Bearer <api_key>` instead of `x-api-key`.
         /// Used for Claude.ai subscription (OAuth user:inference scope) tokens.
@@ -522,9 +556,7 @@ pub mod client {
                 api_base: claurst_core::constants::ANTHROPIC_API_BASE.to_string(),
                 api_version: ANTHROPIC_API_VERSION.to_string(),
                 beta_features: ANTHROPIC_BETA_HEADER.to_string(),
-                max_retries: 5,
-                initial_retry_delay: Duration::from_secs(1),
-                max_retry_delay: Duration::from_secs(60),
+                retry: crate::retry::RetryConfig::default(),
                 // Honour the process-wide configured timeout (issue #175);
                 // falls back to DEFAULT_REQUEST_TIMEOUT_SECS when unset.
                 request_timeout: crate::request_timeout(),
@@ -534,7 +566,9 @@ pub mod client {
         }
     }
 
-    /// The main Anthropic API client.
+    /// The main Anthropic API client. Cloning is cheap: the HTTP client is
+    /// reference-counted and the clone keeps the same session id.
+    #[derive(Clone)]
     pub struct AnthropicClient {
         http: wreq::Client,
         config: ClientConfig,
@@ -746,12 +780,12 @@ pub mod client {
             self.apply_oauth_stealth(&mut request);
             let body = serde_json::to_value(&request).map_err(ClaudeError::Json)?;
 
-            let resp = self.send_with_retry(&body).await?;
+            let resp = self.send_with_retry(&body, self.config.retry.max_retries).await?;
             let status = resp.status();
             let text = resp.text().await.map_err(|e| ClaudeError::Api(format!("HTTP error: {e}")))?;
 
             if !status.is_success() {
-                return Err(self.parse_api_error(status.as_u16(), &text));
+                return Err(self.parse_api_error(status.as_u16(), &text, None));
             }
 
             serde_json::from_str(&text).map_err(ClaudeError::Json)
@@ -781,7 +815,7 @@ pub mod client {
             let text = resp.text().await.map_err(|e| ClaudeError::Api(format!("HTTP error: {e}")))?;
 
             if !status.is_success() {
-                return Err(self.parse_api_error(status.as_u16(), &text));
+                return Err(self.parse_api_error(status.as_u16(), &text, None));
             }
 
             // Parse OpenAI response and convert to Anthropic format
@@ -804,11 +838,32 @@ pub mod client {
 
         /// Send a streaming `POST /v1/messages`.  Events are dispatched to the
         /// provided `handler` in real time, and also forwarded into the returned
-        /// channel so the caller can drive a select loop.
+        /// channel so the caller can drive a select loop. Transient HTTP
+        /// failures are retried per `ClientConfig::retry`.
         pub async fn create_message_stream(
+            &self,
+            request: CreateMessageRequest,
+            handler: Arc<dyn StreamHandler>,
+        ) -> Result<mpsc::Receiver<streaming::AnthropicStreamEvent>, ClaudeError> {
+            self.open_stream(request, handler, self.config.retry.max_retries).await
+        }
+
+        /// Like [`create_message_stream`](Self::create_message_stream) but makes
+        /// exactly one HTTP attempt. The query loop uses this and owns the retry
+        /// loop itself so it can report progress and cancel the wait.
+        pub async fn create_message_stream_once(
+            &self,
+            request: CreateMessageRequest,
+            handler: Arc<dyn StreamHandler>,
+        ) -> Result<mpsc::Receiver<streaming::AnthropicStreamEvent>, ClaudeError> {
+            self.open_stream(request, handler, 0).await
+        }
+
+        async fn open_stream(
             &self,
             mut request: CreateMessageRequest,
             handler: Arc<dyn StreamHandler>,
+            max_retries: u32,
         ) -> Result<mpsc::Receiver<streaming::AnthropicStreamEvent>, ClaudeError> {
             // Deferred key validation
             if self.config.api_key.is_empty() && self.config.provider != Provider::Codex {
@@ -852,13 +907,7 @@ pub mod client {
             self.apply_oauth_stealth(&mut request);
             let body = serde_json::to_value(&request).map_err(ClaudeError::Json)?;
 
-            let resp = self.send_with_retry(&body).await?;
-            let status = resp.status();
-
-            if !status.is_success() {
-                let text = resp.text().await.map_err(|e| ClaudeError::Api(format!("HTTP error: {e}")))?;
-                return Err(self.parse_api_error(status.as_u16(), &text));
-            }
+            let resp = self.send_with_retry(&body, max_retries).await?;
 
             let (tx, rx) = mpsc::channel(256);
 
@@ -926,14 +975,16 @@ pub mod client {
 
         // ---- Internal helpers --------------------------------------------
 
-        /// Build the common request and execute with retry logic.
+        /// Build the common request and send it, retrying transient failures
+        /// up to `max_retries` times per the shared [`crate::retry`] policy.
+        /// Returns only successful (2xx) responses.
         async fn send_with_retry(
             &self,
             body: &Value,
+            max_retries: u32,
         ) -> Result<wreq::Response, ClaudeError> {
             let url = format!("{}/v1/messages", self.config.api_base);
             let mut attempts = 0u32;
-            let mut delay = self.config.initial_retry_delay;
 
             let use_oauth = self.config.use_bearer_auth;
             let session_id = self.session_id.clone();
@@ -1072,62 +1123,51 @@ pub mod client {
 
                 let req = req.body(body_str.clone());
 
-                let resp = req.send().await.map_err(|e| ClaudeError::Api(format!("HTTP error: {e}")))?;
-                let status = resp.status().as_u16();
+                let err = match req.send().await {
+                    Ok(resp) if resp.status().is_success() => return Ok(resp),
+                    Ok(resp) => {
+                        let status = resp.status().as_u16();
+                        let retry_after = crate::retry::retry_after(resp.headers());
+                        let text = resp.text().await.unwrap_or_default();
+                        self.parse_api_error(status, &text, retry_after)
+                    }
+                    Err(e) => ClaudeError::Api(format!("connection error: {e}")),
+                };
 
-                // 200-299: success
-                if resp.status().is_success() {
-                    return Ok(resp);
+                match crate::retry::classify_claude_error(&err) {
+                    crate::retry::RetryDecision::Retry { after } if attempts <= max_retries => {
+                        let wait = self.config.retry.delay_for(attempts, after);
+                        warn!(
+                            attempt = attempts,
+                            max_retries,
+                            wait_ms = wait.as_millis() as u64,
+                            error = %err,
+                            "Retryable API error, backing off"
+                        );
+                        tokio::time::sleep(wait).await;
+                    }
+                    _ => return Err(err),
                 }
-
-                // 429 (rate limit) or 529 (overloaded): retry
-                if (status == 429 || status == 529) && attempts <= self.config.max_retries {
-                    // Honour Retry-After header if present
-                    let retry_after = resp
-                        .headers()
-                        .get("retry-after")
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|v| v.parse::<u64>().ok())
-                        .map(Duration::from_secs);
-
-                    let wait = retry_after.unwrap_or(delay);
-                    warn!(
-                        status,
-                        attempt = attempts,
-                        wait_secs = wait.as_secs(),
-                        "Retryable API error, backing off"
-                    );
-                    tokio::time::sleep(wait).await;
-                    delay = (delay * 2).min(self.config.max_retry_delay);
-                    continue;
-                }
-
-                // Non-retryable error – return immediately
-                let text = resp.text().await.unwrap_or_default();
-                return Err(self.parse_api_error(status, &text));
             }
         }
 
         /// Parse an API error body into a typed `ClaudeError`.
-        fn parse_api_error(&self, status: u16, body: &str) -> ClaudeError {
-            if let Ok(err) = serde_json::from_str::<ApiErrorResponse>(body) {
-                match status {
-                    401 => ClaudeError::Auth(err.error.message),
-                    429 => ClaudeError::RateLimit,
-                    529 => ClaudeError::ApiStatus {
-                        status,
-                        message: format!("Overloaded: {}", err.error.message),
-                    },
-                    _ => ClaudeError::ApiStatus {
-                        status,
-                        message: err.error.message,
-                    },
-                }
-            } else {
-                ClaudeError::ApiStatus {
-                    status,
-                    message: body.to_string(),
-                }
+        fn parse_api_error(
+            &self,
+            status: u16,
+            body: &str,
+            retry_after: Option<Duration>,
+        ) -> ClaudeError {
+            let message = match serde_json::from_str::<ApiErrorResponse>(body) {
+                Ok(err) if status == 401 => return ClaudeError::Auth(err.error.message),
+                Ok(err) if status == 529 => format!("Overloaded: {}", err.error.message),
+                Ok(err) => err.error.message,
+                Err(_) => body.to_string(),
+            };
+            ClaudeError::ApiStatus {
+                status,
+                message,
+                retry_after,
             }
         }
 
@@ -1156,9 +1196,13 @@ pub mod client {
             // network chunk boundary is never corrupted.
             let mut decoder = crate::SseByteDecoder::new();
             let mut byte_stream = resp.bytes_stream();
+            // Stream integrity (#439): only `message_stop` marks a complete
+            // response; anything else ending the byte stream is a truncation.
+            let mut saw_message_stop = false;
 
             while let Some(chunk_result) = byte_stream.next().await {
-                let chunk = chunk_result.map_err(|e| ClaudeError::Api(format!("HTTP error: {e}")))?;
+                let chunk = chunk_result
+                    .map_err(|e| ClaudeError::Api(format!("stream read error: {e}")))?;
 
                 for line in decoder.push(&chunk) {
                     let line = line.trim_end_matches('\r');
@@ -1166,6 +1210,8 @@ pub mod client {
                         if let Some(event) =
                             Self::frame_to_event(&frame.event, &frame.data)
                         {
+                            saw_message_stop |=
+                                matches!(event, streaming::AnthropicStreamEvent::MessageStop);
                             handler.on_event(&event);
                             if tx.send(event).await.is_err() {
                                 // Receiver dropped – stop reading.
@@ -1174,6 +1220,15 @@ pub mod client {
                         }
                     }
                 }
+            }
+
+            if !saw_message_stop {
+                let event = streaming::AnthropicStreamEvent::Error {
+                    error_type: "stream_incomplete".into(),
+                    message: "stream ended before message_stop".into(),
+                };
+                handler.on_event(&event);
+                let _ = tx.send(event).await;
             }
 
             Ok(())
@@ -1270,6 +1325,65 @@ pub mod client {
             }
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn oauth_stealth_keeps_the_stable_block_breakpoint() {
+            let client = AnthropicClient::new(ClientConfig {
+                api_key: "oauth-token".to_string(),
+                use_bearer_auth: true,
+                ..Default::default()
+            })
+            .expect("client");
+            let block = |text: &str| SystemBlock {
+                block_type: "text".to_string(),
+                text: text.to_string(),
+                cache_control: None,
+            };
+            let mut request = CreateMessageRequest::builder("claude-opus-4-6", 1024)
+                .system(SystemPrompt::Blocks(vec![
+                    block("You are Claurst, an agent.\n\nstable rules"),
+                    block("dynamic context"),
+                ]))
+                .messages(vec![ApiMessage {
+                    role: "user".to_string(),
+                    content: Value::String("hi".to_string()),
+                }])
+                .build();
+            request.apply_cache_breakpoints();
+            client.apply_oauth_stealth(&mut request);
+
+            let Some(SystemPrompt::Blocks(blocks)) = &request.system else {
+                panic!("expected system blocks");
+            };
+            assert_eq!(blocks.len(), 4);
+            assert!(blocks[0].text.starts_with("x-anthropic-billing-header:"));
+            assert!(blocks[0].cache_control.is_none());
+            assert!(blocks[1].cache_control.is_none());
+            assert_eq!(blocks[2].text, "stable rules");
+            assert!(blocks[2].cache_control.is_some());
+            assert_eq!(blocks[3].text, "dynamic context");
+            assert!(blocks[3].cache_control.is_none());
+        }
+
+        /// `cache_read_input_tokens` / `cache_creation_input_tokens` on a
+        /// `message_start` event reach the parsed usage.
+        #[test]
+        fn message_start_usage_parses_cache_fields() {
+            let data = r#"{"message":{"id":"m1","model":"claude","usage":{"input_tokens":12,"output_tokens":1,"cache_creation_input_tokens":3400,"cache_read_input_tokens":51000}}}"#;
+            let event = AnthropicClient::frame_to_event(&Some("message_start".to_string()), data);
+            let Some(streaming::AnthropicStreamEvent::MessageStart { usage, .. }) = event else {
+                panic!("expected message_start");
+            };
+            assert_eq!(usage.input_tokens, 12);
+            assert_eq!(usage.cache_creation_input_tokens, 3400);
+            assert_eq!(usage.cache_read_input_tokens, 51000);
+            assert_eq!(usage.total_input(), 12 + 3400 + 51000);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1290,7 +1404,146 @@ impl CreateMessageRequest {
             top_k: None,
             stop_sequences: None,
             thinking: None,
+            output_config: None,
         }
+    }
+
+    /// Place Anthropic prompt-cache breakpoints (`cache_control:
+    /// {"type":"ephemeral"}`) in the standard four-breakpoint layout:
+    ///
+    /// 1. the first system block, which is the stable half of the system
+    ///    prompt (the dynamic half follows it uncached),
+    /// 2. the last tool definition,
+    /// 3. the last user message, and
+    /// 4. the user message before it.
+    ///
+    /// The cached prefix renders as tools, then system, then messages, and a
+    /// request may carry at most 4 breakpoints. Each breakpoint looks back at
+    /// most 20 content blocks for an earlier cache entry, so the previous user
+    /// turn (where the previous request wrote its entry) is marked too: a turn
+    /// that appends more than 20 blocks, such as a long tool loop, still gets
+    /// an exact read point. See "Prompt caching" in the Anthropic docs,
+    /// sections "Cache limitations" and "20-block lookback window":
+    /// <https://docs.claude.com/en/docs/build-with-claude/prompt-caching>.
+    /// Prompt caching is GA on the Messages API and needs no beta header.
+    ///
+    /// Markers already present count towards the limit and are kept. Only
+    /// call this for requests sent to Anthropic's Messages API.
+    pub fn apply_cache_breakpoints(&mut self) {
+        let existing = self.cache_breakpoint_count();
+        let mut budget = MAX_CACHE_BREAKPOINTS.saturating_sub(existing);
+
+        let system_marked = match &self.system {
+            Some(SystemPrompt::Blocks(blocks)) => {
+                blocks.iter().any(|b| b.cache_control.is_some())
+            }
+            _ => false,
+        };
+        if budget > 0 && !system_marked {
+            match &mut self.system {
+                Some(SystemPrompt::Blocks(blocks)) => {
+                    if let Some(first) = blocks.iter_mut().find(|b| !b.text.is_empty()) {
+                        first.cache_control = Some(CacheControl::ephemeral());
+                        budget -= 1;
+                    }
+                }
+                Some(SystemPrompt::Text(text)) if !text.is_empty() => {
+                    let text = std::mem::take(text);
+                    self.system = Some(SystemPrompt::Blocks(vec![SystemBlock {
+                        block_type: "text".to_string(),
+                        text,
+                        cache_control: Some(CacheControl::ephemeral()),
+                    }]));
+                    budget -= 1;
+                }
+                _ => {}
+            }
+        }
+
+        if budget > 0 {
+            if let Some(last) = self.tools.as_mut().and_then(|tools| tools.last_mut()) {
+                if last.cache_control.is_none() {
+                    last.cache_control = Some(CacheControl::ephemeral());
+                    budget -= 1;
+                }
+            }
+        }
+
+        for message in self.messages.iter_mut().rev().filter(|m| m.role == "user").take(2) {
+            if budget == 0 {
+                break;
+            }
+            if mark_last_cacheable_block(&mut message.content) {
+                budget -= 1;
+            }
+        }
+    }
+
+    /// Number of `cache_control` markers already present in the request.
+    fn cache_breakpoint_count(&self) -> usize {
+        let system = match &self.system {
+            Some(SystemPrompt::Blocks(blocks)) => {
+                blocks.iter().filter(|b| b.cache_control.is_some()).count()
+            }
+            _ => 0,
+        };
+        let tools = self
+            .tools
+            .iter()
+            .flatten()
+            .filter(|t| t.cache_control.is_some())
+            .count();
+        let messages = self
+            .messages
+            .iter()
+            .filter_map(|m| m.content.as_array())
+            .flatten()
+            .filter(|b| b.get("cache_control").is_some())
+            .count();
+        system + tools + messages
+    }
+}
+
+/// Maximum number of `cache_control` breakpoints the Messages API accepts in
+/// one request.
+pub const MAX_CACHE_BREAKPOINTS: usize = 4;
+
+/// Mark the last block of a message's content that may carry `cache_control`.
+/// String content becomes a single text block. Empty text blocks and thinking
+/// blocks cannot be cache breakpoints and are skipped. Returns whether a
+/// marker was placed.
+fn mark_last_cacheable_block(content: &mut Value) -> bool {
+    let ephemeral = || serde_json::json!({ "type": "ephemeral" });
+    match content {
+        Value::String(text) if !text.is_empty() => {
+            let text = std::mem::take(text);
+            *content = serde_json::json!([{
+                "type": "text",
+                "text": text,
+                "cache_control": ephemeral(),
+            }]);
+            true
+        }
+        Value::Array(blocks) => {
+            for block in blocks.iter_mut().rev() {
+                let Some(obj) = block.as_object_mut() else {
+                    continue;
+                };
+                let eligible = match obj.get("type").and_then(Value::as_str) {
+                    Some("thinking" | "redacted_thinking") | None => false,
+                    Some("text") => {
+                        matches!(obj.get("text"), Some(Value::String(t)) if !t.is_empty())
+                    }
+                    Some(_) => true,
+                };
+                if eligible {
+                    obj.insert("cache_control".to_string(), ephemeral());
+                    return true;
+                }
+            }
+            false
+        }
+        _ => false,
     }
 }
 
@@ -1305,6 +1558,7 @@ pub struct CreateMessageRequestBuilder {
     top_k: Option<u32>,
     stop_sequences: Option<Vec<String>>,
     thinking: Option<ThinkingConfig>,
+    output_config: Option<OutputConfig>,
 }
 
 impl CreateMessageRequestBuilder {
@@ -1358,6 +1612,12 @@ impl CreateMessageRequestBuilder {
         self
     }
 
+    /// Set `output_config.effort`.
+    pub fn effort(mut self, effort: impl Into<String>) -> Self {
+        self.output_config = Some(OutputConfig { effort: effort.into() });
+        self
+    }
+
     pub fn build(self) -> CreateMessageRequest {
         CreateMessageRequest {
             model: self.model,
@@ -1371,6 +1631,7 @@ impl CreateMessageRequestBuilder {
             stop_sequences: self.stop_sequences,
             stream: true,
             thinking: self.thinking,
+            output_config: self.output_config,
         }
     }
 }
@@ -1388,6 +1649,9 @@ pub struct StreamAccumulator {
     partials: std::collections::HashMap<usize, PartialBlock>,
     stop_reason: Option<String>,
     usage: UsageInfo,
+    /// Tool-use ids whose argument JSON could not be parsed or repaired,
+    /// with the parse error. These calls must not be executed (#439).
+    invalid_tool_inputs: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug)]
@@ -1419,6 +1683,7 @@ impl StreamAccumulator {
             partials: Default::default(),
             stop_reason: None,
             usage: UsageInfo::default(),
+            invalid_tool_inputs: Default::default(),
         }
     }
 
@@ -1486,8 +1751,17 @@ impl StreamAccumulator {
                     let block = match partial {
                         PartialBlock::Text(text) => ContentBlock::Text { text },
                         PartialBlock::ToolUse { id, name, json_buf } => {
-                            let input = serde_json::from_str(&json_buf)
-                                .unwrap_or(Value::Object(Default::default()));
+                            // Repair-then-reject (#439): an unparseable call keeps
+                            // a `{}` placeholder so the history stays well-formed,
+                            // but is recorded so the caller never executes it.
+                            let input = match tool_json::parse_tool_input(&json_buf) {
+                                Ok(input) => input,
+                                Err(e) => {
+                                    warn!(tool = %name, tool_id = %id, error = %e, "Invalid tool-call JSON");
+                                    self.invalid_tool_inputs.insert(id.clone(), e.to_string());
+                                    Value::Object(Default::default())
+                                }
+                            };
                             ContentBlock::ToolUse { id, name, input, thought_signature: None }
                         }
                         PartialBlock::Thinking {
@@ -1519,9 +1793,18 @@ impl StreamAccumulator {
         }
     }
 
+    /// Tool-use ids (with the parse error) whose arguments were invalid JSON.
+    /// Callers must answer these with an error instead of running the tool.
+    pub fn take_invalid_tool_inputs(&mut self) -> std::collections::HashMap<String, String> {
+        std::mem::take(&mut self.invalid_tool_inputs)
+    }
+
     /// Finalize and produce the accumulated `Message`.
     pub fn finish(self) -> (Message, UsageInfo, Option<String>) {
-        let msg = Message::assistant_blocks(self.content_blocks);
+        // Keep the API message id so consumers (headless stream-json) can
+        // report it; uuid users only compare ids.
+        let mut msg = Message::assistant_blocks(self.content_blocks);
+        msg.uuid = self.id;
         (msg, self.usage, self.stop_reason)
     }
 
@@ -1541,6 +1824,94 @@ impl StreamAccumulator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn caching_fixture() -> CreateMessageRequest {
+        use serde_json::json;
+        let block = |text: &str| SystemBlock {
+            block_type: "text".to_string(),
+            text: text.to_string(),
+            cache_control: None,
+        };
+        let tool = |name: &str| ApiToolDefinition {
+            name: name.to_string(),
+            description: String::new(),
+            input_schema: json!({ "type": "object" }),
+            cache_control: None,
+        };
+        let msg = |role: &str, content: Value| ApiMessage {
+            role: role.to_string(),
+            content,
+        };
+        CreateMessageRequest::builder("claude-opus-4-6", 1024)
+            .system(SystemPrompt::Blocks(vec![block("stable"), block("dynamic")]))
+            .tools(vec![tool("Read"), tool("Bash")])
+            .messages(vec![
+                msg("user", json!("first")),
+                msg("assistant", json!([{ "type": "tool_use", "id": "t1", "name": "Read", "input": {} }])),
+                msg("user", json!([{ "type": "tool_result", "tool_use_id": "t1", "content": "ok" }])),
+                msg("assistant", json!([{ "type": "text", "text": "done" }])),
+                msg("user", json!("second")),
+            ])
+            .build()
+    }
+
+    /// Request-body snapshot: two system blocks (only the stable one cached),
+    /// with breakpoints on the last tool and on the last two user messages.
+    #[test]
+    fn cache_breakpoints_request_body_snapshot() {
+        use serde_json::json;
+        let mut request = caching_fixture();
+        request.apply_cache_breakpoints();
+        let body = serde_json::to_value(&request).expect("serialize");
+        let eph = json!({ "type": "ephemeral" });
+
+        assert_eq!(
+            body["system"],
+            json!([
+                { "type": "text", "text": "stable", "cache_control": eph },
+                { "type": "text", "text": "dynamic" },
+            ])
+        );
+        assert!(body["tools"][0].get("cache_control").is_none());
+        assert_eq!(body["tools"][1]["cache_control"], eph);
+        assert_eq!(body["messages"][0]["content"], json!("first"));
+        assert_eq!(
+            body["messages"][2]["content"],
+            json!([{ "type": "tool_result", "tool_use_id": "t1", "content": "ok", "cache_control": eph }])
+        );
+        assert_eq!(body["messages"][3]["content"], json!([{ "type": "text", "text": "done" }]));
+        assert_eq!(
+            body["messages"][4]["content"],
+            json!([{ "type": "text", "text": "second", "cache_control": eph }])
+        );
+        assert_eq!(body.to_string().matches("cache_control").count(), MAX_CACHE_BREAKPOINTS);
+    }
+
+    #[test]
+    fn cache_breakpoints_are_idempotent_and_skip_empty_text() {
+        use serde_json::json;
+        let mut request = caching_fixture();
+        request.apply_cache_breakpoints();
+        request.apply_cache_breakpoints();
+        let body = serde_json::to_value(&request).expect("serialize");
+        assert_eq!(body.to_string().matches("cache_control").count(), MAX_CACHE_BREAKPOINTS);
+
+        let mut request = CreateMessageRequest::builder("claude-opus-4-6", 1024)
+            .system_text("plain system")
+            .messages(vec![ApiMessage {
+                role: "user".to_string(),
+                content: json!([{ "type": "text", "text": "hi" }, { "type": "text", "text": "" }]),
+            }])
+            .build();
+        request.apply_cache_breakpoints();
+        let body = serde_json::to_value(&request).expect("serialize");
+        assert_eq!(
+            body["system"],
+            json!([{ "type": "text", "text": "plain system", "cache_control": { "type": "ephemeral" } }])
+        );
+        assert_eq!(body["messages"][0]["content"][0]["cache_control"], json!({ "type": "ephemeral" }));
+        assert!(body["messages"][0]["content"][1].get("cache_control").is_none());
+    }
 
     #[test]
     fn test_sse_parser_basic() {
@@ -1601,6 +1972,7 @@ mod tests {
         let (msg, _usage, stop) = acc.finish();
         assert_eq!(msg.get_text(), Some("Hello world!"));
         assert_eq!(stop.as_deref(), Some("end_turn"));
+        assert_eq!(msg.uuid.as_deref(), Some("m1"), "the API message id is kept");
     }
 
     // -----------------------------------------------------------------------

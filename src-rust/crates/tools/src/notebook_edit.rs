@@ -102,13 +102,17 @@ impl Tool for NotebookEditTool {
         }
 
         // Permission check
-        if let Err(e) = ctx.check_permission(
+        if let Err(e) = ctx.check_permission_for_path(
             self.name(),
             &format!("Edit notebook {}", path.display()),
+            path.clone(),
             false,
         ) {
             return ToolResult::error(e.to_string());
         }
+
+        // Serialise with other tools changing this file (#443).
+        let _lock = crate::lock_files([path.as_path()]).await;
 
         // Read notebook
         let content = match tokio::fs::read_to_string(&path).await {

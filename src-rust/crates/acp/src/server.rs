@@ -1,8 +1,12 @@
 //! Top-level ACP request / notification dispatcher.
 
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use agent_client_protocol_schema as acp;
+use claurst_core::config::Settings;
+use claurst_core::permissions::PermissionManager;
 use serde_json::Value;
 use tracing::{debug, info, warn};
 
@@ -10,22 +14,43 @@ use crate::connection::{Connection, Inbound};
 use crate::runtime::AgentRuntime;
 use crate::sessions::{SessionRegistry, SessionState};
 
-/// The ACP agent: owns the connection, the runtime, and the session registry.
+/// The ACP agent: owns the connection, the per-directory runtimes, and the
+/// session registry.
 pub struct AgentServer {
     pub connection: Arc<Connection>,
-    pub runtime: Arc<AgentRuntime>,
+    /// One runtime per session working directory, built on first use.
+    pub runtimes: tokio::sync::Mutex<HashMap<PathBuf, Arc<AgentRuntime>>>,
     pub sessions: Arc<SessionRegistry>,
     pub client_capabilities: parking_lot::RwLock<acp::ClientCapabilities>,
 }
 
 impl AgentServer {
-    pub fn new(connection: Arc<Connection>, runtime: Arc<AgentRuntime>) -> Arc<Self> {
+    pub fn new(connection: Arc<Connection>) -> Arc<Self> {
         Arc::new(Self {
             connection,
-            runtime,
+            runtimes: tokio::sync::Mutex::new(HashMap::new()),
             sessions: Arc::new(SessionRegistry::new()),
             client_capabilities: parking_lot::RwLock::new(acp::ClientCapabilities::default()),
         })
+    }
+
+    /// The runtime for `cwd`, building it (settings, context, MCP servers
+    /// for that directory) the first time a session opens there.
+    async fn runtime_for(&self, cwd: &std::path::Path) -> Result<Arc<AgentRuntime>, acp::Error> {
+        let mut runtimes = self.runtimes.lock().await;
+        if let Some(runtime) = runtimes.get(cwd) {
+            return Ok(runtime.clone());
+        }
+        let cwd = cwd.to_path_buf();
+        let runtime = AgentRuntime::build(cwd.clone()).await.map_err(|e| {
+            acp::Error::new(
+                i32::from(acp::ErrorCode::InternalError),
+                format!("Failed to start the agent for {}: {e}", cwd.display()),
+            )
+        })?;
+        let runtime = Arc::new(runtime);
+        runtimes.insert(cwd, runtime.clone());
+        Ok(runtime)
     }
 
     /// Dispatch a single inbound message. Spawns the actual handler on a
@@ -104,17 +129,13 @@ impl AgentServer {
                 match parsed {
                     Ok(notif) => {
                         if let Some(session) = self.sessions.get(&notif.session_id) {
-                            info!(session_id = %notif.session_id, "ACP: cancelling session");
-                            session.cancel_token.cancel();
-                            // Re-arm with a fresh token for any subsequent prompt
-                            // calls on this session. (The cancellation only
-                            // affects the in-flight turn.)
-                            //
-                            // SAFETY: we hold an Arc<SessionState>; this races
-                            // with the prompt handler reading cancel_token but
-                            // the race is benign — either the next prompt sees
-                            // the old (cancelled) token (and finishes
-                            // immediately) or the new fresh one.
+                            // Only the running prompt is cancelled; the next
+                            // prompt starts with a fresh token.
+                            if session.cancel_turn() {
+                                info!(session_id = %notif.session_id, "ACP: cancelling prompt");
+                            } else {
+                                debug!(session_id = %notif.session_id, "ACP: cancel with no prompt running");
+                            }
                         }
                     }
                     Err(e) => warn!(?e, "ACP: malformed session/cancel notification"),
@@ -143,7 +164,9 @@ impl AgentServer {
             .agent_capabilities(
                 acp::AgentCapabilities::new()
                     .load_session(false)
-                    .prompt_capabilities(acp::PromptCapabilities::new())
+                    // Images pass through when the session's provider accepts
+                    // them and are replaced by a short note otherwise.
+                    .prompt_capabilities(acp::PromptCapabilities::new().image(true))
                     .mcp_capabilities(acp::McpCapabilities::new()),
             );
         response = response.agent_info(Some(agent_info));
@@ -158,15 +181,34 @@ impl AgentServer {
             return Err(acp::Error::invalid_params()
                 .data(Some(serde_json::json!({ "reason": "cwd must be absolute" }))));
         }
+        let runtime = self.runtime_for(&req.cwd).await?;
         let session_id = acp::SessionId::new(format!("acp-{}", uuid::Uuid::new_v4()));
-        let state = SessionState::new(session_id.clone(), req.cwd.clone());
+        // Read the global rules fresh so approvals saved by earlier sessions
+        // apply here too.
+        let mode = runtime.config.permission_mode.clone();
+        let permission_manager = match Settings::load_sync() {
+            Ok(settings) => PermissionManager::new(mode, &settings),
+            Err(e) => {
+                warn!(error = %e, "ACP: could not reload settings, using the runtime's permission rules");
+                PermissionManager::new(mode, &runtime.settings)
+            }
+        };
+        // Project approvals for this cwd, and the configured allow/deny lists.
+        let mut permission_manager = permission_manager.with_project_store(
+            claurst_core::permissions::project_approvals_path(
+                &Settings::config_dir(),
+                &claurst_core::permissions::approvals_project_root(&req.cwd),
+            ),
+        );
+        permission_manager.sync_config(&runtime.config);
+        let state = SessionState::new(session_id.clone(), runtime, permission_manager);
         info!(session_id = %session_id, cwd = %req.cwd.display(), "ACP: new session");
 
         // v1: ignore req.mcp_servers — agent uses settings.json MCP roster.
         if !req.mcp_servers.is_empty() {
             warn!(
                 count = req.mcp_servers.len(),
-                "ACP: session-specific MCP servers are not yet routed (v1) — using global config"
+                "ACP: session-specific MCP servers are not yet routed (v1) — using the configured servers for this directory"
             );
         }
 
@@ -187,13 +229,7 @@ impl AgentServer {
                 }))));
             }
         };
-        crate::prompt::handle(
-            self.runtime.clone(),
-            self.connection.clone(),
-            session,
-            req,
-        )
-        .await
+        crate::prompt::handle(self.connection.clone(), session, req).await
     }
 }
 
@@ -202,4 +238,37 @@ fn parse_params<T: serde::de::DeserializeOwned>(params: Option<Value>) -> Result
     serde_json::from_value(value).map_err(|e| {
         acp::Error::invalid_params().data(Some(serde_json::json!({ "deserialize_error": e.to_string() })))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(serde::Deserialize, PartialEq, Debug)]
+    struct Params {
+        name: String,
+    }
+
+    #[test]
+    fn parse_params_missing_returns_invalid_params_error() {
+        let result: Result<Params, acp::Error> = parse_params(None);
+        let err = result.expect_err("None params should be rejected");
+        assert_eq!(err.code, acp::ErrorCode::InvalidParams);
+    }
+
+    #[test]
+    fn parse_params_deserializes_matching_shape() {
+        let value = serde_json::json!({ "name": "claurst" });
+        let result: Params = parse_params(Some(value)).expect("valid params should parse");
+        assert_eq!(result, Params { name: "claurst".to_string() });
+    }
+
+    #[test]
+    fn parse_params_mismatched_shape_returns_invalid_params_error_with_detail() {
+        let value = serde_json::json!({ "wrong_field": 1 });
+        let result: Result<Params, acp::Error> = parse_params(Some(value));
+        let err = result.expect_err("mismatched shape should be rejected");
+        assert_eq!(err.code, acp::ErrorCode::InvalidParams);
+        assert!(err.data.is_some());
+    }
 }

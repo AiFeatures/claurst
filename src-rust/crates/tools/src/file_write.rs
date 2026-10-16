@@ -59,10 +59,12 @@ impl Tool for FileWriteTool {
         let path = ctx.resolve_path(&params.file_path);
         debug!(path = %path.display(), "Writing file");
 
-        // Permission check
-        if let Err(e) = ctx.check_permission(
+        // Permission check (path-aware, so AcceptEdits covers writes inside
+        // the workspace and path rules apply).
+        if let Err(e) = ctx.check_permission_for_path(
             self.name(),
             &format!("Write {}", path.display()),
+            path.clone(),
             false,
         ) {
             return ToolResult::error(e.to_string());
@@ -80,6 +82,9 @@ impl Tool for FileWriteTool {
                 }
             }
         }
+
+        // Serialise with other tools changing this file (#443).
+        let _lock = crate::lock_files([path.as_path()]).await;
 
         let existed = path.exists();
         let before_content = if existed {

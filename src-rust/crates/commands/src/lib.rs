@@ -32,6 +32,10 @@ pub struct CommandContext {
     pub mcp_manager: Option<Arc<claurst_mcp::McpManager>>,
     /// Optional callback for starting an MCP OAuth flow in the background.
     pub mcp_auth_runner: Option<Arc<dyn Fn(claurst_mcp::oauth::McpAuthSession) + Send + Sync>>,
+    /// The session's permission manager, so `/permissions` can list every
+    /// rule in effect. `None` outside an interactive session.
+    pub permission_manager:
+        Option<Arc<std::sync::Mutex<claurst_core::permissions::PermissionManager>>>,
 }
 
 /// Result of running a slash command.
@@ -58,6 +62,13 @@ pub enum CommandResult {
     ClearConversation,
     /// Replace the conversation with a specific message list (used by /rewind).
     SetMessages(Vec<Message>),
+    /// `/compact` replaced the conversation with a compacted history: record
+    /// the entry in the session and show `report` (before/after token counts).
+    Compacted {
+        messages: Vec<Message>,
+        record: claurst_query::CompactionRecord,
+        report: String,
+    },
     /// Load a previously saved session into the live REPL.
     ResumeSession(claurst_core::history::ConversationSession),
     /// Update the current session title.
@@ -183,6 +194,7 @@ async fn provider_for_config(config: &Config) -> Option<std::sync::Arc<dyn claur
             use_bearer_auth: anthropic_auth
                 .as_ref()
                 .is_some_and(|(_, use_bearer)| *use_bearer),
+            retry: claurst_api::RetryConfig::with_max_retries(config.max_retries),
             ..Default::default()
         },
     );
@@ -629,21 +641,91 @@ impl SlashCommand for CompactCommand {
     fn name(&self) -> &str { "compact" }
     fn description(&self) -> &str { "Compact the conversation to reduce token usage" }
 
-    async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
-        let msg_count = ctx.messages.len();
-        let instruction = if args.is_empty() {
-            "Provide a detailed summary of our conversation so far, preserving all \
-             key technical details, decisions made, file paths mentioned, and current \
-             task status."
-                .to_string()
-        } else {
-            args.to_string()
-        };
+    fn help(&self) -> &str {
+        "Usage: /compact [instructions]\n\n\
+         Summarises the older part of the conversation now, through the active\n\
+         provider, keeping the most recent messages and your last few requests\n\
+         verbatim. Optional instructions steer what the summary keeps.\n\
+         Reports the context size before and after."
+    }
 
-        CommandResult::UserMessage(format!(
-            "[Compact requested ({} messages). Instruction: {}]",
-            msg_count, instruction
-        ))
+    async fn execute(&self, args: &str, ctx: &mut CommandContext) -> CommandResult {
+        if ctx.messages.is_empty() {
+            return CommandResult::Message("Nothing to compact yet.".to_string());
+        }
+        let Some(provider) = provider_for_config(&ctx.config).await else {
+            return CommandResult::Error(format!(
+                "Cannot compact: no credentials for provider '{}'.",
+                ctx.config.selected_provider_id()
+            ));
+        };
+        let model = stripped_model_for_provider(
+            ctx.config.selected_provider_id(),
+            ctx.config.effective_model(),
+        );
+        let instructions = Some(args.trim()).filter(|a| !a.is_empty());
+        // PreCompact hooks (#447). Informational: the decision is ignored.
+        claurst_core::hooks::run_hooks(
+            &ctx.config.hooks,
+            &claurst_core::hooks::HookPayload::new(
+                &ctx.session_id,
+                &ctx.working_dir,
+                claurst_core::hooks::HookEventData::PreCompact {
+                    trigger: claurst_core::hooks::CompactTrigger::Manual,
+                    custom_instructions: instructions.unwrap_or_default(),
+                },
+            ),
+        )
+        .await;
+        compact_now(
+            provider.as_ref(),
+            model,
+            &ctx.messages,
+            ctx.config.effective_max_tokens(),
+            instructions,
+        )
+        .await
+    }
+}
+
+/// Compact `messages` through `provider` immediately and report the result.
+async fn compact_now(
+    provider: &dyn claurst_api::LlmProvider,
+    model: &str,
+    messages: &[Message],
+    max_output_tokens: u32,
+    instructions: Option<&str>,
+) -> CommandResult {
+    match claurst_query::compact_conversation(
+        provider,
+        model,
+        messages,
+        claurst_query::CompactionTrigger::Manual,
+        claurst_query::summary_token_budget(max_output_tokens),
+        instructions,
+    )
+    .await
+    {
+        Ok(Some(compaction)) => {
+            let record = compaction.record;
+            let report = format!(
+                "Compacted {} messages into {}: ~{} → ~{} tokens.",
+                record.messages_before,
+                record.messages_after,
+                record.tokens_before,
+                record.tokens_after
+            );
+            CommandResult::Compacted {
+                messages: compaction.messages,
+                record,
+                report,
+            }
+        }
+        Ok(None) => CommandResult::Message(
+            "Nothing to compact: the conversation already fits the recent-context budget."
+                .to_string(),
+        ),
+        Err(e) => CommandResult::Error(format!("Compaction failed: {}", e)),
     }
 }
 
@@ -873,8 +955,8 @@ impl SlashCommand for StatusCommand {
             format!("{} server(s) configured", mcp_count)
         };
 
-        // Hook status
-        let hook_count: usize = ctx.config.hooks.values().map(|v| v.len()).sum();
+        // Hook status (settings hooks; plugin hooks are listed by /hooks)
+        let hook_count: usize = ctx.config.hooks.values().flatten().map(|g| g.hooks.len()).sum();
 
         // UI settings
         let ui = load_ui_settings();
@@ -1061,8 +1143,10 @@ impl SlashCommand for HooksCommand {
     fn description(&self) -> &str { "Show configured event hooks" }
     fn help(&self) -> &str {
         "Usage: /hooks\n\
-         Show hooks configured in settings.json under 'hooks'.\n\
-         Hooks fire shell commands on events: PreToolUse, PostToolUse, Stop, UserPromptSubmit."
+         Show the hooks that run: settings hooks (the 'hooks' key of ~/.claurst/settings.json)\n\
+         and hooks registered by plugins. Events: PreToolUse, PostToolUse, UserPromptSubmit,\n\
+         Stop, SubagentStop, SessionStart, SessionEnd, Notification, PreCompact, PostModelTurn.\n\
+         See docs/hooks.md."
     }
 
     async fn execute(&self, _args: &str, ctx: &mut CommandContext) -> CommandResult {
@@ -1072,7 +1156,7 @@ impl SlashCommand for HooksCommand {
         //
         // Signal to the CLI driver that it should open the TUI overlay if possible;
         // the CLI will fall back to the text listing when no TUI is active.
-        if ctx.config.hooks.is_empty() {
+        if ctx.config.hooks.is_empty() && claurst_core::hooks::plugin_hooks().is_none() {
             // If there is nothing to show in the overlay, emit a helpful message
             // so the user knows what to do.
             return CommandResult::Message(
@@ -1080,7 +1164,7 @@ impl SlashCommand for HooksCommand {
                  Add hooks to ~/.claurst/settings.json under the 'hooks' key.\n\
                  Example:\n\
                  \x20 \"hooks\": {\n\
-                 \x20   \"PreToolUse\": [{ \"matcher\": \"*\", \"hooks\": [{ \"type\": \"command\", \"command\": \"echo $STDIN\" }] }]\n\
+                 \x20   \"PreToolUse\": [{ \"matcher\": \"Bash\", \"hooks\": [{ \"type\": \"command\", \"command\": \"cat >> ~/.claurst/hooks.log\" }] }]\n\
                  \x20 }"
                     .to_string(),
             );
@@ -1422,34 +1506,21 @@ impl SlashCommand for SkillCommand {
     }
 }
 
-/// Build slash commands from skill markdown files discovered on the filesystem
-/// and from configured git URLs.
-///
-/// Pass the project `cwd` and the `skills` section of the effective config.
-/// Bundled skills take precedence — any discovered skill whose name clashes
-/// with a built-in command will be silently skipped.
-pub fn commands_from_discovered_skills(
-    cwd: &std::path::Path,
-    skills_config: &claurst_core::SkillsConfig,
-) -> Vec<Box<dyn SlashCommand>> {
-    let discovered = claurst_core::discover_skills(cwd, skills_config);
-    // Build a set of built-in command names so we can skip collisions.
+/// `(name, description)` of each skill in `registry` that runs as a slash
+/// command: the skills loaded from disk or a skills repo (bundled skills are
+/// reached through the Skill tool), minus any whose name clashes with a
+/// built-in command name or alias. Used for autocomplete.
+pub fn skill_command_entries(registry: &claurst_core::SkillRegistry) -> Vec<(String, String)> {
     let all_cmds = all_commands();
     let builtin_names: std::collections::HashSet<&str> = all_cmds
         .iter()
-        .map(|c| c.name())
+        .flat_map(|c| std::iter::once(c.name()).chain(c.aliases()))
         .collect();
 
-    discovered
-        .into_values()
+    registry
+        .discovered()
         .filter(|skill| !builtin_names.contains(skill.name.as_str()))
-        .map(|skill| {
-            Box::new(SkillCommand {
-                name: skill.name,
-                description: skill.description,
-                template: skill.template,
-            }) as Box<dyn SlashCommand>
-        })
+        .map(|skill| (skill.name.clone(), skill.description.clone()))
         .collect()
 }
 
@@ -1474,16 +1545,16 @@ pub async fn execute_command(
     }
 
     // Check discovered skill commands (from .claurst/skills/, git URLs, etc.).
-    {
-        let discovered = claurst_core::discover_skills(&ctx.working_dir, &ctx.config.skills);
-        if let Some(skill) = discovered.get(cmd_name) {
-            let sc = SkillCommand {
-                name: skill.name.clone(),
-                description: skill.description.clone(),
-                template: skill.template.clone(),
-            };
-            return Some(sc.execute(args, ctx).await);
-        }
+    let skill_command = claurst_core::SkillRegistry::discover(&ctx.working_dir, &ctx.config.skills)
+        .discovered()
+        .find(|skill| skill.name == cmd_name)
+        .map(|skill| SkillCommand {
+            name: skill.name.clone(),
+            description: skill.description.clone(),
+            template: skill.template.clone(),
+        });
+    if let Some(sc) = skill_command {
+        return Some(sc.execute(args, ctx).await);
     }
 
     // Then check plugin-defined slash commands.
@@ -1531,6 +1602,7 @@ mod tests {
             remote_session_url: None,
             mcp_manager: None,
             mcp_auth_runner: None,
+            permission_manager: None,
         }
     }
 
@@ -1873,5 +1945,105 @@ mod tests {
                 "second value".to_string(),
             ]
         );
+    }
+
+    // ---- /compact (issue #441) ------------------------------------------------
+
+    /// Answers every summarisation request with a fixed short summary.
+    struct SummaryProvider {
+        id: claurst_core::ProviderId,
+    }
+
+    #[async_trait::async_trait]
+    impl claurst_api::LlmProvider for SummaryProvider {
+        fn id(&self) -> &claurst_core::ProviderId {
+            &self.id
+        }
+        fn name(&self) -> &str {
+            "summary-mock"
+        }
+        async fn create_message(
+            &self,
+            _request: claurst_api::ProviderRequest,
+        ) -> Result<claurst_api::ProviderResponse, claurst_api::ProviderError> {
+            unimplemented!("compaction streams")
+        }
+        async fn create_message_stream(
+            &self,
+            _request: claurst_api::ProviderRequest,
+        ) -> Result<
+            std::pin::Pin<
+                Box<
+                    dyn futures::Stream<
+                            Item = Result<claurst_api::StreamEvent, claurst_api::ProviderError>,
+                        > + Send,
+                >,
+            >,
+            claurst_api::ProviderError,
+        > {
+            let events = vec![
+                Ok(claurst_api::StreamEvent::TextDelta {
+                    index: 0,
+                    text: "<summary>Manual summary.</summary>".to_string(),
+                }),
+                Ok(claurst_api::StreamEvent::MessageStop),
+            ];
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+        async fn health_check(
+            &self,
+        ) -> Result<claurst_api::ProviderStatus, claurst_api::ProviderError> {
+            Ok(claurst_api::ProviderStatus::Healthy)
+        }
+        fn capabilities(&self) -> claurst_api::ProviderCapabilities {
+            claurst_api::ProviderCapabilities {
+                streaming: true,
+                tool_calling: false,
+                thinking: false,
+                image_input: false,
+                pdf_input: false,
+                audio_input: false,
+                video_input: false,
+                caching: false,
+                structured_output: false,
+                system_prompt_style: claurst_api::SystemPromptStyle::TopLevel,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn compact_runs_now_and_reports_before_and_after_tokens() {
+        let provider = SummaryProvider { id: claurst_core::ProviderId::new("google") };
+        let messages: Vec<Message> = (0..9)
+            .map(|i| {
+                let text = format!("turn {} {}", i, "z".repeat(30_000));
+                if i % 2 == 0 { Message::user(text) } else { Message::assistant(text) }
+            })
+            .collect();
+
+        let result = compact_now(&provider, "gemini-test", &messages, 32_000, None).await;
+        let CommandResult::Compacted { messages: compacted, record, report } = result else {
+            panic!("expected a compaction, got {:?}", result);
+        };
+        assert!(compacted[0].get_all_text().contains("Manual summary."));
+        assert_eq!(record.trigger, claurst_query::CompactionTrigger::Manual);
+        assert!(record.tokens_after < record.tokens_before);
+        assert_eq!(
+            report,
+            format!(
+                "Compacted 9 messages into {}: ~{} → ~{} tokens.",
+                compacted.len(),
+                record.tokens_before,
+                record.tokens_after
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_reports_when_nothing_fits_the_cut() {
+        let provider = SummaryProvider { id: claurst_core::ProviderId::new("ollama") };
+        let messages = vec![Message::user("hi"), Message::assistant("hello")];
+        let result = compact_now(&provider, "llama", &messages, 8_000, None).await;
+        assert!(matches!(result, CommandResult::Message(ref m) if m.starts_with("Nothing to compact")));
     }
 }
